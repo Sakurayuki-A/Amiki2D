@@ -545,6 +545,154 @@ impl SparseCapacity {
     pub fn is_valid(&self) -> bool {
         self.cells > 0 && self.items > 0
     }
+
+    /// `usage` 是否超出本容量（任一项超出即溢出）。
+    ///
+    /// 溢出意味着本帧有写入被丢弃、画面残缺 —— **必须作废重做**。
+    pub fn exceeds(&self, usage: &SparseCapacity) -> bool {
+        usage.cells > self.cells
+            || usage.buckets > self.buckets
+            || usage.tile_entries > self.tile_entries
+            || usage.items > self.items
+    }
+}
+
+/// M3.6：**场景特征键** —— 用于给不同场景各留一份稀疏容量。
+///
+/// # 为什么必须按场景分表
+///
+/// 容量只是"元素个数上限"：换场景时它仍然**合法**，但**大小是否合适**完全
+/// 取决于场景 —— 1080p×10k 曲线与 720p×64 曲线所需格数差几个数量级。
+/// 共用一个全局容量会二选一地失败，两者都实测到了：
+///
+/// - **共用 + 直接覆盖**：换场景即溢出 → 作废重做（诊断打印 `[溢出重做 1]`）
+/// - **共用 + 只增不减**：变成过度分配 → 小场景每帧按大场景的格数分配大缓冲，
+///   实测 720p×64 从 0.67 ms **退化到 2.09 ms**
+///
+/// 因此按场景特征分表：同 key 的稀疏规模相近，各自收敛、互不影响。
+///
+/// `seg_bucket` 取 `total_segments` 的**不小于它的 2 的幂**：几何会随动画小幅
+/// 变化，量化后 key 才稳定（否则每帧都 miss）。代价是至多 2 倍过度分配，
+/// 而稀疏缓冲本身很小（1080p×10k 全量约 34 MB 量级）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct SceneKey {
+    pub width: u32,
+    pub height: u32,
+    /// draw 数
+    pub draws: u32,
+    /// `total_segments` 向上取到 2 的幂
+    pub seg_bucket: u32,
+}
+
+impl SceneKey {
+    /// 从 GPU 场景取廉价特征。只用已在 `GpuScene` 里的计数，不做任何遍历。
+    pub fn of(gs: &GpuScene) -> SceneKey {
+        SceneKey {
+            width: gs.width,
+            height: gs.height,
+            draws: gs.colors.len() as u32,
+            seg_bucket: gs.total_segments.max(1).next_power_of_two(),
+        }
+    }
+}
+
+/// 每个 key 最多容忍多少次连续溢出。超过则**放弃该 key 的投机**，
+/// 退回每帧测量 —— 这样即使遇到"容量总也猜不准"的病态场景，
+/// 最坏情况也只是回到没有投机时的性能，而不会每帧都作废重做。
+const MAX_CONSECUTIVE_OVERFLOWS: u32 = 2;
+
+/// M3.6：**按场景特征分表的稀疏容量**（含 LRU 淘汰与放弃投机的策略）。
+#[derive(Debug, Default)]
+pub struct SparseCapacityTable {
+    entries: std::collections::HashMap<SceneKey, TableEntry>,
+    clock: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TableEntry {
+    cap: SparseCapacity,
+    /// 该 key 连续溢出次数（成功一次即清零）
+    overflows: u32,
+    /// 最近一次使用的时间戳（LRU 用）
+    used: u64,
+}
+
+/// 表项上限：超出则淘汰最久未用的 key。设上限是为了让长跑里不断变化场景的
+/// 进程不会无限增长内存。
+const CAPACITY_TABLE_MAX: usize = 8;
+
+impl SparseCapacityTable {
+    /// 取该 key 的可用容量。返回 `None` 表示"这一帧应走测量路径"：
+    /// 从未见过该 key，或该 key 已因反复溢出被放弃。
+    pub fn get(&mut self, key: SceneKey) -> Option<SparseCapacity> {
+        self.clock += 1;
+        let e = self.entries.get_mut(&key)?;
+        e.used = self.clock;
+        if e.overflows >= MAX_CONSECUTIVE_OVERFLOWS {
+            return None; // 该 key 已放弃投机
+        }
+        Some(e.cap)
+    }
+
+    /// 记录该 key 的实测用量。`overflowed` 表示这一帧是因容量不足作废的。
+    pub fn record(&mut self, key: SceneKey, usage: SparseCapacity, overflowed: bool) {
+        self.clock += 1;
+        match self.entries.get_mut(&key) {
+            Some(e) => {
+                // 只增不减：容量是"留多少格"，取历史最大值即可。
+                e.cap = SparseCapacity {
+                    cells: e.cap.cells.max(usage.cells),
+                    buckets: e.cap.buckets.max(usage.buckets),
+                    tile_entries: e.cap.tile_entries.max(usage.tile_entries),
+                    items: e.cap.items.max(usage.items),
+                    overflows: 0,
+                };
+                e.overflows = if overflowed { e.overflows + 1 } else { 0 };
+                e.used = self.clock;
+            }
+            None => {
+                if self.entries.len() >= CAPACITY_TABLE_MAX {
+                    self.evict_lru();
+                }
+                self.entries.insert(
+                    key,
+                    TableEntry {
+                        cap: usage,
+                        overflows: u32::from(overflowed),
+                        used: self.clock,
+                    },
+                );
+            }
+        }
+    }
+
+    fn evict_lru(&mut self) {
+        if let Some(k) = self
+            .entries
+            .iter()
+            .min_by_key(|(_, e)| e.used)
+            .map(|(k, _)| *k)
+        {
+            self.entries.remove(&k);
+        }
+    }
+
+    /// 当前表项数（诊断用）。
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// 表是否为空（诊断用；与 `len` 成对，符合 clippy 的约定）。
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// 诊断：该 key 是否已放弃投机。
+    pub fn gave_up(&self, key: SceneKey) -> bool {
+        self.entries
+            .get(&key)
+            .is_some_and(|e| e.overflows >= MAX_CONSECUTIVE_OVERFLOWS)
+    }
 }
 
 impl TimestampRecorder {
@@ -1026,7 +1174,7 @@ pub struct GpuRenderer {
     readback_pool: Mutex<Vec<wgpu::Buffer>>,
     /// M3.6：上一帧实测的稀疏容量（投机分配）。锁中毒时按"无容量"处理
     /// ——退回精确路径，只会更慢，不会更错。
-    sparse_capacity: Mutex<SparseCapacity>,
+    sparse_capacity: Mutex<SparseCapacityTable>,
     fine_pipeline: wgpu::ComputePipeline,
     coverage_pipeline: wgpu::ComputePipeline,
     fine_bgl: wgpu::BindGroupLayout,
@@ -1467,7 +1615,7 @@ impl GpuRenderer {
             timestamp_period_ns,
             limits,
             readback_pool: Mutex::new(Vec::new()),
-            sparse_capacity: Mutex::new(SparseCapacity::default()),
+            sparse_capacity: Mutex::new(SparseCapacityTable::default()),
             device,
             queue,
             fine_pipeline,
@@ -1613,20 +1761,48 @@ impl GpuRenderer {
         }))
     }
 
-    /// M3.6：当前生效的稀疏容量（投机分配的跨帧状态）。
+    /// M3.6：取某场景的投机容量。`None` 表示该场景应走**精确测量路径**
+    /// （从未见过，或已因反复溢出放弃投机）。
     ///
-    /// **运行时报告**：首帧为 [`SparseCapacity::default`]（不可用，因而必走
-    /// 精确测量路径），其后是上一帧实测到的用量。测试与诊断据此断言
-    /// "这一帧究竟走没走投机路径"，而不是靠注释描述。
-    pub fn sparse_capacity(&self) -> SparseCapacity {
-        self.sparse_capacity.lock().map(|c| *c).unwrap_or_default()
+    /// **运行时报告**：测试与诊断据此断言"这一帧究竟走没走投机路径"，
+    /// 而不是靠注释描述。
+    pub fn sparse_capacity(&self, key: SceneKey) -> Option<SparseCapacity> {
+        self.sparse_capacity.lock().ok().and_then(|mut t| t.get(key))
     }
 
-    /// M3.6：更新投机分配的容量。锁中毒时静默放弃——容量只是加速手段，
-    /// 丢了只会让下一帧退回精确测量路径（更慢，但结果不变）。
-    fn store_sparse_capacity(&self, cap: SparseCapacity) {
-        if let Ok(mut slot) = self.sparse_capacity.lock() {
-            *slot = cap;
+    /// 诊断：容量表的项数（长跑里不该无限增长）。
+    pub fn capacity_table_len(&self) -> usize {
+        self.sparse_capacity.lock().map(|t| t.len()).unwrap_or(0)
+    }
+
+    /// 诊断：某场景的容量是否因反复溢出而被放弃投机。
+    pub fn capacity_gave_up(&self, key: SceneKey) -> bool {
+        self.sparse_capacity.lock().is_ok_and(|t| t.gave_up(key))
+    }
+
+    /// 诊断：列出容量表的全部表项（key 与容量）。
+    ///
+    /// 测试用 —— 避免在测试里硬编码场景特征（例如几何桶的具体取值），
+    /// 那些属于实现的内部细节。
+    pub fn capacity_entries(&self) -> Vec<(SceneKey, SparseCapacity)> {
+        self.sparse_capacity
+            .lock()
+            .map(|t| {
+                t.entries
+                    .iter()
+                    .map(|(k, e)| (*k, e.cap))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// M3.6：记录该场景的实测用量（`overflowed` 表示这一帧因容量不足作废）。
+    ///
+    /// 锁中毒时静默放弃 —— 容量只是加速手段，丢了只会退回精确测量路径
+    /// （更慢，但结果不变）。
+    fn store_sparse_capacity(&self, key: SceneKey, usage: SparseCapacity, overflowed: bool) {
+        if let Ok(mut t) = self.sparse_capacity.lock() {
+            t.record(key, usage, overflowed);
         }
     }
 
@@ -2153,10 +2329,15 @@ impl GpuRenderer {
             return Ok(());
         }
 
-        // 这一帧的产出不可用 → 作废容量，走测量路径重做。
+        // 这一帧的产出不可用（有写入被丢弃）→ **必须重做**。
+        //
+        // 不必清空容量：`_once` 在返回溢出前已把实测用量记进该场景的表项
+        // （并给该 key 的溢出计数 +1），而实测用量正是本帧需要的格数，
+        // 故第二次必然容得下。若该 key 反复溢出，表会放弃它的投机并
+        // 永久退回测量路径 —— 最坏情况也只是回到没有投机时的性能。
+        //
         // 诊断与时间戳只在第一次尝试时收集（第二次为的是正确性，不是测量）。
         prof.capacity_overflows += 1;
-        self.store_sparse_capacity(SparseCapacity::default());
         self.run_pipeline_sparse_once(gs, tex, coverage, clip_views, damage, None, None, prof)?;
         Ok(())
     }
@@ -2190,6 +2371,8 @@ impl GpuRenderer {
         //   这份缓存，两帧之间容量会被反复改写，主场景每帧都要重做；
         // - 诊断转储（`dump`）要的正是**精确**规模，测量本身就是它的目的。
         let learns_capacity = !coverage && dump.is_none();
+        // M3.6：本场景的特征键 —— 容量按它分表，避免大小场景互相踩。
+        let key = SceneKey::of(gs);
         let (tiles_x, tiles_y) = (gs.tiles_x, gs.tiles_y);
         let n_tiles = (tiles_x as u64) * (tiles_y as u64);
         let n_strips = (n_draws as u64) * (tiles_y as u64);
@@ -2645,16 +2828,20 @@ impl GpuRenderer {
         self.queue.submit(Some(enc2.finish()));
         prof.submit2_ms = t_sub2.elapsed().as_secs_f64() * 1000.0;
 
-        // M3.6：本帧 GPU 工作已全部提交，把**实测用量**记为下一帧的容量。
-        // （本步只是记录：据此分配要等容量查表接上；见 `learns_capacity` 的取用处。）
+        // M3.6：本帧 GPU 工作已全部提交，把**实测用量**记进该场景的容量表项。
+        // （本步仍每帧测量；据容量查表来分配是下一步 —— 见 `learns_capacity` 的取用处。）
         if learns_capacity {
-            self.store_sparse_capacity(SparseCapacity {
-                cells: n_cells,
-                buckets: n_buckets,
-                tile_entries: n_tile_entries,
-                items: n_items,
-                overflows: 0,
-            });
+            self.store_sparse_capacity(
+                key,
+                SparseCapacity {
+                    cells: n_cells,
+                    buckets: n_buckets,
+                    tile_entries: n_tile_entries,
+                    items: n_items,
+                    overflows: 0,
+                },
+                false,
+            );
         }
 
         // —— 诊断转储（M3.5：全字段无条件转储，供 check_sparse_consistency 使用）——
@@ -4317,11 +4504,14 @@ mod tests {
         );
     }
 
-    /// M3.6：投机分配的**容量缓存**必须来自实测用量，而不是写死的猜测。
+    /// M3.6：投机分配的**容量表**必须来自实测用量，而不是写死的猜测，
+    /// 且必须**按场景特征分表**（共用一个全局值会让大小场景互相踩，
+    /// 实测 720p×64 曾因此退化 3 倍）。
     ///
-    /// 本测试只回答"学到了什么"：首帧之前没有可用容量（因此必走精确测量路径），
-    /// 渲染一帧后容量恰好等于该帧实测的规模（与 `sparse_stats` 读到的逐项一致）。
-    /// 容量**够不够用**、不够时能否被检出并重做，由后续的投机测试负责。
+    /// 本测试回答"学到了什么"：渲染一帧后，表里应当出现**该场景**的表项，
+    /// 且其规模恰好等于该帧实测的用量（与 `sparse_stats` 逐项一致）。
+    /// 容量**够不够用**、不够时能否被检出并重做，见
+    /// `speculative_overflow_is_redone_correctly`。
     #[test]
     fn sparse_capacity_is_learned_from_measured_usage() {
         use amiki_math::Vec2;
@@ -4331,10 +4521,7 @@ mod tests {
             eprintln!("跳过：无 GPU 适配器");
             return;
         };
-        assert!(
-            !renderer.sparse_capacity().is_valid(),
-            "首帧之前不应存在可用容量（否则会跳过必要的规模测量）"
-        );
+        assert_eq!(renderer.capacity_table_len(), 0, "首帧之前不应有任何容量表项");
 
         let mut scene = Scene::new(160, 160);
         for i in 0..12 {
@@ -4348,14 +4535,101 @@ mod tests {
         }
 
         renderer.render_blocking(&scene, 0.05).expect("渲染失败");
-        let cap = renderer.sparse_capacity();
-        assert!(cap.is_valid(), "渲染一帧后应学到容量：{cap:?}");
+
+        let entries = renderer.capacity_entries();
+        assert_eq!(entries.len(), 1, "应为该场景建立一个表项：{entries:?}");
+        let (key, cap) = entries[0];
+        assert_eq!(
+            (key.width, key.height, key.draws),
+            (160, 160, 12),
+            "key 应描述刚渲染的场景（宽/高/draw 数）"
+        );
+        assert!(
+            key.seg_bucket.is_power_of_two(),
+            "几何桶应为 2 的幂（量化后才稳定）：{key:?}"
+        );
 
         let st = renderer.sparse_stats(&scene, 0.05).expect("统计失败").expect("稀疏统计缺失");
         assert_eq!(
             (cap.cells, cap.buckets, cap.tile_entries, cap.items),
             (st.n_cells, st.n_buckets, st.n_tile_entries, st.n_items),
             "容量必须等于实测用量（单元/桶/条目/成员）"
+        );
+    }
+
+    /// M3.6：**容量表按场景分表** —— 这是投机分配能成立的前提。
+    ///
+    /// 若共用一个全局容量，大小场景会互相覆盖：换场景即溢出作废，
+    /// 或（只增不减时）小场景被大场景的容量拖着过度分配。
+    /// 本测试用两个规模差两个数量级的场景交替渲染，断言：
+    /// ① 表里出现两个独立表项；② 两者的容量**各自**与自身实测用量一致。
+    #[test]
+    fn capacity_table_keeps_scenes_apart() {
+        use amiki_math::Vec2;
+        use amiki_scene::{Color, Paint, PathBuilder, Scene};
+
+        let Ok(renderer) = pollster::block_on(GpuRenderer::new()) else {
+            eprintln!("跳过：无 GPU 适配器");
+            return;
+        };
+
+        let build = |n: usize, r: f32| {
+            let mut scene = Scene::new(200, 200);
+            for i in 0..n {
+                let mut pb = PathBuilder::new();
+                pb.circle(
+                    Vec2::new(20.0 + (i as f32 * 7.0) % 170.0, 20.0 + (i as f32 * 3.0) % 170.0),
+                    r,
+                    false,
+                );
+                scene.push(
+                    amiki_math::Affine::IDENTITY,
+                    pb.build(),
+                    Paint::Solid(Color::rgba8(40, 120, 200, 180)),
+                );
+            }
+            scene
+        };
+        let small = build(4, 6.0);
+        let big = build(160, 5.0);
+
+        // 交替渲染：先小后大再小，模拟应用在不同界面之间切换
+        for _ in 0..2 {
+            renderer.render_blocking(&small, 0.05).expect("小场景渲染失败");
+            renderer.render_blocking(&big, 0.05).expect("大场景渲染失败");
+        }
+
+        let entries = renderer.capacity_entries();
+        assert_eq!(entries.len(), 2, "两个场景应各占一个表项：{entries:?}");
+
+        let usage = |scene: &Scene, n: usize| {
+            let st = renderer
+                .sparse_stats(scene, 0.05)
+                .expect("统计失败")
+                .expect("稀疏统计缺失");
+            (n, st.n_cells)
+        };
+        let (n_small, cells_small) = usage(&small, 4);
+        let (n_big, cells_big) = usage(&big, 160);
+        assert!(cells_big > cells_small, "大场景的稀疏单元数应更多");
+
+        // 找到两个表项：一个对应 4 draw、一个对应 160 draw
+        let by_draws = |d: u32| {
+            entries
+                .iter()
+                .find(|(k, _)| k.draws == d)
+                .map(|(_, c)| *c)
+                .unwrap_or_else(|| panic!("缺少 draw={d} 的表项：{entries:?}"))
+        };
+        assert_eq!(
+            by_draws(n_small as u32).cells,
+            cells_small,
+            "小场景的容量必须等于它自己的实测用量"
+        );
+        assert_eq!(
+            by_draws(n_big as u32).cells,
+            cells_big,
+            "大场景的容量必须等于它自己的实测用量"
         );
     }
 

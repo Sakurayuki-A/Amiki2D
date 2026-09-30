@@ -379,7 +379,7 @@ fn main() {
         // 这里曾经硬编码"滤镜走 CPU 参考实现"，而在 GPU 层合成实现之后，
         // 那句话就变成了假信息（会让人以为滤镜没走 GPU）。
         let backend;
-        let mut img_rgba = match pollster::block_on(gpu::GpuRenderer::new()) {
+        let img_rgba = match pollster::block_on(gpu::GpuRenderer::new()) {
             Ok(r) => match r.render_blocking(&scene, 0.1) {
                 Ok(px) => {
                     backend = "GPU (wgpu)";

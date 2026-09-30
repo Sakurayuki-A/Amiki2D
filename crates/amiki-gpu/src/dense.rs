@@ -94,8 +94,20 @@ impl GpuRenderer {
         let data_buf = mk_init("amiki_data", bytemuck::cast_slice(&data));
         let entry_draws_buf = mk_init("amiki_edraws", bytemuck::cast_slice(&entry_draws));
         let colors_buf = mk_init("amiki_colors", bytemuck::cast_slice(&gs.colors));
-        let flags_buf = mk_init("amiki_flags", bytemuck::cast_slice(&gs.draw_flags));
-        let clips_buf = mk_init("amiki_clips", bytemuck::cast_slice(&gs.draw_clips));
+        // 稠密路径的 WGSL 用 `array<u32>` 的 flags 与 `array<vec4<u32>>` 的 clips，
+        // 而宿主的 `GpuScene` 现在只存合并后的 `draw_meta`（见 `extract.rs`）。
+        // **稠密仅用于对拍基准与诊断**，不在热路径上，所以在这里拆开即可。
+        let draw_flags: Vec<u32> = gs.draw_meta.iter().map(|m| m[0]).collect();
+        let draw_clips: Vec<[u32; 4]> = gs
+            .draw_meta
+            .iter()
+            .map(|m| {
+                let (a, b) = (m[1], m[2]);
+                [a & 0xFF, (a >> 8) & 0xFF, b & 0xFF, (b >> 8) & 0xFF]
+            })
+            .collect();
+        let flags_buf = mk_init("amiki_flags", bytemuck::cast_slice(&draw_flags));
+        let clips_buf = mk_init("amiki_clips", bytemuck::cast_slice(&draw_clips));
         let counts_buf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("amiki_counts"),
             contents: bytemuck::cast_slice(&gs.counts),

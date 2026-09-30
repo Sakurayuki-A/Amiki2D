@@ -87,9 +87,14 @@ pub struct GpuScene {
     pub lines: Vec<[f32; 4]>,
     pub line_draws: Vec<u32>,
     pub colors: Vec<[f32; 4]>,
+    /// **每个 draw 一个 vec4**：`(flags, clip0|clip1<<8, clip2|clip3<<8, grad_index)`。
+    ///
+    /// 直接从 per-draw 循环里拼出来，而不是"先各存一份、之后在 `sparse.rs` 里
+    /// 再 zip 装配"。P1-1 实测：提取的 82% 时间在 `Vec::push` 上（每帧约 10 万次），
+    /// 合并后每 draw 从 4 次 push（3 份分开 + 1 次装配）降到 1 次。
+    pub draw_meta: Vec<[u32; 4]>,
     /// M6：每 draw 的渐变下标；`u32::MAX` 表示纯实心色。
     /// 随 `draw_meta.w` 传给 WGSL（该分量此前闲置）。
-    pub gradient_index: Vec<u32>,
     /// M6：本场景用到的渐变定义，按首次出现顺序排列（下标即 `gradient_index` 的值）。
     pub gradients: Vec<std::sync::Arc<amiki_scene::Gradient>>,
     /// M6：每 draw 的图像下标；`u32::MAX` 表示非图像绘制。
@@ -103,8 +108,6 @@ pub struct GpuScene {
     /// P0-3：场景的离屏层。逐帧路径需要在 GPU 上合成它们，而 `Frame` 只带
     /// `GpuScene` —— 因此层数据必须放在这里（否则帧路径拿不到层）。
     pub layers: Vec<amiki_scene::Layer>,
-    pub draw_flags: Vec<u32>,
-    pub draw_clips: Vec<[u32; 4]>,
     /// CPU 闭式段数（每入口：quad/cubic 变长，line=1）
     pub counts: Vec<u32>,
     pub total_segments: u32,
@@ -222,35 +225,34 @@ fn extract_prims_into(draw: &amiki_scene::Draw, di: u32, out: &mut DrawPrims) {
 /// # 为什么这里是**串行**的（一次被实测否定的尝试）
 ///
 /// 逐 draw 的提取互不依赖，看上去是并行的理想对象。我按"分块 + 按序合并"实现过
-/// 一版（顺序固定，结果与串行逐字节一致），但**实测是净损失**：
+/// 逐 draw 提取图元，按 draw 顺序累加。
 ///
-/// | 场景 | 串行 | 每帧起线程的并行 |
-/// |---|---|---|
-/// | 1080p×10k 曲线 | **942 µs** | 1346 µs |
-/// | 1080p×1000 曲线 | **60 µs** | 370 µs |
+/// # 为什么是串行
 ///
-/// 固定开销约 **1.2 ms** —— `std::thread::scope` 每帧创建/回收线程的成本，
-/// 远超提取本身。`build_gpu_scene` 是**逐帧**调用的，所以这个开销每帧都要付。
+/// 并行的尝试已被**线程数曲线**否定（1080p×10k：1 线程 0.70–0.91 ms，
+/// 2 线程起单调变差到 1.27–1.62 ms）。已排除线程创建开销（实测 304 µs）
+/// 与分配器争用（主线程预分配无改善），而同一台机器纯计算负载能加速 4.43× ——
+/// 也就是**这个负载并行不了**。
 ///
-/// 正确的做法是**常驻线程池**（只建一次，跨帧复用），而不是每帧起线程。
-/// 本项目刻意不引入 `rayon`（见 `Cargo.toml` 的依赖注释），所以那需要一个
-/// 基于 `std::sync::mpsc` 的小池子 —— 属于后续工作。
+/// # 容量预留按**真实图元数**而不是 draw 数
 ///
-/// 在那之前，**按实测选择串行**：942 µs 已经接近发布计划给的 800 µs 目标，
-/// 而每帧起线程会把它推到 1.3 ms 以上。
+/// 一条 draw 可能贡献多个图元（一个圆是 4 条三次曲线，一条矩形是 4~5 条线段）。
+/// 原先按 `n_draws` 预留，于是实际要 4 万条曲线却只留了 1 万个位置，
+/// 仍然反复扩容、反复拷贝。这里按"路径元素数 + 1"求和预留。
 fn extract_all_prims(scene: &Scene) -> DrawPrims {
-    let n = scene.draws.len();
+    let cap: usize = scene.draws.iter().map(|d| d.path.els.len() + 1).sum();
     let mut acc = DrawPrims::default();
-    // 预留容量：避免 10k 条 draw 反复扩容（纯收益，不改变结果）
-    acc.quads.reserve(n);
-    acc.cubics.reserve(n);
-    acc.lines.reserve(n);
+    acc.quads.reserve(cap);
+    acc.quad_draws.reserve(cap);
+    acc.cubics.reserve(cap);
+    acc.cubic_draws.reserve(cap);
+    acc.lines.reserve(cap);
+    acc.line_draws.reserve(cap);
     for (d, draw) in scene.draws.iter().enumerate() {
         extract_prims_into(draw, d as u32, &mut acc);
     }
     acc
 }
-
 /// 场景 → GpuScene（CPU 只做变换、控制点收集与闭式段数计算；不压平、不分箱）。
 pub fn build_gpu_scene(scene: &Scene, eps: f32) -> GpuScene {
     use amiki_scene::Paint;
@@ -266,6 +268,12 @@ pub fn build_gpu_scene(scene: &Scene, eps: f32) -> GpuScene {
         layers: scene.layers.clone(),
         ..Default::default()
     };
+    // per-draw 数组各按 draw 数预留一次 —— 原先完全没有预留，10k 条 draw
+    // 会让每个数组从 0 长到 10k（约 14 次扩容 + 拷贝）。纯收益，不改变结果。
+    let nd = scene.draws.len();
+    gs.colors.reserve(nd);
+    gs.draw_meta.reserve(nd);
+    gs.image_index.reserve(nd);
     for (d, draw) in scene.draws.iter().enumerate() {
         let di = d as u32;
         let mut gi = u32::MAX;
@@ -297,23 +305,23 @@ pub fn build_gpu_scene(scene: &Scene, eps: f32) -> GpuScene {
                 [0.0, 0.0, 0.0, 0.0]
             }
         });
-        gs.gradient_index.push(gi);
         gs.image_index.push(ii);
         let _ = di;
         let nclip = draw.clips.len().min(4);
         let mut ci = [0u32; 4];
         ci[..nclip].copy_from_slice(&draw.clips[..nclip]);
-        gs.draw_clips.push(ci);
-        gs.draw_flags.push(draw.blend.id() | ((nclip as u32) << 8));
+        // **直接拼成 draw_meta**（每 draw 1 次 push，而不是 3 次 + 之后 1 次装配）
+        gs.draw_meta.push([
+            draw.blend.id() | ((nclip as u32) << 8),
+            ci[0] | (ci[1] << 8),
+            ci[2] | (ci[3] << 8),
+            gi,
+        ]);
 
     }
 
-    // P1-1：路径提取**并行**做（逐 draw 独立），再按序合并。
-    //
-    // 逐 draw 的图元提取互不依赖，因此可以分块并行、再按顺序拼接 ——
-    // 拼接顺序与串行遍历一致，所以结果**逐字节相同**（这是并行化的前提）。
-    // 低于 `EXTRACT_PARALLEL_MIN_DRAWS` 时保持串行：起线程的开销（几十微秒）
-    // 会超过小场景（如 720p×64，提取仅 0.01 ms）的全部收益。
+    // P1-1：路径提取是**串行**的 —— 并行的尝试已被线程数曲线否定，
+    // 见本文件模块文档与 `extract_all_prims` 的说明。
     {
         let prims = extract_all_prims(scene);
         gs.quads = prims.quads;
@@ -327,7 +335,9 @@ pub fn build_gpu_scene(scene: &Scene, eps: f32) -> GpuScene {
     // counts 按【数据布局顺序】（quads | cubics | lines）重算 —— 与 data/entry_draws
     // 的入口顺序严格一致。此前的遍历顺序 counts 与类型分块布局错位，
     // 导致混合场景（线 + 曲线）的段数张冠李戴（M2f 曲线偏差的根因）。
+    // counts 按图元数预留：每个 quad/cubic/line 一项，无预留时同样会反复扩容。
     gs.counts.clear();
+    gs.counts.reserve(gs.quads.len() + gs.cubics.len() + gs.lines.len());
     for q in &gs.quads {
         let q = amiki_math::QuadBez::new(
             amiki_math::Vec2::new(q[0][0], q[0][1]),

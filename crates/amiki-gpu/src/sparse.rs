@@ -83,15 +83,13 @@ impl GpuRenderer {
         entry_draws.extend_from_slice(&gs.quad_draws);
         entry_draws.extend_from_slice(&gs.cubic_draws);
         entry_draws.extend_from_slice(&gs.line_draws);
-        // draw_meta = (flags, clip0|clip1<<8, clip2|clip3<<8, grad_index)
-        // （每裁剪索引 8 bit；w 为 M6 渐变下标，u32::MAX 表示实心色）
-        let draw_meta: Vec<[u32; 4]> = gs
-            .draw_flags
-            .iter()
-            .zip(gs.draw_clips.iter())
-            .zip(gs.gradient_index.iter())
-            .map(|((f, c), gi)| [*f, c[0] | (c[1] << 8), c[2] | (c[3] << 8), *gi])
-            .collect();
+        // draw_meta 已由 `build_gpu_scene` **直接拼好**
+        // （`(flags, clip0|clip1<<8, clip2|clip3<<8, grad_index)`；
+        //  每裁剪索引 8 bit，w 为 M6 渐变下标，u32::MAX 表示实心色）。
+        //
+        // 这里曾经是"把三个数组 zip 成 draw_meta"的装配 pass —— P1-1 实测它是
+        // 提取的 82% 时间（`Vec::push`）的一部分，已改为在提取循环里直接生成。
+        let draw_meta: &[[u32; 4]] = &gs.draw_meta;
 
         // M6：渐变数据打包（定长条目，布局与 sparse_fine.wgsl 的 grad_color 对应）
         let grad_vec = pack_gradients(&gs.gradients);
@@ -105,7 +103,7 @@ impl GpuRenderer {
         let data_buf = mk_init("amiki_sparse_data", bytemuck::cast_slice(&data));
         let entry_draws_buf = mk_init("amiki_sparse_edraws", bytemuck::cast_slice(&entry_draws));
         let colors_buf = mk_init("amiki_sparse_colors", bytemuck::cast_slice(&gs.colors));
-        let draw_meta_buf = mk_init("amiki_sparse_draw_meta", bytemuck::cast_slice(&draw_meta));
+        let draw_meta_buf = mk_init("amiki_sparse_draw_meta", bytemuck::cast_slice(draw_meta));
         let counts_buf = mk_storage("amiki_sparse_counts", (total_entries as u64) * 4);
         // counts 需要 CPU 数据 → 用初始化版本
         self.queue

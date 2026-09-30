@@ -120,8 +120,7 @@ fn shaping_advances_do_not_overlap() {
 }
 
 #[test]
-fn missing_char_reports_error_not_panic() {
-    let Some(font) = load() else { return };
+fn missing_char_reports_error_not_panic() {    let Some(font) = load() else { return };
     // 一个 Inter 几乎肯定没有的码位
     let gid = font.glyph_index('\u{10FFFD}');
     if let Some(g) = gid {
@@ -131,4 +130,83 @@ fn missing_char_reports_error_not_panic() {
     // 越界字形 id 必须返回 Err 而不是 panic
     let bad = font.glyph_count() + 1000;
     assert!(font.outline(bad).is_err(), "越界字形 id 应返回 Err");
+}
+
+#[test]
+fn metrics_are_sane_and_consistent() {
+    let Some(font) = load() else { return };
+    let m = font.metrics().expect("应能读取度量");
+
+    // Inter 的真实量级：ascent ≈ 0.97、descent ≈ 0.24（em 单位）
+    assert!(m.ascent > 0.5 && m.ascent < 1.5, "ascent 应在合理范围，实际 {}", m.ascent);
+    assert!(m.descent > 0.0 && m.descent < 1.0, "descent 应为正且合理，实际 {}", m.descent);
+    // 行高必须大于 ascent（否则行与行会重叠）
+    assert!(
+        m.line_height() > m.ascent,
+        "行高 {} 应大于 ascent {}",
+        m.line_height(),
+        m.ascent
+    );
+    // cap height 应大于 x height（这是字体设计的硬约束）
+    assert!(
+        m.cap_height > m.x_height,
+        "cap height {} 应大于 x height {}",
+        m.cap_height,
+        m.x_height
+    );
+    // x height 应小于 ascent
+    assert!(m.x_height < m.ascent, "x height 应小于 ascent");
+    eprintln!(
+        "度量：ascent={:.3} descent={:.3} line_gap={:.3} 行高={:.3} x={:.3} cap={:.3}（em）",
+        m.ascent,
+        m.descent,
+        m.line_gap,
+        m.line_height(),
+        m.x_height,
+        m.cap_height
+    );
+}
+
+#[test]
+fn advance_width_is_consistent_with_shaping() {
+    let Some(font) = load() else { return };
+    let text = "Hello";
+    let size = 48.0f32;
+
+    // 快速测量（不做 shaping，无 kerning）
+    let approx = font.advance_width(text) * size;
+    // 精确宽度：shaping 后末字形位置 + 其前进量
+    let run = shape(&font, text, size).expect("shaping");
+    let last = run.glyphs.last().unwrap();
+    let last_adv = font.advance(last.id).unwrap() * size;
+    let exact = last.x * size + last_adv;
+
+    assert!(approx > 0.0 && exact > 0.0);
+    // 无 kerning 的近似与精确值应接近（"Hello" 里没有明显负 kerning）
+    let rel = (approx - exact).abs() / exact;
+    assert!(
+        rel < 0.05,
+        "快速测量 {approx:.2} 与 shaping 精确宽 {exact:.2} 相差 {:.1}% 过大",
+        rel * 100.0
+    );
+    eprintln!("宽度：快速测量 {approx:.2}px，shaping 精确 {exact:.2}px（相对差 {:.2}%）", rel * 100.0);
+}
+
+#[test]
+fn advance_of_each_glyph_matches_shaping_positions() {
+    // 逐字形校验：若 shaping 的游标累加正确，则相邻字形位置差
+    // 应等于前一个字形的 advance（无 kerning 时严格成立）。
+    let Some(font) = load() else { return };
+    let run = shape(&font, "lllll", 40.0).expect("shaping");
+    assert_eq!(run.glyphs.len(), 5);
+    // 'l' 重复五次，无 kerning，故位置差应恒等于 advance
+    for w in run.glyphs.windows(2) {
+        let adv = font.advance(w[0].id).unwrap();
+        let diff = w[1].x - w[0].x;
+        assert!(
+            (diff - adv).abs() < 1e-5,
+            "位置差 {diff:.6} 应等于 advance {adv:.6}"
+        );
+    }
+    eprintln!("逐字形 advance 与 shaping 位置严格一致（5 个 'l'）");
 }

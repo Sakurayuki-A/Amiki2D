@@ -155,6 +155,90 @@ impl ttf_parser::OutlineBuilder for OutlineToPathEl {
     }
 }
 
+/// 字体度量：排版（断行、行高、基线）所需的一切。
+///
+/// 全部归一化为 **em 单位**（1.0 = 字号），因此与字号无关，可直接乘以字号使用。
+/// 这正是"为什么布局层不需要新依赖"的原因：`ttf-parser` 的 `Face` 已提供全部数据。
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct FontMetrics {
+    /// 基线以上高度（正值）
+    pub ascent: f32,
+    /// 基线以下深度（值为正，表示"向下多少"）
+    pub descent: f32,
+    /// 行间额外留白
+    pub line_gap: f32,
+    /// 小写 x 高度（用于光学对齐/竖排居中）
+    pub x_height: f32,
+    /// 大写高度（cap height，用于光学对齐）
+    pub cap_height: f32,
+    /// 建议行高 = ascent + descent + line_gap
+    pub line_height: f32,
+}
+
+impl FontMetrics {
+    /// 排版用行高。若字体给了 `use_typographic_metrics` 之外的度量，
+    /// 这里取 hhea 的 ascent/descent/line_gap —— 这是绝大多数排版系统
+    /// （含浏览器默认行为）采用的一组。
+    pub fn line_height(&self) -> f32 {
+        self.line_height
+    }
+}
+
+impl Font {
+    /// 字体度量（em 单位）。
+    ///
+    /// 坐标系约定与本 crate 一致：**y 向下**，因此 `descent` 以正值表示
+    /// "基线向下的深度"；排版时"下一行基线 = 当前基线 + line_height"。
+    pub fn metrics(&self) -> Result<FontMetrics, TextError> {
+        let face = self.face()?;
+        let upem = self.units_per_em.max(1.0);
+        let ascent = face.ascender() as f32 / upem;
+        let descent = -(face.descender() as f32) / upem; // ttf 的 descender 通常为负
+        let line_gap = face.line_gap() as f32 / upem;
+        let x_height = face.x_height().unwrap_or(0) as f32 / upem;
+        let cap_height = face.capital_height().unwrap_or(0) as f32 / upem;
+        Ok(FontMetrics {
+            ascent,
+            descent,
+            line_gap,
+            x_height,
+            cap_height,
+            line_height: ascent + descent + line_gap,
+        })
+    }
+
+    /// 某字形的水平前进量（em 单位）。
+    ///
+    /// 供布局在**不做 shaping** 时估算宽度（例如快速测量），
+    /// 或对已 shaping 的结果做逐字形校验。
+    pub fn advance(&self, glyph: u32) -> Result<f32, TextError> {
+        let face = self.face()?;
+        let gid = ttf_parser::GlyphId(glyph as u16);
+        match face.glyph_hor_advance(gid) {
+            Some(a) => Ok(a as f32 / self.units_per_em.max(1.0)),
+            None => Err(TextError::MissingGlyph(glyph)),
+        }
+    }
+
+    /// 一串文本的**排版宽度**（em 单位），不做 shaping。
+    ///
+    /// 只累加 simple 字形映射的前进量，因此**不含 kerning 与连字**，
+    /// 对宽度是近似（通常略偏宽）。用于快速测量/断行预估；
+    /// 需要精确宽度时请用 [`shape`] 后取末字形位置。
+    /// 字体中没有对应字形的字符按 `.notdef` 处理（跳过，不计宽）。
+    pub fn advance_width(&self, text: &str) -> f32 {
+        let mut w = 0.0;
+        for c in text.chars() {
+            if let Some(g) = self.glyph_index(c) {
+                if let Ok(a) = self.advance(g) {
+                    w += a;
+                }
+            }
+        }
+        w
+    }
+}
+
 /// 一段文本的 shaping 结果：字形序列（位置为 em 单位，相对基线原点）。
 ///
 /// 直接可转成 [`TextRun`] 交给引擎。

@@ -5,35 +5,23 @@
 
 ---
 
-## [未发布] —— M4 damage region + M5 文本 + M6 渐变 / 位图 / 滤镜
+## [0.2.0-alpha] —— M4 增量渲染 + M5 文本 + M6 渐变 / 位图 / 滤镜
 
-> 尚未打版本号。M4 功能闭环；M5 已能渲染真实字体文本但**尚无换行排版**；
-> M6 的渐变与位图在 CPU/GPU 两侧一致实现，**滤镜（离屏层）目前仅有 CPU 参考实现**
-> —— GPU 侧会显式报错而非静默丢效果。
+第二个 Alpha：从"能画图形"扩展到"能画文字、位图、渐变与滤镜，且只重画改动处"。
 
-### M6：渐变（CPU + GPU 一致）
+> **边界说明（诚实清单）**
+> - M4 功能闭环；M5 能渲染真实字体文本但**尚无换行排版**（布局是独立的一层）；
+> - M6 的渐变与位图在 CPU/GPU 两侧逐像素一致；**滤镜（离屏层）目前仅 CPU**，
+>   GPU 侧会**显式报错**而非静默丢效果。
 
-- **模型**（`amiki-scene`）：`GradientKind` 支持**线性 / 径向 / 扫描**，
-  几何存**设备空间**（着色在逐像素阶段，画布变换已作用完）。
-  构造时按 `t` 排序；色标 < 2 或半径非正时返回 `None`（拒绝退化输入）。
-- **解析采样，刻意不查表**：常见做法是把渐变烘成 256 项 LUT，
-  但那会把着色量化到 **1/255**。本项目对解析覆盖率有质量承诺，
-  不该在着色阶段引入额外近似 —— 因此逐像素解析求值。
-- **CPU**（`amiki-raster`）：`BinnedScene` 增加 `gradients` 与 `gradient_index`
-  两张平行表。用独立索引表而非在颜色值里编码下标 ——
-  后者依赖浮点精确相等，一旦有颜色恰好碰撞就会静默出错。
-- **GPU**（`amiki-gpu` + `sparse_fine.wgsl`）：`grad_data` 打包为定长条目
-  （`MAX_GRAD_STOPS = 8`），下标经 `draw_meta.w` 传入（该分量此前闲置）。
-- **编码流**：渐变**完整编码**（类型 + 几何 + repeat + 色标），不降级为实心色。
-- 示例：`headless_png` 的文字改用渐变着色，同时验证 M5 与 M6 正交可组合。
+### M5.1：字体度量（排版的前提）
 
-### 本阶段修复的缺陷（M6）
-
-- **GPU 渐变在首色标之外外插而非 clamp**：WGSL 的区间查找从 `i = 1` 开始，
-  当 `t` 为负时第一次比较即成立，于是以负的 `k` 在 `stop[0]` 与 `stop[1]`
-  之间**外插**，得到比首色标更极端的颜色（实测与 CPU 差 19/255）。
-  两色标场景**恰好掩盖**了这一点（首色标之外的颜色本来就等于首色标），
-  三色标才暴露。现显式 `clamp(t, 0, 1)`。
+- `FontMetrics`：ascent / descent / line_gap / x_height / cap_height / 行高，
+  全部归一化为 **em 单位**（与字号无关，可直接乘字号）。
+- `Font::advance`（字形前进量）、`Font::advance_width`（不做 shaping 的快速测宽）。
+- **不需要新依赖**：`ttf-parser` 的 `Face` 已提供全部数据。
+- 实测（Inter）：ascent 0.969 / descent 0.241 / 行高 1.210 / x 0.546 / cap 0.728 em；
+  快速测宽与 shaping 精确宽度相对差 **0.00%**（交叉验证了 shaping 的游标累加正确）。
 
 ### M6：滤镜（层树）—— CPU 参考实现
 
@@ -49,8 +37,7 @@
   `w ≈ sqrt(12σ²/n + 1)` 并强制为奇数以保证窗口对称。
 - **层缓冲存预乘**：模糊是对颜色加权平均，若存直线 alpha，透明区域的
   "未定义颜色"会被平均进来，边缘出现暗边。
-- **`DropShadow` 语义是"附加"而非"替换"**：保留原内容，在其**后方**叠加模糊着色的副本
-  （与 CSS drop-shadow 直觉一致）。
+- **`DropShadow` 语义是"附加"而非"替换"**：保留原内容，在其**后方**叠加模糊着色的副本。
 - 门面 API：`Canvas::push_layer_filtered(bounds, filter, opacity, blend, |canvas| {...})`。
 
 ### M6：位图绘制（CPU + GPU 一致）
@@ -96,6 +83,26 @@
 - **`image` crate 未启用 jpeg feature**：JPEG 无法解码，而加载函数用 `.ok()?`
   把"解码失败"与"文件不存在"混为一谈，误报成"未找到 img.jpg"，浪费一轮排查。
   现启用 jpeg 并把解码错误单独报出。
+- **`Canvas::text` 位置未随字号缩放**：`TextCache` 把字号折进坐标却仍按 em
+  平移位置，而 `expand_text_run` 用 `scale.then(translate)`（平移量也被缩放）⇒
+  `size≠1` 时字形摆到错误位置。由"缓存展开 vs 直接展开逐点比较"的测试抓出。
+- **`shape()` 忽略 advance**：初版只用 offset，会让所有字形叠在同一处。
+  advance 才决定位置，offset 只做微调（kerning/mark），两者都必须用。
+- **`render_damage` 陈旧像素**：`shade_tile` 在 tile 无绘制时保留原像素（那是
+  "未脏 tile 复用上一帧"的正确语义），但**已脏**的 tile 必须从零重算，
+  否则"某 tile 从有内容变无内容"会永久残留。现脏 tile 先清零再着色。
+- **`Damage` 三态建模**：初版用 `Option<DamageRect>` 把"全脏"与"无脏"混为一谈，
+  导致 4 个测试失败。现用显式 `DamageState { All, Clean, Rect }`。
+
+### 工程质量（0.2.0-alpha）
+
+- 测试 36 → **89**（GPU 16 / CPU 正确性与滤镜 37 / 场景 12 / 字体 8 / 门面 2 /
+  快照 1 / 几何 4 …）
+- `cargo clippy --workspace --all-targets`：**零警告**
+- 规模：Rust 约 10000 行 / 15 文件；WGSL 约 1400 行 / 13 模块
+- 依赖边界：`amiki-math` / `amiki-scene` / `amiki-raster` **零第三方依赖**；
+  `amiki-gpu` 仅 wgpu/bytemuck/pollster；字体栈仅在 `amiki-text`
+- 引入版本控制（22 提交），`.gitattributes` 统一 LF
 
 ### M4：damage region（增量渲染）
 

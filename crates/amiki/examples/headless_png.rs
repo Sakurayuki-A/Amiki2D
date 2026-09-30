@@ -221,6 +221,62 @@ fn main() {
         );
     }
 
+    // ── P0-2：**带滤镜的**静态界面 ──
+    //
+    // 上一条场景没有层。真实 UI 几乎都有阴影/模糊，而层是"整块滤波再合成"的，
+    // 因此这里专门测含层版本：层缓冲跨帧复用，只重算被改动覆盖的 tile。
+    //
+    // 这条曾经是 100%（一有层就全量重画）—— 现在应当接近上面那条。
+    {
+        use amiki::raster::PersistentRenderer;
+        let (w, h) = (1280u32, 720u32);
+        let build = |px: f32| -> amiki::scene::Scene {
+            let mut c = amiki::Canvas::new(w, h);
+            c.rect(0.0, 0.0, w as f32, h as f32, Paint::Solid(INK));
+            c.rect(0.0, 0.0, 220.0, h as f32, Paint::Solid(amiki::scene::Color::rgb8(28, 34, 42)));
+            // 两处带投影的卡片（真实 UI 的常见形态）
+            for (x0, y0) in [(280.0f32, 120.0f32), (760.0, 360.0)] {
+                c.push_layer_filtered(
+                    amiki::scene::LayerBounds::new(x0 as i32 - 24, y0 as i32 - 24, 300, 180),
+                    amiki::scene::Filter::DropShadow {
+                        dx: 8.0,
+                        dy: 10.0,
+                        sigma: 8.0,
+                        color: amiki::scene::Color::rgba8(0, 0, 0, 150),
+                    },
+                    1.0,
+                    amiki::scene::BlendMode::Normal,
+                    |lc| {
+                        lc.rect(x0, y0, x0 + 252.0, y0 + 132.0, Paint::Solid(amiki::scene::Color::rgb8(58, 68, 82)));
+                    },
+                );
+            }
+            // 唯一在动的东西：进度点
+            c.circle(Vec2::new(px, 600.0), 13.0, Paint::Solid(ORANGE));
+            c.scene
+        };
+
+        let mut r = PersistentRenderer::new(0.1);
+        let mut total_work = 0u64;
+        let mut total_all = 0u64;
+        let mut frames = 0u32;
+        for i in 0..=30u32 {
+            let scene = build(320.0 + i as f32 * 18.0);
+            r.update(&scene);
+            let st = r.last_stats();
+            total_work += st.shaded_tiles.max(st.composited_tiles) as u64;
+            total_all += st.total_tiles as u64;
+            frames += 1;
+        }
+        let ratio = total_work as f64 / total_all.max(1) as f64;
+        println!(
+            "P0-2 增量渲染（带投影的静态界面）：{frames} 帧平均重画 {:.1}% 的 tile（省下 {:.1}%）\
+             ← 层缓冲跨帧复用，内容未变的层不重新滤波",
+            ratio * 100.0,
+            (1.0 - ratio) * 100.0
+        );
+    }
+
     let t0 = Instant::now();
     let scene = build_scene(0.7);
     let binned = raster::bin(&scene, 0.1);

@@ -327,3 +327,81 @@ fn incremental_path_does_not_lose_layers() {
     );
     eprintln!("含层场景增量渲染与全量一致，且滤镜确实生效");
 }
+
+/// M4/P0-2：**持久渲染器的增量帧不得丢掉层**。
+///
+/// 这是一个真实的静默错误：`PersistentRenderer::update` 的增量分支只做
+/// `clear_tile` + `shade_tile`，而**层合成发生在 `render` 里**（图元之后）。
+/// 于是首帧（走全量）正确，**第二帧起层整个消失** —— 而且不报错。
+///
+/// 既有的 `incremental_path_does_not_lose_layers` 覆盖的是 `render_damage`，
+/// 它含层时回落到全量渲染，所以那条路是对的；**`update` 是另一条路**，
+/// 这个洞就是被漏掉的地方。
+#[test]
+fn persistent_renderer_keeps_layers_on_incremental_frames() {
+    use amiki_raster::PersistentRenderer;
+
+    // 含一个模糊层的场景。`inner_dx` 用来**改动层内容本身** ——
+    // 这一点是必须的：若只改层外的图元，层的陈旧像素恰好仍是正确的，
+    // 测试会因为"侥幸"而通过（第一版就是这样，没能暴露问题）。
+    let build = |inner_dx: f32| -> Scene {
+        let mut s = Scene::new(200, 160);
+        s.push_layer(
+            amiki_scene::Layer {
+                bounds: LayerBounds::new(40, 30, 120, 100),
+                scene: Scene::new(200, 160),
+                filter: Filter::Blur { sigma: 5.0 },
+                opacity: 1.0,
+                blend: BlendMode::Normal,
+            },
+            |sc| {
+                let mut pb = PathBuilder::new();
+                pb.rect(78.0 + inner_dx, 58.0, 122.0 + inner_dx, 102.0);
+                sc.push(Affine::IDENTITY, pb.build(), Paint::Solid(Color::rgba8(255, 60, 40, 255)));
+            },
+        );
+        s
+    };
+
+    let mut r = PersistentRenderer::new(0.05);
+
+    let s1 = build(0.0);
+    r.update(&s1);
+    let full1 = render(&bin(&s1, 0.05));
+    assert_eq!(r.image(), full1.as_slice(), "首帧（全量）应与 render 一致");
+
+    let s2 = build(14.0); // 层内方块挪动 14px → 层内容变化
+    r.update(&s2);
+    let full2 = render(&bin(&s2, 0.05));
+    let stats = r.last_stats();
+    assert!(
+        stats.shaded_tiles < stats.total_tiles,
+        "本测试要的是增量分支，但着色的 tile 数是 {} / {}（说明走了全量）",
+        stats.shaded_tiles,
+        stats.total_tiles
+    );
+    // 用差异摘要而不是 assert_eq!：整幅字节数组被打印出来会让失败输出无法阅读
+    let got = r.image();
+    let mut diff_px = 0usize;
+    let mut worst = 0u8;
+    for i in 0..(200 * 160) {
+        let a = &got[i * 4..i * 4 + 4];
+        let b = &full2[i * 4..i * 4 + 4];
+        if a != b {
+            diff_px += 1;
+            for k in 0..4 {
+                worst = worst.max(a[k].abs_diff(b[k]));
+            }
+        }
+    }
+    assert!(
+        diff_px == 0,
+        "增量帧与全量渲染必须逐字节一致 —— 尤其**不能丢掉层**；\
+         实际有 {diff_px} 个像素不同（最大通道差 {worst}，画布共 {} 像素）",
+        200 * 160
+    );
+    eprintln!(
+        "持久渲染器的增量帧保住了层（重画 {}/{} tile）",
+        stats.shaded_tiles, stats.total_tiles
+    );
+}

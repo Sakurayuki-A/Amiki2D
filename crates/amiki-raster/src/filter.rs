@@ -65,20 +65,12 @@ impl LayerBuffer {
 /// 模糊/阴影会把影响扩散到内容之外，**必须**先扩张缓冲，
 /// 否则边缘被切掉（而且因为只切一圈，很容易被忽略）。
 pub fn inflated_bounds(bounds: LayerBounds, filter: Filter) -> LayerBounds {
-    match filter {
-        Filter::None => bounds,
-        // 三倍标准差之外的高斯尾部可忽略（覆盖 99.7%）
-        Filter::Blur { sigma } => bounds.inflate(sigma * 3.0),
-        Filter::DropShadow { dx, dy, sigma, .. } => {
-            let b = bounds.inflate(sigma * 3.0);
-            LayerBounds {
-                x: b.x + dx.floor() as i32,
-                y: b.y + dy.floor() as i32,
-                width: b.width + dx.abs().ceil() as u32,
-                height: b.height + dy.abs().ceil() as u32,
-            }
-        }
-    }
+    // **转调 `amiki-scene`**，不在这里再写一份。
+    //
+    // 这个量同时被两处需要：光栅化（决定层缓冲多大）与 damage（决定脏区多大）。
+    // 两份实现必然漂移，而漂移的后果是"层的外扩范围与脏区不一致" —— 边缘残影，
+    // 极难定位。所以真正的实现在 `LayerBounds::inflate_by_filter`。
+    bounds.inflate_by_filter(filter)
 }
 
 /// 三次盒式模糊近似高斯（可分离：先横向后纵向）。

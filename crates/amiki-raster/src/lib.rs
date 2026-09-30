@@ -773,31 +773,33 @@ fn shade_tile(binned: &BinnedScene, img: &mut [u8], tx: usize, ty: usize) {
 /// ```
 ///
 /// `bounds` 之外的像素不参与合成；缓冲范围与 `bounds` 对齐后逐像素叠加。
-fn composite_layer(
-    root: &mut [u8],
-    scene: &amiki_scene::Scene,
+/// 把一层渲染成**已滤波的层缓冲**，并给出它在设备空间的位置。
+///
+/// 这是层处理里最贵的一步（渲染层内容 + 滤波），也是**跨帧缓存的单位**。
+/// 与 [`blend_layer_rect`] 的分工是刻意的：本函数只依赖"层内容"，
+/// 与合成参数（`opacity`/`blend`）无关，所以改不透明度不必重新滤波。
+///
+/// 返回 `None` 表示该层不与画布相交（无需处理）。
+pub fn layer_buffer_from_content(
+    layer_img: &[u8],
+    root_w: u32,
+    root_h: u32,
     layer: &amiki_scene::Layer,
-    eps: f32,
-) {
+) -> Option<(i32, i32, LayerBuffer)> {
     if layer.bounds.is_empty() {
-        return;
+        return None;
     }
-    // 1) 层内容（同一画布尺寸，故层内坐标即设备坐标）
-    let layer_img = render_inner(scene.width, scene.height, &layer.scene, eps);
-
-    // 2) 只取需要合成的范围（向外扩张以容纳滤镜扩散 —— 否则边缘被切掉）
+    // 只取需要合成的范围（向外扩张以容纳滤镜扩散 —— 否则边缘被切掉）
     let b = inflated_bounds(layer.bounds, layer.filter);
-    let (root_w, root_h) = (scene.width, scene.height);
-    // 裁剪到画布内（超出部分无处可合成）
     let bx = b.x.max(0);
     let by = b.y.max(0);
     if bx >= root_w as i32 || by >= root_h as i32 {
-        return;
+        return None;
     }
     let lw = b.width.min(root_w - bx as u32);
     let lh = b.height.min(root_h - by as u32);
     if lw == 0 || lh == 0 {
-        return;
+        return None;
     }
 
     // 从层图拷到层缓冲（**直线色**：滤波必须在颜色上做，见 filter 模块说明）
@@ -806,11 +808,7 @@ fn composite_layer(
         for x in 0..lw {
             let sx = bx + x as i32;
             let sy = by + y as i32;
-            let src = if sx >= 0
-                && sy >= 0
-                && (sx as u32) < root_w
-                && (sy as u32) < root_h
-            {
+            let src = if sx >= 0 && sy >= 0 && (sx as u32) < root_w && (sy as u32) < root_h {
                 let o = ((sy as u32 * root_w + sx as u32) * 4) as usize;
                 [
                     layer_img[o] as f32 / 255.0,
@@ -824,29 +822,63 @@ fn composite_layer(
             buf.set(x, y, src);
         }
     }
-
-    // 3) 滤波
     apply_filter(&mut buf, layer.filter);
+    Some((bx, by, buf))
+}
 
-    // 4) 合成回父图像。
-    //
-    // **关键：在预乘空间合成。** 层缓冲是直线色，先乘 alpha 得到预乘源；
-    // 若直接把直线色交给要求直线输入的 `composite`，模糊后小 alpha 处的
-    // 量化噪声会被放大，边缘出现明显色偏（实测与 GPU 差 86/255）。
-    // 因此把**目标**也转成预乘，算完再转回直线存储。
-    let opacity = layer.opacity.clamp(0.0, 1.0);
-    for y in 0..lh {
-        for x in 0..lw {
-            let p = buf.get(x, y);
+/// 把**已滤波**的层缓冲按不透明度/混合合成到根图像上，**只处理指定设备矩形**。
+///
+/// `rect` 为 `(rx0, ry0, rx1, ry1)`（半开区间，设备像素）。全量合成时传整个画布。
+///
+/// # 为什么必须与 `layer_buffer_from_content` 分开
+///
+/// 增量渲染要跨帧复用层缓冲，只在脏 tile 上重新合成。若把"渲染+滤波+合成"
+/// 写成一个整体，增量路径就得另写一份合成逻辑 —— 两份实现必然漂移，
+/// 表现为"全量与增量在某些边界上不同"。拆开之后两条路径**共用**这两步。
+///
+/// 合成在**预乘空间**进行：层缓冲是直线色，直接交给要求直线输入的 `composite`
+/// 会在小 alpha 处放大模糊量化噪声（实测边缘色偏 86/255）。故把目标也转成预乘，
+/// 算完再转回直线存储。
+#[allow(clippy::too_many_arguments)]
+pub fn blend_layer_rect(
+    root: &mut [u8],
+    root_w: u32,
+    root_h: u32,
+    buf: &LayerBuffer,
+    x: i32,
+    y: i32,
+    opacity: f32,
+    blend: u32,
+    rect: (u32, u32, u32, u32),
+) {
+    if buf.is_empty() {
+        return;
+    }
+    let opacity = opacity.clamp(0.0, 1.0);
+    let (rx0, ry0, rx1, ry1) = rect;
+    // 缓冲内与请求矩形相交的范围
+    let lx0 = (rx0 as i32 - x).max(0).min(buf.width as i32);
+    let ly0 = (ry0 as i32 - y).max(0).min(buf.height as i32);
+    let lx1 = (rx1 as i32 - x).max(0).min(buf.width as i32);
+    let ly1 = (ry1 as i32 - y).max(0).min(buf.height as i32);
+    if lx0 >= lx1 || ly0 >= ly1 {
+        return;
+    }
+    for ly in ly0..ly1 {
+        for lx in lx0..lx1 {
+            let gx = x + lx;
+            let gy = y + ly;
+            if gx < 0 || gy < 0 || gx >= root_w as i32 || gy >= root_h as i32 {
+                continue;
+            }
+            let p = buf.get(lx as u32, ly as u32);
             let sa = p[3] * opacity;
             if sa <= 0.0 {
                 continue;
             }
             // 源：直线 → 预乘
             let src_pm = [p[0] * sa, p[1] * sa, p[2] * sa, sa];
-            let gx = (bx + x as i32) as u32;
-            let gy = (by + y as i32) as u32;
-            let o = ((gy * root_w + gx) * 4) as usize;
+            let o = ((gy as u32 * root_w + gx as u32) * 4) as usize;
             let da = root[o + 3] as f32 / 255.0;
             // 目标：直线 → 预乘
             let dst_pm = [
@@ -855,7 +887,7 @@ fn composite_layer(
                 root[o + 2] as f32 / 255.0 * da,
                 da,
             ];
-            let out_pm = composite_premul(dst_pm, src_pm, layer.blend.id());
+            let out_pm = composite_premul(dst_pm, src_pm, blend);
             let oa = out_pm[3];
             let inv = if oa > 0.0 { 1.0 / oa } else { 0.0 };
             let straight = [out_pm[0] * inv, out_pm[1] * inv, out_pm[2] * inv, oa];
@@ -864,6 +896,47 @@ fn composite_layer(
             }
         }
     }
+}
+
+/// M6：合成一个离屏层到父图像（**全量路径**）。
+///
+/// 步骤与 `filter` 模块的说明一致：
+/// ```text
+/// 1) 把层内容渲进独立缓冲（含它自己的嵌套层 —— 层可嵌套）
+/// 2) 按 bounds 裁出需要的范围，并向外扩张以容纳滤镜扩散
+/// 3) 对整层滤波
+/// 4) 按不透明度 + 混合模式合成回父图像
+/// ```
+///
+/// 本函数只是把 1~4 串起来；真正的工作在 [`layer_buffer_from_content`]
+/// 与 [`blend_layer_rect`] 里，好让增量路径复用同两步。
+fn composite_layer(
+    root: &mut [u8],
+    scene: &amiki_scene::Scene,
+    layer: &amiki_scene::Layer,
+    eps: f32,
+) {
+    if layer.bounds.is_empty() {
+        return;
+    }
+    // 1) 层内容（同一画布尺寸，故层内坐标即设备坐标）
+    let layer_img = render_inner(scene.width, scene.height, &layer.scene, eps);
+    let Some((bx, by, buf)) = layer_buffer_from_content(&layer_img, scene.width, scene.height, layer)
+    else {
+        return;
+    };
+    // 4) 合成回父图像（整幅）
+    blend_layer_rect(
+        root,
+        scene.width,
+        scene.height,
+        &buf,
+        bx,
+        by,
+        layer.opacity,
+        layer.blend.id(),
+        (0, 0, scene.width, scene.height),
+    );
 }
 
 /// 预乘空间下的 src-over + 混合（用于离屏层合成）。

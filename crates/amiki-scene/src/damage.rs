@@ -20,7 +20,7 @@
 
 use amiki_math::{Affine, Vec2};
 
-use crate::{Damage, Draw, Path, PathEl, Scene};
+use crate::{Damage, Draw, LayerBounds, Path, PathEl, Scene};
 
 /// 把一次仿射与路径在设备空间的保守包围盒并入 `out`。
 ///
@@ -120,6 +120,9 @@ pub fn changed_bounds(old: &Draw, new: &Draw) -> Option<[f32; 4]> {
 /// 规则：
 /// - 某个下标只存在于一侧（新增或删除）→ 该侧的包围盒；
 /// - 两侧都有但**内容不同**（变换 / 路径 / 样式 / 混合 / 裁剪任一不同）→ 旧 ∪ 新；
+/// - **层**：层内容/滤镜/范围变化时，标脏该层经滤镜后的**作用范围**
+///   （见 [`LayerBounds::inflate_by_filter`]）。层是"整块滤波再合成"的，
+///   所以层内任何改动都可能影响它作用范围内的一切 —— 这里取保守范围。
 /// - 画布尺寸变化、或出现无法界定的 draw → **整幅全脏**（安全兜底）。
 ///
 /// **只多标、不漏标**。多标只损失性能；漏标会产生错误画面。
@@ -152,5 +155,38 @@ pub fn edit_damage(old: &Scene, new: &Scene) -> Damage {
             (None, None) => unreachable!("i < max(len) 保证至少一侧存在"),
         }
     }
+
+    // —— 层 ——
+    //
+    // 这一整块曾经是缺失的：`edit_damage` 只看 `draws`，于是**层内改动产生零脏区**，
+    // 增量渲染永远看不到它（画面停在旧层内容上，且不报错）。
+    let nl = old.layers.len().max(new.layers.len());
+    for i in 0..nl {
+        match (old.layers.get(i), new.layers.get(i)) {
+            (Some(a), Some(b)) => {
+                if a == b {
+                    continue;
+                }
+                // 层的**作用范围**取两边的并集（滤镜/偏移可能同时变了）
+                let ba = a.inflated_bounds();
+                let bb = b.inflated_bounds();
+                d.invalidate_bounds(bounds_rect(&ba));
+                d.invalidate_bounds(bounds_rect(&bb));
+            }
+            (Some(a), None) => d.invalidate_bounds(bounds_rect(&a.inflated_bounds())),
+            (None, Some(b)) => d.invalidate_bounds(bounds_rect(&b.inflated_bounds())),
+            (None, None) => unreachable!("i < max(len) 保证至少一侧存在"),
+        }
+    }
     d
+}
+
+/// `LayerBounds` → `[x0, y0, x1, y1]`（`Damage` 的矩形约定）。
+fn bounds_rect(b: &LayerBounds) -> [f32; 4] {
+    [
+        b.x as f32,
+        b.y as f32,
+        b.x as f32 + b.width as f32,
+        b.y as f32 + b.height as f32,
+    ]
 }

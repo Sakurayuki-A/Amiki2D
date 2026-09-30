@@ -1,29 +1,25 @@
-//! M6：GPU 可分离盒式模糊（近似高斯）。
+//! M6：GPU 可分离盒式模糊（近似高斯），以**渲染 pass + fragment 采样**实现。
 //!
-//! # 为什么用渲染 pass + fragment shader，而不是 compute + storage texture
+//! # 为什么是渲染 pass 而不是 compute + storage texture
 //!
-//! 最初我用 compute 着色器 + `textureLoad` 读源、`textureStore` 写目标。
-//! 结果是 **dispatch 确实执行了（写常量可见），但读不到数据** ——
-//! 输出与输入逐字节相同。
+//! 最初用 compute 着色器 + `textureLoad`/`textureStore`：dispatch 确实执行
+//! （换成写常量的着色器可见全屏变红），但**读不到数据**，输出与输入逐字节相同。
+//! 换成渲染 pass + 采样器后问题消失 —— 这是本项目已经用熟的路径
+//! （裁剪覆盖率 pass 就是这么做的）。
 //!
-//! 改用渲染 pass 后问题消失：fragment shader 的**采样器**是本项目已经用熟的
-//! 路径（裁剪覆盖率 pass 就是这么做的），而"采样纹理 + 存储纹理"的绑定组合
-//! 在我这里的用法下始终拿不到数据。
-//!
-//! 结论：**走已验证的模式，而不是走理论上更"现代"的模式。**
+//! 教训：**走已验证的模式，而不是理论上更"现代"的模式。**
 //!
 //! # 为什么是可分离 + 三次盒式
 //!
-//! 真二维高斯每像素 O(r²)；**三次盒式**（横纵各 3 遍）在每像素固定采样数下
-//! 即可良好逼近高斯，且**可分离**（先横后纵）。与 CPU 参考实现
-//! （`amiki-raster::filter`）同算法、同盒宽公式，因此两端结果应当接近 ——
-//! 这正是跨端对拍能成立的前提。
+//! 真二维高斯每像素 O(r²)；三次盒式（横纵各 3 遍）在每像素固定采样数下即可
+//! 良好逼近高斯，且可分离。与 CPU 参考实现（`amiki-raster::filter`）同算法、
+//! 同盒宽公式，因此两端结果应当接近 —— 这正是跨端对拍能成立的前提。
 //!
 //! 盒宽 `w ≈ sqrt(12σ²/n + 1)`（n = 3）并强制为奇数保证对称。
 
 use crate::{err, RenderError};
 
-/// 模糊参数（uniform；fragment 与 vertex 共用，故布局需与 WGSL 一致）。
+/// 模糊参数（uniform；4 个 f32，与 WGSL 的 `struct P` 一一对应）。
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct BlurParams {
@@ -35,10 +31,6 @@ pub struct BlurParams {
     pub vertical: f32,
 }
 
-/// 顶点着色器：一个覆盖全屏的三角形（无需顶点缓冲）。
-///
-/// 用 3 个顶点覆盖整个裁剪空间，比 4 顶点四边形少一次三角形装配，
-/// 且不需要 `@builtin(vertex_index)` 之外的任何输入。
 const VS: &str = r#"
 struct VOut {
     @builtin(position) pos: vec4<f32>,
@@ -46,7 +38,7 @@ struct VOut {
 }
 @vertex
 fn vs(@builtin(vertex_index) i: u32) -> VOut {
-    // 覆盖 [-1,3] 的三角形：(0,0) (2,0) (0,2) 映射到 uv
+    // 覆盖整个裁剪空间的三角形（无需顶点缓冲）
     var p = array<vec2<f32>, 3>(
         vec2<f32>(-1.0, -1.0),
         vec2<f32>( 3.0, -1.0),
@@ -54,13 +46,11 @@ fn vs(@builtin(vertex_index) i: u32) -> VOut {
     );
     var o: VOut;
     o.pos = vec4<f32>(p[i], 0.0, 1.0);
-    // 转换到 [0,1] 纹理坐标
     o.uv = (p[i] + vec2<f32>(1.0, 1.0)) * 0.5;
     return o;
 }
 "#;
 
-/// 片元着色器：沿一个方向做盒式平均。
 const FS: &str = r#"
 struct P {
     width: f32,
@@ -76,7 +66,6 @@ struct P {
 fn fs(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
     let r = i32(p.box_w * 0.5);
     let n = f32(2 * r + 1);
-    // 纹素尺寸
     let texel = vec2<f32>(1.0 / p.width, 1.0 / p.height);
     var acc = vec4<f32>(0.0, 0.0, 0.0, 0.0);
     for (var i = -r; i <= r; i = i + 1) {
@@ -86,7 +75,6 @@ fn fs(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
         } else {
             off = vec2<f32>(0.0, f32(i) * texel.y);
         }
-        // 钳到 [0,1] 避免采到边缘外
         let s = clamp(uv + off, vec2<f32>(0.0, 0.0), vec2<f32>(1.0, 1.0));
         acc += textureSampleLevel(src_tex, src_smp, s, 0.0);
     }
@@ -116,7 +104,7 @@ pub const BLUR_TEXTURE_USAGE: wgpu::TextureUsages = wgpu::TextureUsages::RENDER_
     .union(wgpu::TextureUsages::COPY_SRC)
     .union(wgpu::TextureUsages::COPY_DST);
 
-/// 模糊所需的资源（渲染管线 + 布局 + 采样器）。
+/// 模糊资源（渲染管线 + 绑定布局 + 采样器）。
 pub struct BlurResources {
     pub pipeline: wgpu::RenderPipeline,
     pub bgl: wgpu::BindGroupLayout,
@@ -204,7 +192,12 @@ pub fn create_resources(device: &wgpu::Device) -> BlurResources {
 
 /// 一趟方向模糊：把 `src` 模糊后渲染进 `dst`。
 ///
-/// 调用方需在此**之前**把含方向的 `BlurParams` 写进 `params_buf`。
+/// 调用方需在此**之前**把对应方向的 `BlurParams` 写进 `params_buf`。
+///
+/// **注意**：横纵两趟必须使用**各自独立的** `params_buf`。同一个命令缓冲内
+/// 若共用一个缓冲并写两次，队列上"写参数1 → 写参数2 → 提交"会使两趟都读到
+/// 第二次的值 —— 表现为"横向那趟从未执行"，且若测试数据恰好对该方向不敏感，
+/// 就会看不出任何异常。
 pub fn blur_pass(
     device: &wgpu::Device,
     encoder: &mut wgpu::CommandEncoder,
@@ -218,8 +211,14 @@ pub fn blur_pass(
         layout: &res.bgl,
         entries: &[
             wgpu::BindGroupEntry { binding: 0, resource: params_buf.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(src) },
-            wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(&res.sampler) },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::TextureView(src),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: wgpu::BindingResource::Sampler(&res.sampler),
+            },
         ],
     });
     let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {

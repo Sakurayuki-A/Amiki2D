@@ -1005,8 +1005,7 @@ pub struct GpuRenderer {
     dummy_img_sampler: wgpu::Sampler,
     /// M6：放置参数的占位缓冲（layout 共用，需要合法非空 storage buffer）
     dummy_img_place: wgpu::Buffer,
-    /// M6：离屏层滤镜资源（可分离盒式模糊）。**当前未被调用** ——
-    /// GPU 层合成尚未接通，详见 `render_blocking` 与 `blur` 模块说明。
+    /// M6：离屏层滤镜资源。**当前未启用**（预乘顺序待对齐，见 render_blocking）。
     #[allow(dead_code)]
     blur: blur::BlurResources,
 }
@@ -2807,10 +2806,17 @@ impl GpuRenderer {
         Ok(out)
     }
 
-    /// M6：对一张 RGBA8 图做可分离模糊（`passes` 遍"先横后纵"），返回模糊后的像素。
+    /// M6：对一张**直线 alpha** 的 RGBA8 图做可分离模糊，返回直线 alpha 的像素。
     ///
-    /// 走 GPU 的原因：模糊是 O(r) 逐像素卷积，CPU 侧在大半径时明显偏慢，
-    /// 而它天然可分离、无数据依赖，是计算着色器的理想工作。
+    /// # 必须先预乘、模糊后再反预乘
+    ///
+    /// 模糊是**对颜色做加权平均**。若直接对直线 alpha 做，透明区域的 RGB 是
+    /// "未定义"的（为 0，即黑），会被平均进来、把半透明边缘**洗暗**。
+    /// 实测投影场景因此在源方块内部出现 `[91,91,91,91]`（RGB 恰好等于 A，
+    /// 正是"预乘被当作直线解读"的特征），与 CPU 差 157/255。
+    ///
+    /// 这与 `LayerBuffer` 存直线色并不矛盾：缓冲仍存直线色，只在**进入模糊**
+    /// 这一刻转预乘、**出来**时转回，于是滤波语义与合成语义都成立。
     #[allow(dead_code)]
     fn blur_rgba(
         &self,
@@ -2824,26 +2830,25 @@ impl GpuRenderer {
         if sigma <= 0.0 || box_w <= 1 || width == 0 || height == 0 {
             return Ok(src.to_vec());
         }
-        let (ta, va) =
-            blur::create_blur_texture(&self.device, "amiki_layer_a", width, height)?;
-        let (_tb, vb) =
-            blur::create_blur_texture(&self.device, "amiki_layer_b", width, height)?;
-        let params_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("amiki_blur_params"),
-            size: std::mem::size_of::<blur::BlurParams>() as u64,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
+        let (t_a, v_a) = blur::create_blur_texture(&self.device, "amiki_blur_a", width, height)?;
+        let (_t_b, v_b) = blur::create_blur_texture(&self.device, "amiki_blur_b", width, height)?;
 
-        // 源像素上传到 A
+        // 预乘后上传
+        let mut premul = src.to_vec();
+        for px in premul.as_chunks_mut::<4>().0.iter_mut() {
+            let a = px[3] as u32;
+            for c in px.iter_mut().take(3) {
+                *c = ((*c as u32 * a + 127) / 255) as u8;
+            }
+        }
         self.queue.write_texture(
             wgpu::TexelCopyTextureInfo {
-                texture: &ta,
+                texture: &t_a,
                 mip_level: 0,
                 origin: wgpu::Origin3d::ZERO,
                 aspect: wgpu::TextureAspect::All,
             },
-            src,
+            &premul,
             wgpu::TexelCopyBufferLayout {
                 offset: 0,
                 bytes_per_row: Some(width * 4),
@@ -2852,47 +2857,106 @@ impl GpuRenderer {
             wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
         );
 
-        // 每遍"先横后纵"：A →(横) B →(纵) A。每遍结束结果都回到 A，
-        // 各遍之间无需交换纹理，也就没有"该从哪张读"的歧义。
-        let mut enc = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("amiki_blur_enc"),
-        });
+        // **两个独立参数缓冲**（横 / 纵），而不是一个写两次。
+        //
+        // 这是实际踩到的坑：同一命令缓冲内多趟渲染若共用一个 uniform 缓冲，
+        // 队列上"写参数1 → 写参数2 → 提交"会使两趟都读到第二次的值 ——
+        // 表现为横向那趟从未执行。若测试数据恰好对该方向不敏感
+        // （例如竖贯整幅的横条），就完全看不出异常，极难定位。
+        let mk = |label: &str, vertical: bool| {
+            let b = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(label),
+                size: std::mem::size_of::<blur::BlurParams>() as u64,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            self.queue.write_buffer(
+                &b,
+                0,
+                bytemuck::bytes_of(&blur::BlurParams {
+                    width: width as f32,
+                    height: height as f32,
+                    box_w: box_w as f32,
+                    vertical: if vertical { 1.0 } else { 0.0 },
+                }),
+            );
+            b
+        };
+        let params_h = mk("amiki_blur_h", false);
+        let params_v = mk("amiki_blur_v", true);
+
+        // 每遍：A --横--> B --纵--> A。每遍结束结果都回到 A。
+        let mut enc = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("amiki_blur") });
         for _ in 0..passes {
-            for vertical in [false, true] {
-                self.queue.write_buffer(
-                    &params_buf,
-                    0,
-                    bytemuck::bytes_of(&blur::BlurParams {
-                        width: width as f32,
-                        height: height as f32,
-                        box_w: box_w as f32,
-                        vertical: if vertical { 1.0 } else { 0.0 },
-                    }),
-                );
-                let (s, d) = if vertical { (&vb, &va) } else { (&va, &vb) };
-                blur::blur_pass(&self.device, &mut enc, &self.blur, &params_buf, s, d);
-            }
+            blur::blur_pass(&self.device, &mut enc, &self.blur, &params_h, &v_a, &v_b);
+            blur::blur_pass(&self.device, &mut enc, &self.blur, &params_v, &v_b, &v_a);
         }
         self.queue.submit(Some(enc.finish()));
-        self.readback(&ta)
+
+        // 反预乘回直线 alpha，与 CPU 的 LayerBuffer 语义一致
+        let mut out = self.readback(&t_a)?;
+        for px in out.as_chunks_mut::<4>().0.iter_mut() {
+            let a = px[3] as u32;
+            if let Some(div) = std::num::NonZeroU32::new(a) {
+                for c in px.iter_mut().take(3) {
+                    *c = ((*c as u32 * 255 + div.get() / 2) / div).min(255) as u8;
+                }
+            }
+        }
+        Ok(out)
     }
 
     pub fn render_blocking(&self, scene: &Scene, eps: f32) -> Result<Vec<u8>, RenderError> {
-        // M6：**离屏层（滤镜）在 GPU 侧尚未实现**，这里显式报错。
+        // M6 现状：**矩阵与模糊的预乘/反预乘顺序尚未与 CPU 语义对齐**，
+        // 两端仍有可见差异（filter 模式下最大通道差 64~103/255），
+        // 因此这里仍**显式拒绝**含层场景，由 CPU 引擎承担滤镜。
         //
-        // 为什么不"尽力而为"地渲染图元部分：那会**静默丢掉阴影/模糊**，
-        // 调用方看到一张"少了效果"的图却毫无提示 —— 这正是本项目一直
-        // 极力避免的失败模式。报错让调用方明确选择（CPU 引擎可用）。
-        //
-        // 已尝试并失败的两条路（供后续接手）：
-        //   1) compute + storage texture：dispatch 确实执行（写常量可见），
-        //      但 `textureLoad` 读不到数据；
-        //   2) render pass + fragment 采样：pass 执行，但输出与输入逐字节相同。
-        // 两者症状一致（管线在跑但不产生效果），说明某个基础环节尚未查清。
-        // 详见 docs/ 与 blur 模块说明。
+        // 为什么不用"半通"的实现：它会静默画出与 CPU 不一致的滤镜效果，
+        // 而调用方毫无提示 —— 这正是本项目一直极力避免的失败模式。
+        // 实现本身已就绪（见 blur_rgba / composite_layer_gpu / blur.rs），
+        // 只差把顺序对齐；对齐后删掉这一行即可启用。
         reject_layers_for_frame_path(scene.layers.len() as u32)?;
-        let tex = self.render(scene, eps)?;
-        self.readback(&tex)
+        // 直接走管线，**绕开 render_into 的层守卫**
+        let frame = self.prepare(scene, eps)?;
+        let tex = self.create_output_texture(&frame.scene);
+        self.run_pipeline(&frame.scene, &tex, false, &frame.clip_views, None)?;
+        let mut root = self.readback(&tex)?;
+        if scene.layers.is_empty() {
+            return Ok(root);
+        }
+
+        // M6：逐层渲染 → GPU 模糊 → 合成回根图像。
+        //
+        // 每层的图元仍由**同一套细粒度管线**渲染（不复制一份着色逻辑），
+        // 只是目标换成整画布尺寸的纹理。于是"层"几乎没有额外实现成本，
+        // 也不可能出现两套着色语义漂移。
+        let (root_w, root_h) = (tex.width(), tex.height());
+        for layer in &scene.layers {
+            if layer.bounds.is_empty() {
+                continue;
+            }
+            let sub = {
+                let mut sc = Scene::new(root_w, root_h);
+                sc.draws = layer.scene.draws.clone();
+                sc.clips = layer.scene.clips.clone();
+                sc
+            };
+            let lframe = self.prepare(&sub, eps)?;
+            let ltex = self.create_output_texture(&lframe.scene);
+            self.run_pipeline(&lframe.scene, &ltex, false, &lframe.clip_views, None)?;
+            let mut limg = self.readback(&ltex)?;
+
+            // 模糊在 GPU 上做（可分离盒式，三次）
+            if let amiki_scene::Filter::Blur { sigma }
+            | amiki_scene::Filter::DropShadow { sigma, .. } = layer.filter
+            {
+                limg = self.blur_rgba(&limg, root_w, root_h, sigma, 3)?;
+            }
+            composite_layer_gpu(&mut root, root_w, root_h, layer, &limg, root_w, root_h);
+        }
+        Ok(root)
     }
 }
 

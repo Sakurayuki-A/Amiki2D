@@ -466,6 +466,12 @@ pub struct FrameProfile {
     pub resolve_ts_ms: Option<f64>,
     /// M3.6：本帧因容量不足被作废重做的次数（正常应恒为 0）
     pub capacity_overflows: u32,
+    /// M3.6：本帧是否走了投机路径（该场景容量已知）。**运行时报告**，
+    /// 诊断据此判断"读回为何仍在计时"，而不是靠注释描述。
+    pub speculative: bool,
+    /// M3.6 投机路径专属：帧尾读回**实际用量**的耗时（溢出检测与容量更新）。
+    /// 测量路径为 `None`（那两次读回自己就给出了用量）。
+    pub usage_readback_ms: Option<f64>,
     /// 逐 pass GPU 时长
     pub timestamps: PassTimings,
 }
@@ -483,6 +489,7 @@ impl FrameProfile {
             + self.readback1_ms.unwrap_or(0.0)
             + self.readback2_ms.unwrap_or(0.0)
             + self.readback_dense_ms.unwrap_or(0.0)
+            + self.usage_readback_ms.unwrap_or(0.0)
             + self.dump_ms.unwrap_or(0.0)
             + self.resolve_ts_ms.unwrap_or(0.0)
     }
@@ -506,7 +513,12 @@ impl FrameProfile {
         push(&mut s, "读回2", self.readback2_ms);
         push(&mut s, "读回(稠密)", self.readback_dense_ms);
         push(&mut s, "转储", self.dump_ms);
+        push(&mut s, "用量读回", self.usage_readback_ms);
         push(&mut s, "时间戳解析", self.resolve_ts_ms);
+        s.push_str(if self.speculative { " [投机]" } else { " [测量]" });
+        if self.capacity_overflows > 0 {
+            s.push_str(&format!(" [溢出重做 {}]", self.capacity_overflows));
+        }
         s
     }
 }
@@ -606,6 +618,10 @@ const MAX_CONSECUTIVE_OVERFLOWS: u32 = 2;
 pub struct SparseCapacityTable {
     entries: std::collections::HashMap<SceneKey, TableEntry>,
     clock: u64,
+    /// 累计溢出次数（**只增**）。诊断与测试用：单帧的 `capacity_overflows`
+    /// 在重做成功后不易观察（表项里的连续计数会被清零），累计值才能证明
+    /// "确实发生过溢出并被处理过"。
+    overflow_total: u64,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -637,6 +653,9 @@ impl SparseCapacityTable {
     /// 记录该 key 的实测用量。`overflowed` 表示这一帧是因容量不足作废的。
     pub fn record(&mut self, key: SceneKey, usage: SparseCapacity, overflowed: bool) {
         self.clock += 1;
+        if overflowed {
+            self.overflow_total += 1;
+        }
         match self.entries.get_mut(&key) {
             Some(e) => {
                 // 只增不减：容量是"留多少格"，取历史最大值即可。
@@ -685,6 +704,11 @@ impl SparseCapacityTable {
     /// 表是否为空（诊断用；与 `len` 成对，符合 clippy 的约定）。
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
+    }
+
+    /// 累计溢出次数（只增）。测试用它证明"确实发生过溢出"。
+    pub fn overflow_total(&self) -> u64 {
+        self.overflow_total
     }
 
     /// 诊断：该 key 是否已放弃投机。
@@ -1770,6 +1794,14 @@ impl GpuRenderer {
         self.sparse_capacity.lock().ok().and_then(|mut t| t.get(key))
     }
 
+    /// 累计溢出次数（只增）。测试用它断言"溢出确实发生并被处理"。
+    pub fn capacity_overflow_total(&self) -> u64 {
+        self.sparse_capacity
+            .lock()
+            .map(|t| t.overflow_total())
+            .unwrap_or(0)
+    }
+
     /// 诊断：容量表的项数（长跑里不该无限增长）。
     pub fn capacity_table_len(&self) -> usize {
         self.sparse_capacity.lock().map(|t| t.len()).unwrap_or(0)
@@ -2650,20 +2682,33 @@ impl GpuRenderer {
         self.queue.submit(Some(enc1a.finish()));
         prof.encode1a_ms = t_enc1.elapsed().as_secs_f64() * 1000.0;
 
-        // 〖读回 1〗稀疏规模 → 分配稀疏缓冲
-        let t_rb1 = Instant::now();
-        let stats_bytes = self.read_buffer(&stats_buf, 32)?;
-        prof.readback1_ms = Some(t_rb1.elapsed().as_secs_f64() * 1000.0);
-        let st: [u32; 8] = bytemuck::pod_read_unaligned(&stats_bytes);
-        let (n_cells, n_buckets, n_tile_entries) = (st[0], st[1], st[2]);
-        if let Some(d) = dump.as_deref_mut() {
-            if d.sparse_stats.is_some() {
-                d.sparse_stats = Some(st);
+        // 〖容量 1〗投机分配：该场景容量已知则**直接采用，不再停顿**
+        //
+        // 原实现必须在此读回规模，而那是一次同步停顿（实测 2.35 ms，其中
+        // 约 1.4 ms 是纯 fence/map 延迟）。改为用**该场景**上一帧学到的容量
+        // 直接分配；只有首帧、或该场景已放弃投机时才真的读一次。
+        let cap = if learns_capacity { self.sparse_capacity(key) } else { None };
+        let speculative = cap.is_some();
+        prof.speculative = speculative;
+
+        let (n_cells, n_buckets, n_tile_entries) = match cap {
+            Some(c) => (c.cells, c.buckets, c.tile_entries),
+            None => {
+                let t_rb1 = Instant::now();
+                let stats_bytes = self.read_buffer(&stats_buf, 32)?;
+                prof.readback1_ms = Some(t_rb1.elapsed().as_secs_f64() * 1000.0);
+                let st: [u32; 8] = bytemuck::pod_read_unaligned(&stats_bytes);
+                if let Some(d) = dump.as_deref_mut() {
+                    if d.sparse_stats.is_some() {
+                        d.sparse_stats = Some(st);
+                    }
+                }
+                if st[0] == 0 {
+                    return Ok(false); // 无任何内容覆盖画布
+                }
+                (st[0], st[1], st[2])
             }
-        }
-        if n_cells == 0 {
-            return Ok(false); // 无任何内容覆盖画布
-        }
+        };
         let cell_aux_buf = mk_storage("amiki_sparse_cell_aux", (n_cells as u64) * 8);
         let cell_csr_buf = mk_storage("amiki_sparse_cell_csr", ((n_cells + 1) as u64) * 4);
         let buckets_buf = mk_storage("amiki_sparse_buckets", (n_buckets as u64) * 4);
@@ -2705,12 +2750,17 @@ impl GpuRenderer {
         self.queue.submit(Some(enc1b.finish()));
         prof.encode1b_ms = t_enc1b.elapsed().as_secs_f64() * 1000.0;
 
-        // 〖读回 2〗成员总数 → 分配段列表
-        let t_rb2 = Instant::now();
-        let stats_bytes = self.read_buffer(&stats_buf, 32)?;
-        prof.readback2_ms = Some(t_rb2.elapsed().as_secs_f64() * 1000.0);
-        let st2: [u32; 8] = bytemuck::pod_read_unaligned(&stats_bytes);
-        let n_items = st2[3];
+        // 〖容量 2〗成员总数：投机时同样来自该场景的容量（理由见「容量 1」）
+        let (n_items, measured2) = match cap {
+            Some(c) => (c.items, None),
+            None => {
+                let t_rb2 = Instant::now();
+                let stats_bytes = self.read_buffer(&stats_buf, 32)?;
+                prof.readback2_ms = Some(t_rb2.elapsed().as_secs_f64() * 1000.0);
+                let st2: [u32; 8] = bytemuck::pod_read_unaligned(&stats_bytes);
+                (st2[3], Some(st2))
+            }
+        };
         let cell_segs_buf = mk_storage("amiki_sparse_cell_segs", (n_items.max(1) as u64) * 16);
 
         // ———— enc2：单元 CSR → tile 桶表 → scatter → carry → fine ————
@@ -2828,26 +2878,51 @@ impl GpuRenderer {
         self.queue.submit(Some(enc2.finish()));
         prof.submit2_ms = t_sub2.elapsed().as_secs_f64() * 1000.0;
 
-        // M3.6：本帧 GPU 工作已全部提交，把**实测用量**记进该场景的容量表项。
-        // （本步仍每帧测量；据容量查表来分配是下一步 —— 见 `learns_capacity` 的取用处。）
+        // M3.6：本帧 GPU 工作已全部提交。确定**实际用量**并记进该场景的容量表项。
+        //
+        // 测量路径下分配值本身就来自实测，用量即它，不可能溢出。
+        // 投机路径下分配值只是容量，**必须读回实际用量**才能判断是否溢出
+        // —— 溢出的那一帧画面残缺，由外层作废重做（见 `run_pipeline_sparse`）。
+        let allocated = SparseCapacity {
+            cells: n_cells,
+            buckets: n_buckets,
+            tile_entries: n_tile_entries,
+            items: n_items,
+            overflows: 0,
+        };
+        let (usage, overflow) = if speculative {
+            let t_use = Instant::now();
+            let bytes = self.read_buffer(&stats_buf, 32)?;
+            prof.usage_readback_ms = Some(t_use.elapsed().as_secs_f64() * 1000.0);
+            let u: [u32; 8] = bytemuck::pod_read_unaligned(&bytes);
+            let usage = SparseCapacity {
+                cells: u[0],
+                buckets: u[1],
+                tile_entries: u[2],
+                items: u[3],
+                overflows: 0,
+            };
+            let ovf = allocated.exceeds(&usage);
+            (usage, ovf)
+        } else {
+            (allocated, false)
+        };
         if learns_capacity {
-            self.store_sparse_capacity(
-                key,
-                SparseCapacity {
-                    cells: n_cells,
-                    buckets: n_buckets,
-                    tile_entries: n_tile_entries,
-                    items: n_items,
-                    overflows: 0,
-                },
-                false,
-            );
+            self.store_sparse_capacity(key, usage, overflow);
+        }
+        if overflow {
+            return Ok(true);
         }
 
         // —— 诊断转储（M3.5：全字段无条件转储，供 check_sparse_consistency 使用）——
         let t_dump = Instant::now();
         if let Some(d) = dump {
-            d.sparse_stats = Some(st2);
+            // 诊断路径必然走测量（`learns_capacity` 要求 `dump.is_none()`），
+            // 因此这里一定拿得到实测统计。用 `if let` 而非 `expect`：
+            // 万一将来约束被改动，也只是少一份诊断，而不是 panic 掉渲染。
+            if let Some(st2) = measured2 {
+                d.sparse_stats = Some(st2);
+            }
             let b = self.read_buffer(&strip_meta_buf, n_strips as usize * 16)?;
             d.strip_meta = Some(bytemuck::cast_slice(&b).to_vec());
             let b = self.read_buffer(&tr_offsets_buf, tiles_y as usize * 8)?;
@@ -4632,6 +4707,105 @@ mod tests {
             "大场景的容量必须等于它自己的实测用量"
         );
     }
+
+    /// M3.6：**容量不足时绝不允许把残缺的画面交出去** —— 这是投机分配
+    /// 能成立的前提，也是本方案唯一真正危险的地方。
+    ///
+    /// 本测试**强制制造溢出**：先正常渲染一帧让该场景的容量被学到，然后把
+    /// 它的容量手工改到极小（1 格），再渲染一帧 —— **并检查这一帧自己**返回
+    /// 的像素。累计溢出计数用来证明"溢出确实发生在这一次调用上"，否则测试
+    /// 可能在没触发溢出的情况下空转通过。
+    ///
+    /// 注意：必须检查**溢出帧本身**的像素。曾经写成检查溢出之后下一帧的像素，
+    /// 那时容量已被修正，即使完全取消失败重做测试也照样通过 —— 即测试没牙。
+    /// 已用"临时取消重做"验证过本测试确实会失败。
+    #[test]
+    fn speculative_overflow_is_redone_correctly() {
+        use amiki_math::{Affine, Vec2};
+        use amiki_scene::{Color, Paint, PathBuilder, Scene};
+
+        let Ok(renderer) = pollster::block_on(GpuRenderer::new()) else {
+            eprintln!("跳过：无 GPU 适配器");
+            return;
+        };
+
+        let mut scene = Scene::new(200, 200);
+        let mut pb = PathBuilder::new();
+        pb.rect(0.0, 0.0, 200.0, 200.0);
+        scene.push(Affine::IDENTITY, pb.build(), Paint::Solid(Color::rgb8(246, 243, 238)));
+        for i in 0..40 {
+            let mut pb = PathBuilder::new();
+            pb.circle(
+                Vec2::new(20.0 + (i as f32 * 11.0) % 170.0, 20.0 + (i as f32 * 7.0) % 170.0),
+                7.0,
+                false,
+            );
+            scene.push(Affine::IDENTITY, pb.build(), Paint::Solid(Color::rgba8(200, 60, 50, 210)));
+        }
+
+        // ① 先渲染一帧：学到容量（走测量路径）
+        renderer.render_blocking(&scene, 0.05).expect("首帧渲染失败");
+        let key = renderer.capacity_entries()[0].0;
+
+        // ② 把该场景的容量破坏到极小，**强制下一帧溢出**
+        {
+            let mut t = renderer.sparse_capacity.lock().expect("容量锁中毒");
+            let e = t.entries.get_mut(&key).expect("应有该场景的表项");
+            e.cap.cells = 1;
+            e.cap.buckets = 1;
+            e.cap.tile_entries = 1;
+            e.cap.items = 1;
+            e.overflows = 0; // 确保不会被"放弃投机"的策略提前挡掉
+        }
+        assert!(!renderer.capacity_gave_up(key), "该场景应仍在投机");
+
+        // ③ 渲染**溢出帧本身**并取它的像素
+        let overflow_before = renderer.capacity_overflow_total();
+        let gpu = renderer.render_blocking(&scene, 0.05).expect("溢出帧渲染失败");
+        assert_eq!(
+            renderer.capacity_overflow_total(),
+            overflow_before + 1,
+            "容量被破坏到 1 格，这一次调用必须恰好触发一次溢出"
+        );
+
+        // ④ 溢出帧交出的画面必须仍然正确（若没有重做，这里会缺内容）
+        let cpu = amiki_raster::render(&amiki_raster::bin(&scene, 0.05));
+        let mut max_diff = 0u32;
+        let mut worst = (0usize, 0usize);
+        for i in 0..(200 * 200) {
+            for k in 0..4 {
+                let d = (gpu[i * 4 + k] as i32 - cpu[i * 4 + k] as i32).unsigned_abs();
+                if d > max_diff {
+                    max_diff = d;
+                    worst = (i % 200, i / 200);
+                }
+            }
+        }
+        assert!(
+            max_diff <= 2,
+            "溢出重做后画面必须仍与 CPU 一致，实际最大通道差 {max_diff}（位于 {worst:?}）"
+        );
+
+        // ⑤ 容量应已按实测用量恢复
+        let cap = renderer
+            .capacity_entries()
+            .into_iter()
+            .find(|(k, _)| *k == key)
+            .map(|(_, c)| c)
+            .expect("表项应仍在");
+        let st = renderer
+            .sparse_stats(&scene, 0.05)
+            .expect("统计失败")
+            .expect("稀疏统计缺失");
+        assert!(
+            cap.cells >= st.n_cells && cap.items >= st.n_items,
+            "重做后容量应至少覆盖实测用量：{cap:?} vs cells={} items={}",
+            st.n_cells,
+            st.n_items
+        );
+    }
+
+
 
     /// M3a：轴对齐矩形（多 draw、半透明、跨 tile、部分出画布）——strip 逐格对拍。
     #[test]

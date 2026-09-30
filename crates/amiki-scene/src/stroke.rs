@@ -39,7 +39,8 @@
 //! 再把折线交给本模块。这也意味着描边路径在 GPU 侧以线段形式上传 ——
 //! 与填充路径"曲线保持为曲线"不同，这是描边固有的性质。
 
-use amiki_math::Vec2;
+use crate::{Path, PathEl};
+use amiki_math::{Affine, CubicBez, QuadBez, Vec2};
 
 /// 线端样式（开放子路径的两端）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -406,6 +407,123 @@ pub fn stroke_polyline(pts: &[Vec2], closed: bool, style: &StrokeStyle) -> Vec<V
     vec![outline]
 }
 
+
+// ============================================================================
+// 路径级 API：压平 → 描边 → 组装成可填充的路径
+// ============================================================================
+
+/// 把路径压平成若干折线，每条形如 `(顶点, 是否闭合)`。
+///
+/// `transform` 会先作用到点上（控制点变换后再压平，与光栅化同一顺序）。
+/// 闭合子路径（以 [`PathEl::Close`] 结尾）标记为 `true`；未闭合的为 `false`，
+/// 描边时会给它们加端帽。
+///
+/// **与 `amiki-raster::flatten_draw` 的关系**：那里是给分箱用的、输出变换后的
+/// 线段；这里是给描边用的、输出子路径折线。两者都建立在 `amiki-math` 的
+/// 曲线压平上，且**描边产出的轮廓此后只含直线段**，不会再经过曲线压平，
+/// 所以两者的精度差异不会叠加。
+pub fn flatten_path(path: &Path, transform: &Affine, eps: f32) -> Vec<(Vec<Vec2>, bool)> {
+    fn end_sub(sub: &mut Vec<Vec2>, closed: bool, out: &mut Vec<(Vec<Vec2>, bool)>) {
+        if sub.len() >= 2 {
+            out.push((std::mem::take(sub), closed));
+        } else {
+            sub.clear();
+        }
+    }
+
+    let mut out: Vec<(Vec<Vec2>, bool)> = Vec::new();
+    let mut sub: Vec<Vec2> = Vec::new();
+    let mut closed = false;
+    for el in &path.els {
+        match *el {
+            PathEl::MoveTo(p) => {
+                end_sub(&mut sub, closed, &mut out);
+                closed = false;
+                sub.push(transform.map_point(p));
+            }
+            PathEl::LineTo(p) => {
+                sub.push(transform.map_point(p));
+            }
+            PathEl::QuadTo(c, p) => {
+                if let Some(&last) = sub.last() {
+                    // 控制点与终点变换后压平（与光栅化同序）
+                    let q = QuadBez::new(last, transform.map_point(c), transform.map_point(p));
+                    q.flatten(eps, &mut sub);
+                }
+            }
+            PathEl::CubicTo(c1, c2, p) => {
+                if let Some(&last) = sub.last() {
+                    let cb = CubicBez::new(
+                        last,
+                        transform.map_point(c1),
+                        transform.map_point(c2),
+                        transform.map_point(p),
+                    );
+                    cb.flatten(eps, &mut sub);
+                }
+            }
+            PathEl::Close => {
+                if sub.len() >= 2 {
+                    closed = true;
+                }
+                end_sub(&mut sub, closed, &mut out);
+                closed = false;
+            }
+        }
+    }
+    end_sub(&mut sub, closed, &mut out);
+    out
+}
+
+/// 把一条路径**描边**成一条只含直线段的填充路径。
+///
+/// # 为什么在用户空间描边、再变换轮廓
+///
+/// 描边区域是在**用户空间**定义的（线宽是用户单位）。先描边再变换，
+/// 与"先变换再按缩放后的线宽描边"只在等比缩放下等价；旋转与非等比缩放下
+/// 只有前者是对的。所以这里：
+///
+/// 1. 在用户空间压平路径（容差按变换的尺度折算，保证设备空间精度一致）
+/// 2. 在用户空间生成描边轮廓
+/// 3. 把轮廓点变换到设备空间
+///
+/// # 返回值
+///
+/// 一条 [`Path`]，其子路径即各条轮廓。调用方把它当**填充**绘制即可 ——
+/// 描边不需要后端任何改动，因为轮廓已经退化成普通多边形。
+pub fn stroke_path(
+    path: &Path,
+    transform: &Affine,
+    style: &StrokeStyle,
+    eps: f32,
+) -> Path {
+    // 变换的尺度：用于把设备像素容差折算回用户空间。
+    // 取两个基向量像的长度的最大值（对非等比缩放是保守估计）。
+    let sx = transform.map_vec(Vec2::new(1.0, 0.0)).hypot();
+    let sy = transform.map_vec(Vec2::new(0.0, 1.0)).hypot();
+    let scale = sx.max(sy).max(1e-6);
+    let eps_user = (eps / scale).max(1e-6);
+
+    let mut els: Vec<PathEl> = Vec::new();
+    // **在用户空间压平与描边**（恒等变换），只在最后把轮廓点变换到设备空间。
+    // 这里曾经把 `transform` 传给 flatten_path，于是点是设备空间、线宽却仍是
+    // 用户单位 —— 等价于"先变换再按原线宽描边"，3 倍缩放下面积只有 3 倍
+    // 而不是 9 倍（实测 480，正确 1440）。
+    for (poly, closed) in flatten_path(path, &Affine::IDENTITY, eps_user) {
+        for c in stroke_polyline(&poly, closed, style) {
+            if c.len() < 3 {
+                continue;
+            }
+            els.push(PathEl::MoveTo(transform.map_point(c[0])));
+            for p in &c[1..] {
+                els.push(PathEl::LineTo(transform.map_point(*p)));
+            }
+            els.push(PathEl::Close);
+        }
+    }
+    Path::from_els(els)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -574,6 +692,115 @@ mod tests {
                 "{join:?}：闭合正方形描边应为 {e}，实际 {area}"
             );
         }
+    }
+
+    /// 路径级：`stroke_path` 把曲线路径描边成只含直线段的填充路径。
+    #[test]
+    fn stroke_path_flattens_curves_into_lines() {
+        use crate::{PathBuilder, PathEl};
+        // 一个圆：CubicTo 组成，闭合
+        let mut pb = PathBuilder::new();
+        pb.circle(Vec2::new(50.0, 50.0), 30.0, false);
+        let path = pb.build();
+
+        let out = stroke_path(&path, &Affine::IDENTITY, &style(6.0, LineCap::Butt, LineJoin::Round), 0.05);
+        assert!(!out.els.is_empty(), "描边应产出内容");
+        let has_curve = out
+            .els
+            .iter()
+            .any(|e| matches!(e, PathEl::QuadTo(..) | PathEl::CubicTo(..)));
+        assert!(!has_curve, "描边轮廓应当只含直线段：{out:?}");
+        // 圆环：应产出 2 条子路径（外圈 + 反向内圈）
+        let n_move = out.els.iter().filter(|e| matches!(e, PathEl::MoveTo(..))).count();
+        assert_eq!(n_move, 2, "闭合圆的描边应是环（2 条子路径），实际 {n_move}");
+    }
+
+    /// 路径级：**线宽是用户单位** —— 变换缩放时描边随之缩放。
+    ///
+    /// 这条锁定的是"在用户空间描边、再变换轮廓"的决定。若改成
+    /// "先变换再按原线宽描边"，在 3 倍缩放下面积会差 3 倍。
+    #[test]
+    fn stroke_width_is_in_user_space() {
+        use crate::{PathBuilder, PathEl};
+        let mut pb = PathBuilder::new();
+        pb.move_to(Vec2::new(0.0, 0.0));
+        pb.line_to(Vec2::new(40.0, 0.0));
+        let path = pb.build();
+
+        let area_of_path = |t: &Affine| -> f32 {
+            let out = stroke_path(
+                &path,
+                t,
+                &style(4.0, LineCap::Butt, LineJoin::Bevel),
+                0.01,
+            );
+            // 把子路径点收集成轮廓并求净面积
+            // 收走当前子路径：点太少则**丢弃并清空**（不清空会让残留点串到下一段）
+            fn take_contour(cur: &mut Vec<Vec2>, contours: &mut Vec<Vec<Vec2>>) {
+                if cur.len() >= 3 {
+                    contours.push(std::mem::take(cur));
+                } else {
+                    cur.clear();
+                }
+            }
+            let mut contours: Vec<Vec<Vec2>> = Vec::new();
+            let mut cur: Vec<Vec2> = Vec::new();
+            for e in &out.els {
+                match *e {
+                    PathEl::MoveTo(p) => {
+                        take_contour(&mut cur, &mut contours);
+                        cur.push(p);
+                    }
+                    PathEl::LineTo(p) => cur.push(p),
+                    PathEl::Close => take_contour(&mut cur, &mut contours),
+                    _ => {}
+                }
+            }
+            take_contour(&mut cur, &mut contours);
+            contours.iter().map(|c| shoelace(c)).sum::<f32>().abs()
+        };
+
+        let unit = area_of_path(&Affine::IDENTITY);
+        assert!((unit - 40.0 * 4.0).abs() < 0.5, "单位变换下应为 长×宽=160，实际 {unit}");
+
+        // 等比放大 3 倍：面积应放大 9 倍（线宽也随之放大 3 倍）
+        let scaled = Affine::scale(3.0);
+        let s3 = area_of_path(&scaled);
+        assert!(
+            (s3 - unit * 9.0).abs() < unit * 0.5,
+            "3 倍等比缩放后面积应约为 9 倍：单位 {unit}，缩放后 {s3}"
+        );
+
+        // 非等比（x 2 倍、y 1 倍）：面积应约为 2 倍（长×2、宽×1）
+        let nonuni = Affine::scale_nonuniform(2.0, 1.0);
+        let nn = area_of_path(&nonuni);
+        assert!(
+            (nn - unit * 2.0).abs() < unit * 0.5,
+            "非等比缩放后面积应约为 2 倍：单位 {unit}，缩放后 {nn}"
+        );
+    }
+
+    /// 路径级：未闭合子路径会加端帽，闭合的不加。
+    #[test]
+    fn open_and_closed_subpaths_differ() {
+        use crate::PathBuilder;
+        // 开放：一条线
+        let mut pb = PathBuilder::new();
+        pb.move_to(Vec2::new(0.0, 0.0));
+        pb.line_to(Vec2::new(50.0, 0.0));
+        let open = stroke_path(&pb.build(), &Affine::IDENTITY, &style(6.0, LineCap::Butt, LineJoin::Bevel), 0.01);
+        let n_open = open.els.iter().filter(|e| matches!(e, PathEl::MoveTo(..))).count();
+        assert_eq!(n_open, 1, "开放子路径应只有 1 条轮廓");
+
+        // 闭合：一个三角形
+        let mut pb = PathBuilder::new();
+        pb.move_to(Vec2::new(0.0, 0.0));
+        pb.line_to(Vec2::new(50.0, 0.0));
+        pb.line_to(Vec2::new(25.0, 40.0));
+        pb.close();
+        let closed = stroke_path(&pb.build(), &Affine::IDENTITY, &style(6.0, LineCap::Butt, LineJoin::Bevel), 0.01);
+        let n_closed = closed.els.iter().filter(|e| matches!(e, PathEl::MoveTo(..))).count();
+        assert_eq!(n_closed, 2, "闭合子路径描边应是环（2 条轮廓）");
     }
 
     /// 轮廓必须**首尾相接无缝隙**：最后一笔要回到第一点附近。

@@ -1468,3 +1468,101 @@ fn gpu_damage_dispatch_matches_full() {
         "GPU 脏区派发：全脏 / 局部脏 / 空脏区 三类均与全量逐字节一致（tiles={tx}x{ty}）"
     );
 }
+
+/// P1-1：精确测量**每帧起线程的固定开销** —— 这个数字决定了并行提取是否可行。
+///
+/// 之前从"10k 场景串行 942 µs vs 并行 1346 µs"反推出固定开销约 1.2 ms，
+/// 但那个数字是**间接**得到的（两个不同规模的场景做线性拟合）。
+/// 这里直接测空任务，把"线程创建/回收"与"实际计算"分开。
+#[test]
+fn measure_thread_scope_overhead() {
+    let nth = std::thread::available_parallelism().map(|p| p.get()).unwrap_or(1);
+    eprintln!("[线程] available_parallelism = {nth}");
+
+    let t0 = std::time::Instant::now();
+    for _ in 0..20 {
+        let _ = std::thread::available_parallelism();
+    }
+    eprintln!("[线程] available_parallelism ×20 = {:.1} µs", t0.elapsed().as_secs_f64() * 1e6 / 20.0);
+
+    let n = nth.min(16);
+    // 预热
+    for _ in 0..3 {
+        std::thread::scope(|s| {
+            for _ in 0..n {
+                s.spawn(|| {});
+            }
+        });
+    }
+    let t1 = std::time::Instant::now();
+    const ROUNDS: u32 = 20;
+    for _ in 0..ROUNDS {
+        std::thread::scope(|s| {
+            for _ in 0..n {
+                s.spawn(|| {});
+            }
+        });
+    }
+    let per = t1.elapsed().as_secs_f64() * 1e6 / ROUNDS as f64;
+    eprintln!("[线程] thread::scope + {n} 个空 spawn = {per:.1} µs/次");
+    assert!(per < 100_000.0, "线程开销测出来异常（{per:.1} µs）—— 环境有问题");
+}
+
+/// 环境探测：这台机器**实际**能给多少并行算力。
+///
+/// 背景：提取改成 12 线程并行后**反而慢了 1.6 倍**（串行 0.784 ms vs 并行
+/// 1.235 ms，同进程交替测 9 轮取中位数），而线程固定开销只有 304 µs。
+/// 也就是说并行部分几乎没有加速。若一个**纯计算**负载也不加速，
+/// 那就是环境的 CPU 配额问题，而不是我们代码的问题。
+#[test]
+fn measure_actual_parallel_speedup() {
+    use std::time::Instant;
+    const N: usize = 4_000_000;
+    let data: Vec<f64> = (0..N).map(|i| (i % 977) as f64 * 0.5).collect();
+
+    let serial = || {
+        let t = Instant::now();
+        let mut acc = 0.0f64;
+        for v in &data {
+            acc += v.sqrt();
+        }
+        std::hint::black_box(acc);
+        t.elapsed().as_secs_f64() * 1e3
+    };
+    let nth = std::thread::available_parallelism().map(|p| p.get()).unwrap_or(1);
+    let parallel = || {
+        let t = Instant::now();
+        let chunk = N.div_ceil(nth);
+        std::thread::scope(|s| {
+            let mut hs = Vec::new();
+            for k in 0..nth {
+                let lo = k * chunk;
+                if lo >= N {
+                    break;
+                }
+                let hi = ((k + 1) * chunk).min(N);
+                let d = &data;
+                hs.push(s.spawn(move || {
+                    let mut acc = 0.0f64;
+                    for v in &d[lo..hi] {
+                        acc += v.sqrt();
+                    }
+                    acc
+                }));
+            }
+            let mut total = 0.0;
+            for h in hs {
+                total += h.join().unwrap_or(0.0);
+            }
+            std::hint::black_box(total);
+        });
+        t.elapsed().as_secs_f64() * 1e3
+    };
+
+    // 预热
+    serial();
+    parallel();
+    let s_ms = (0..3).map(|_| serial()).fold(f64::MAX, f64::min);
+    let p_ms = (0..3).map(|_| parallel()).fold(f64::MAX, f64::min);
+    eprintln!("[并行度] {nth} 线程：串行 {s_ms:.2} ms，并行 {p_ms:.2} ms，加速 {:.2}×", s_ms / p_ms);
+}

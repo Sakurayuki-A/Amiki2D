@@ -134,8 +134,9 @@ impl Canvas {
         let base = self.transform.then(Affine::translate(origin));
         let paths = amiki_scene::expand_text_run(run, outline);
         for (path, glyph_t) in paths {
+            // `Paint` 非 Copy（渐变经 Arc 共享）；clone 只做一次原子加，可忽略。
             self.scene
-                .push_blend(base.then(glyph_t), path, paint, self.blend);
+                .push_blend(base.then(glyph_t), path, paint.clone(), self.blend);
             if !self.clip_stack.is_empty() {
                 self.scene.draws.last_mut().unwrap().clips = self.clip_stack.clone();
             }

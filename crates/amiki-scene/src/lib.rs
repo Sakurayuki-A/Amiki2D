@@ -208,13 +208,139 @@ impl Color {
     }
 }
 
-/// 绘制样式。M1 支持实心色；渐变 / 图像在路线图 M4。
-///
-/// `Copy`：样式是纯数据（当前仅一个 `Color`），按值传递更自然——
-/// 文本绘制会对**每个字形**重复使用同一个样式，流动语义会让调用方别扭。
+/// 渐变的一个色标：位置 `t ∈ [0,1]` 处的颜色。
 #[derive(Clone, Copy, Debug, PartialEq)]
+pub struct GradientStop {
+    pub t: f32,
+    pub color: Color,
+}
+
+impl GradientStop {
+    pub fn new(t: f32, color: Color) -> GradientStop {
+        GradientStop { t, color }
+    }
+}
+
+/// 渐变几何（**设备空间**，即已含画布变换）。
+///
+/// 之所以存设备空间：着色发生在逐像素阶段，那时画布变换已经作用完毕；
+/// 若在着色里再套一次变换，成本与出错面都更大。调用方在构造时报设备坐标即可。
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum GradientKind {
+    /// 从 `from` 到 `to` 的线性渐变；投影参数 `t = (p − from)·(to − from) / |to − from|²`
+    Linear { from: Vec2, to: Vec2 },
+    /// 以 `center` 为心、`radius` 为半径的径向渐变；`t = |p − center| / radius`
+    Radial { center: Vec2, radius: f32 },
+    /// 绕 `center` 的角度扫描渐变；`t = (atan2(p.y − c.y, p.x − c.x) − start) / TAU`
+    Sweep { center: Vec2, start: f32 },
+}
+
+/// 渐变：几何 + 色标表 + 范围外行为。
+///
+/// **色标按 `t` 升序**（构造时保证）。采样是解析求值而非查表——
+/// 查表会引入 1/255 量化的误差，而本项目对"解析覆盖率"的质量承诺
+/// 不允许在着色阶段引入额外近似。
+#[derive(Clone, Debug, PartialEq)]
+pub struct Gradient {
+    pub kind: GradientKind,
+    pub stops: Vec<GradientStop>,
+    /// 范围外行为：`t` 钳到 [0,1]（Clamp）或按 1 取模重复（Repeat）
+    pub repeat: bool,
+}
+
+impl Gradient {
+    /// 构造线性渐变（设备坐标）。色标会被排序；少于 2 个色标时返回 `None`。
+    pub fn linear(from: Vec2, to: Vec2, mut stops: Vec<GradientStop>) -> Option<Gradient> {
+        if stops.len() < 2 {
+            return None;
+        }
+        stops.sort_by(|a, b| a.t.partial_cmp(&b.t).unwrap_or(std::cmp::Ordering::Equal));
+        Some(Gradient { kind: GradientKind::Linear { from, to }, stops, repeat: false })
+    }
+
+    /// 构造径向渐变（设备坐标）。
+    pub fn radial(center: Vec2, radius: f32, mut stops: Vec<GradientStop>) -> Option<Gradient> {
+        if stops.len() < 2 || radius <= 0.0 || !radius.is_finite() {
+            return None;
+        }
+        stops.sort_by(|a, b| a.t.partial_cmp(&b.t).unwrap_or(std::cmp::Ordering::Equal));
+        Some(Gradient { kind: GradientKind::Radial { center, radius }, stops, repeat: false })
+    }
+
+    /// 构造扫描渐变（设备坐标）。
+    pub fn sweep(center: Vec2, start: f32, mut stops: Vec<GradientStop>) -> Option<Gradient> {
+        if stops.len() < 2 {
+            return None;
+        }
+        stops.sort_by(|a, b| a.t.partial_cmp(&b.t).unwrap_or(std::cmp::Ordering::Equal));
+        Some(Gradient { kind: GradientKind::Sweep { center, start }, stops, repeat: false })
+    }
+
+    /// 求某设备坐标处的 `t`（未做范围处理）。
+    pub fn param_at(&self, p: Vec2) -> f32 {
+        match self.kind {
+            GradientKind::Linear { from, to } => {
+                let d = to - from;
+                let len2 = d.dot(d);
+                if len2 <= 1e-12 {
+                    return 0.0;
+                }
+                (p - from).dot(d) / len2
+            }
+            GradientKind::Radial { center, radius } => (p - center).hypot() / radius,
+            GradientKind::Sweep { center, start } => {
+                let v = p - center;
+                let a = v.y.atan2(v.x);
+                // 归一到以 start 为起点的 [0,1)
+                let t = (a - start) / std::f32::consts::TAU;
+                t - t.floor()
+            }
+        }
+    }
+
+    /// 在参数 `t` 处解析求值（色标之间线性插值，端点外按首尾色延展或按重复取模）。
+    pub fn sample(&self, t: f32) -> Color {
+        let t = if self.repeat {
+            t - t.floor()
+        } else {
+            t.clamp(0.0, 1.0)
+        };
+        let s = &self.stops;
+        // 排序保证：s[0].t 最小、s[n-1].t 最大
+        if t <= s[0].t {
+            return s[0].color;
+        }
+        if t >= s[s.len() - 1].t {
+            return s[s.len() - 1].color;
+        }
+        // 线性查找区间：色标数量很小（通常 2–8），且此处是逐像素热路径，
+        // 二分反而因分支预测不稳更慢。
+        let mut i = 0;
+        while i + 1 < s.len() && s[i + 1].t < t {
+            i += 1;
+        }
+        let (a, b) = (s[i], s[i + 1]);
+        let span = b.t - a.t;
+        let k = if span.abs() <= 1e-9 { 0.0 } else { (t - a.t) / span };
+        Color {
+            r: a.color.r + (b.color.r - a.color.r) * k,
+            g: a.color.g + (b.color.g - a.color.g) * k,
+            b: a.color.b + (b.color.b - a.color.b) * k,
+            a: a.color.a + (b.color.a - a.color.a) * k,
+        }
+    }
+}
+
+/// 绘制样式。
+///
+/// **不是 `Copy`**：渐变经 `Arc` 共享，而 `Arc` 只能 `Clone`。
+/// 代价是每字形绘制需要 `clone()` 一次（仅原子加，可忽略）；
+/// 收益是渐变定义在多条 draw 间共享同一份数据。
+#[derive(Clone, Debug, PartialEq)]
 pub enum Paint {
     Solid(Color),
+    /// 渐变着色。用 `Arc` 让渐变定义在多条 draw 间共享（避免逐字形深拷贝色标表）。
+    Gradient(std::sync::Arc<Gradient>),
 }
 
 /// 每 draw 最多引用的裁剪层数（WGSL 侧展开采样）。
@@ -554,6 +680,14 @@ fn put_f32(buf: &mut Vec<u8>, v: f32) {
     buf.extend_from_slice(&v.to_le_bytes());
 }
 
+/// 写入一个颜色（4×f32：r, g, b, a）。
+fn put_color(buf: &mut Vec<u8>, c: &Color) {
+    put_f32(buf, c.r);
+    put_f32(buf, c.g);
+    put_f32(buf, c.b);
+    put_f32(buf, c.a);
+}
+
 fn put_path(buf: &mut Vec<u8>, path: &Path) {
     put_u32(buf, path.els.len() as u32);
     for el in &path.els {
@@ -667,12 +801,43 @@ pub fn encode_scene(scene: &Scene) -> Vec<u8> {
     }
     for draw in &scene.draws {
         put_transform(&mut buf, &draw.transform);
-        match draw.paint {
+        match &draw.paint {
             Paint::Solid(c) => {
-                put_f32(&mut buf, c.r);
-                put_f32(&mut buf, c.g);
-                put_f32(&mut buf, c.b);
-                put_f32(&mut buf, c.a);
+                put_u32(&mut buf, 0); // paint 类型标签：0 = 实心
+                put_color(&mut buf, c);
+            }
+            Paint::Gradient(g) => {
+                put_u32(&mut buf, 1); // 1 = 渐变
+                // 几何：kind 标签 + 参数
+                match g.kind {
+                    GradientKind::Linear { from, to } => {
+                        put_u32(&mut buf, 0);
+                        put_f32(&mut buf, from.x);
+                        put_f32(&mut buf, from.y);
+                        put_f32(&mut buf, to.x);
+                        put_f32(&mut buf, to.y);
+                    }
+                    GradientKind::Radial { center, radius } => {
+                        put_u32(&mut buf, 1);
+                        put_f32(&mut buf, center.x);
+                        put_f32(&mut buf, center.y);
+                        put_f32(&mut buf, radius);
+                        put_f32(&mut buf, 0.0); // 占位，保持定长便于解码
+                    }
+                    GradientKind::Sweep { center, start } => {
+                        put_u32(&mut buf, 2);
+                        put_f32(&mut buf, center.x);
+                        put_f32(&mut buf, center.y);
+                        put_f32(&mut buf, start);
+                        put_f32(&mut buf, 0.0);
+                    }
+                }
+                put_u32(&mut buf, u32::from(g.repeat));
+                put_u32(&mut buf, g.stops.len() as u32);
+                for s in &g.stops {
+                    put_f32(&mut buf, s.t);
+                    put_color(&mut buf, &s.color);
+                }
             }
         }
         put_u32(&mut buf, draw.blend.id());
@@ -707,7 +872,41 @@ pub fn decode_scene(bytes: &[u8]) -> Result<Scene, String> {
     }
     for _ in 0..n_draws {
         let t = read_transform(&mut r)?;
-        let c = r.f32x(4)?;
+        let paint = match r.u32()? {
+            0 => {
+                let c = r.f32x(4)?;
+                Paint::Solid(Color { r: c[0], g: c[1], b: c[2], a: c[3] })
+            }
+            1 => {
+                let kind_id = r.u32()?;
+                let a = r.f32x(4)?;
+                let kind = match kind_id {
+                    0 => GradientKind::Linear {
+                        from: Vec2::new(a[0], a[1]),
+                        to: Vec2::new(a[2], a[3]),
+                    },
+                    1 => GradientKind::Radial { center: Vec2::new(a[0], a[1]), radius: a[2] },
+                    2 => GradientKind::Sweep { center: Vec2::new(a[0], a[1]), start: a[2] },
+                    other => return Err(format!("渐变类型不支持: {other}")),
+                };
+                let repeat = r.u32()? != 0;
+                let n = r.u32()? as usize;
+                let mut stops = Vec::with_capacity(n);
+                for _ in 0..n {
+                    let st = r.f32()?;
+                    let c = r.f32x(4)?;
+                    stops.push(GradientStop::new(
+                        st,
+                        Color { r: c[0], g: c[1], b: c[2], a: c[3] },
+                    ));
+                }
+                if stops.len() < 2 {
+                    return Err("渐变色标少于 2 个".into());
+                }
+                Paint::Gradient(std::sync::Arc::new(Gradient { kind, stops, repeat }))
+            }
+            other => return Err(format!("paint 类型不支持: {other}")),
+        };
         let blend_id = r.u32()?;
         let n_refs = r.u32()? as usize;
         let mut clips = Vec::with_capacity(n_refs);
@@ -715,7 +914,6 @@ pub fn decode_scene(bytes: &[u8]) -> Result<Scene, String> {
             clips.push(r.u32()?);
         }
         let path = r.path()?;
-        let paint = Paint::Solid(Color { r: c[0], g: c[1], b: c[2], a: c[3] });
         let blend = match blend_id {
             0 => BlendMode::Normal,
             1 => BlendMode::Multiply,

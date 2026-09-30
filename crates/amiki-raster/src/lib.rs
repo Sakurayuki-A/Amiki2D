@@ -68,7 +68,16 @@ pub struct BinnedScene {
     /// 每 (tile, draw) 16 行的进位绕数量。
     pub carries: Vec<f32>,
     /// 每 draw 的直线 RGBA。
+    ///
+    /// M6：当该 draw 使用渐变时，此处的含义变为
+    /// `[gradient_index as f32, _, _, 1.0]`（着色阶段据此查 `gradients`）；
+    /// `gradient_index` 为 `0xFFFF_FFFF`（即 f32 位模式）时表示纯实心色。
     pub colors: Vec<[f32; 4]>,
+    /// M6：本场景用到的渐变定义（`gradient_index[i]` 为其下标）。
+    pub gradients: Vec<std::sync::Arc<amiki_scene::Gradient>>,
+    /// M6：每 draw 的渐变下标；`u32::MAX` 表示纯实心色。
+    /// 与 `colors` 平行；用独立表而非在颜色里编码下标，避免依赖浮点精确相等。
+    pub gradient_index: Vec<u32>,
     /// 每 draw 的裁剪层索引（≤ MAX_DRAW_CLIPS，未用槽位为 0）。
     pub draw_clips: Vec<[u32; 4]>,
     /// 每 scene clip 的 CPU 覆盖率 alpha 图（GPU 侧为纹理，M2d）。
@@ -177,6 +186,8 @@ pub fn bin(scene: &Scene, flatten_eps: f32) -> BinnedScene {
         seg_refs: Vec::new(),
         carries: Vec::new(),
         colors: Vec::new(),
+        gradients: Vec::new(),
+        gradient_index: Vec::new(),
         draw_clips: Vec::new(),
         clip_maps: Vec::new(),
     };
@@ -291,10 +302,25 @@ pub fn bin(scene: &Scene, flatten_eps: f32) -> BinnedScene {
         carry_tiles.dedup();
 
         // 3) 生成 (tile, draw) 条目与逐行列表
-        let color = match draw.paint {
+        let mut grad_idx = u32::MAX;
+        let color = match &draw.paint {
             Paint::Solid(c) => [c.r, c.g, c.b, c.a],
+            Paint::Gradient(g) => {
+                // 去重复用同一定义：文本/图形常对多个 draw 用同一渐变
+                grad_idx = out
+                    .gradients
+                    .iter()
+                    .position(|x| std::sync::Arc::ptr_eq(x, g))
+                    .unwrap_or_else(|| {
+                        out.gradients.push(g.clone());
+                        out.gradients.len() - 1
+                    }) as u32;
+                // colors 仍写入一个占位值（着色走 gradient_index，不读这里）
+                [0.0, 0.0, 0.0, 0.0]
+            }
         };
         out.colors.push(color);
+        out.gradient_index.push(grad_idx);
         let mut clip_idx = [0u32; 4];
         let nclip = draw.clips.len().min(4);
         clip_idx[..nclip].copy_from_slice(&draw.clips[..nclip]);
@@ -594,6 +620,35 @@ fn clear_tile(binned: &BinnedScene, img: &mut [u8], tx: usize, ty: usize) {
     }
 }
 
+/// M6：求某 draw 在设备坐标 `(x, y)` 处的颜色。
+///
+/// 实心色直接返回；渐变按几何求参数 `t` 并在色标间**解析插值**。
+/// 刻意不查表：查表会把着色量化到 1/255，而本项目对解析覆盖率有质量承诺，
+/// 不该在着色阶段引入额外近似。
+fn resolve_color(binned: &BinnedScene, draw: usize, x: f32, y: f32) -> [f32; 4] {
+    match gradient_of(binned, draw) {
+        Some(g) => {
+            let c = g.sample(g.param_at(amiki_math::Vec2::new(x, y)));
+            [c.r, c.g, c.b, c.a]
+        }
+        None => binned.colors[draw],
+    }
+}
+
+/// 若该 draw 使用渐变，返回其定义。
+///
+/// 用**独立的索引表**而非从颜色值里编码下标：后者要依赖浮点精确相等这种脆弱约定，
+/// 一旦将来有颜色恰好碰撞就会静默出错。
+#[inline]
+fn gradient_of(binned: &BinnedScene, draw: usize) -> Option<&std::sync::Arc<amiki_scene::Gradient>> {
+    let idx = binned.gradient_index.get(draw).copied().unwrap_or(u32::MAX);
+    if idx == u32::MAX {
+        None
+    } else {
+        binned.gradients.get(idx as usize)
+    }
+}
+
 /// 渲染单个 tile 到 `img`（tile 内逐像素解析覆盖率 + 画家序合成）。
 ///
 /// M4：全量 `render` 与增量 `render_damage` **共用**此函数——增量路径绝不复制
@@ -637,7 +692,7 @@ fn shade_tile(binned: &BinnedScene, img: &mut [u8], tx: usize, ty: usize) {
                     }
                 }
                 if a > 0.0 {
-                    let c = binned.colors[m[0] as usize];
+                    let c = resolve_color(binned, m[0] as usize, cx, cy);
                     col = composite(col, c, c[3] * a, m[3] & 0xFF);
                 }
             }

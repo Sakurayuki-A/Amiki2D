@@ -156,6 +156,12 @@ pub struct GpuScene {
     pub lines: Vec<[f32; 4]>,
     pub line_draws: Vec<u32>,
     pub colors: Vec<[f32; 4]>,
+    /// M6：使用渐变但 GPU 侧尚未实现其着色的 draw 下标。
+    ///
+    /// 这些 draw 在 GPU 上被**降级为渐变中点色**（见 `build_gpu_scene`）。
+    /// 记录于此以便：诊断输出可提示降级、测试可断言降级范围，
+    /// 而不是让"GPU 与 CPU 逐像素对拍"这条承诺在无人察觉时失效。
+    pub gradient_fallback_draws: Vec<u32>,
     pub draw_flags: Vec<u32>,
     pub draw_clips: Vec<[u32; 4]>,
     /// CPU 闭式段数（每入口：quad/cubic 变长，line=1）
@@ -198,8 +204,17 @@ pub fn build_gpu_scene(scene: &Scene, eps: f32) -> GpuScene {
     };
     for (d, draw) in scene.draws.iter().enumerate() {
         let di = d as u32;
-        gs.colors.push(match draw.paint {
+        gs.colors.push(match &draw.paint {
             Paint::Solid(c) => [c.r, c.g, c.b, c.a],
+            Paint::Gradient(g) => {
+                // M6 现状：GPU 侧尚无渐变着色（WGSL 待接）。
+                // 这里**显式降级为渐变中点色**，而不是静默近似 ——
+                // 静默降级会让"GPU 与 CPU 逐像素对拍"这条质量承诺失效却无人察觉。
+                // 取中点而非端点：中点在这条 draw 上是明确可预测的，便于识别降级。
+                let c = g.sample(0.5);
+                gs.gradient_fallback_draws.push(di);
+                [c.r, c.g, c.b, c.a]
+            }
         });
         let nclip = draw.clips.len().min(4);
         let mut ci = [0u32; 4];

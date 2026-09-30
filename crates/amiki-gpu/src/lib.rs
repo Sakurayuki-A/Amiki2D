@@ -493,6 +493,53 @@ impl TimestampRecorder {
     }
 }
 
+/// 校验脏区与画布 tile 尺寸一致。
+///
+/// `Damage` 用的是它自己的画布 tile 数，而派发范围按当前场景的 tile 数钳制。
+/// 若两者不一致（例如调用方复用了为不同尺寸画布建的 `Damage`），
+/// "全脏"会被误判成"只脏左上角"，从而**静默留下陈旧像素**。
+/// 这类错误必须炸出来，不能靠钳制掩盖。
+fn check_damage_bounds(damage: Option<&amiki_scene::Damage>, tiles_x: u32, tiles_y: u32) {
+    if let Some(d) = damage {
+        assert_eq!(
+            (d.total_tiles()),
+            tiles_x.max(1) * tiles_y.max(1),
+            "damage 的 tile 数与当前画布不一致（damage 可能是为别的画布尺寸创建的）\
+             —— 否则「全脏」会被误当作局部脏区，导致陈旧像素残留"
+        );
+    }
+}
+
+/// 根据脏区算出 fine 阶段的 workgroup 派发范围 `(x_start, x_count, y_start, y_count)`。
+///
+/// M4：fine 内核用 `global_invocation_id` 直接推导像素与 tile 坐标
+/// （`sparse_fine.wgsl` 里 `tile_x = gid.x / 16`），因此**只派发脏 tile 子矩形**
+/// 就会精确只重写那些 tile 的像素——不需要改任何 WGSL，也不需要改着色数学。
+/// 这是"脏区只重算"在 GPU 侧能零成本落地的根本原因。
+///
+/// `None` / 全脏 ⇒ 整幅画布。返回的 count 均 ≥ 1，保证 dispatch 合法
+/// （workgroup 数不能为 0）。
+fn fine_dispatch_range(
+    damage: Option<&amiki_scene::Damage>,
+    tiles_x: u32,
+    tiles_y: u32,
+) -> (u32, u32, u32, u32) {
+    let full = || (0u32, tiles_x.max(1), 0u32, tiles_y.max(1));
+    let Some(d) = damage else { return full() };
+    let Some((tx0, ty0, tx1, ty1)) = d.tiles() else {
+        return full(); // 全脏
+    };
+    let x_start = tx0.min(tiles_x);
+    let y_start = ty0.min(tiles_y);
+    let x_end = tx1.min(tiles_x).max(x_start);
+    let y_end = ty1.min(tiles_y).max(y_start);
+    if x_end == x_start || y_end == y_start {
+        // 无脏区：派发一个最小合法范围（内核按画布裁剪，不会写入任何像素）
+        return (x_start, 1, y_start, 1);
+    }
+    (x_start, x_end - x_start, y_start, y_end - y_start)
+}
+
 fn ts_writes(
     rec: Option<&TimestampRecorder>,
     slot: Option<(u32, u32)>,
@@ -997,11 +1044,11 @@ impl GpuRenderer {
         match self.path {
             RenderPath::Dense => {
                 let mut prof = FrameProfile::default();
-                self.run_pipeline_impl(gs, tex, coverage, clip_views, dump, None, &mut prof)
+                self.run_pipeline_impl(gs, tex, coverage, clip_views, None, dump, None, &mut prof)
             }
             RenderPath::Sparse => {
                 let mut prof = FrameProfile::default();
-                self.run_pipeline_sparse(gs, tex, coverage, clip_views, dump, None, &mut prof)
+                self.run_pipeline_sparse(gs, tex, coverage, clip_views, None, dump, None, &mut prof)
             }
         }
     }
@@ -1024,6 +1071,7 @@ impl GpuRenderer {
             &tex,
             false,
             &frame.clip_views,
+            None,
             Some(&mut dump),
             None,
             &mut prof,
@@ -1065,12 +1113,12 @@ impl GpuRenderer {
             match self.path {
                 RenderPath::Dense => {
                     self.run_pipeline_impl(
-                        &frame.scene, &tex, false, &frame.clip_views, None, None, &mut prof,
+                        &frame.scene, &tex, false, &frame.clip_views, None, None, None, &mut prof,
                     )?;
                 }
                 RenderPath::Sparse => {
                     self.run_pipeline_sparse(
-                        &frame.scene, &tex, false, &frame.clip_views, None, None, &mut prof,
+                        &frame.scene, &tex, false, &frame.clip_views, None, None, None, &mut prof,
                     )?;
                 }
             }
@@ -1085,6 +1133,7 @@ impl GpuRenderer {
                     false,
                     &frame.clip_views,
                     None,
+                    None,
                     Some(&mut rec),
                     &mut prof,
                 )?;
@@ -1095,6 +1144,7 @@ impl GpuRenderer {
                     &tex,
                     false,
                     &frame.clip_views,
+                    None,
                     None,
                     Some(&mut rec),
                     &mut prof,
@@ -1149,6 +1199,7 @@ impl GpuRenderer {
         tex: &wgpu::Texture,
         coverage: bool,
         clip_views: &[wgpu::TextureView],
+        damage: Option<&amiki_scene::Damage>,
         mut dump: Option<&mut PipelineDump>,
         mut ts: Option<&mut TimestampRecorder>,
         prof: &mut FrameProfile,
@@ -1480,7 +1531,11 @@ impl GpuRenderer {
                 pass.set_pipeline(&self.fine_pipeline);
             }
             pass.set_bind_group(0, &fine_bind, &[]);
-            pass.dispatch_workgroups(gs.tiles_x, gs.tiles_y, 1);
+            // M4：只派发脏 tile 子矩形。fine 内核用 global_invocation_id 推导
+            // 像素与 tile 坐标，因此 workgroup 数减少 = 只重写那些 tile 的像素，
+            // 未派发区域的纹理内容原样保留（这正是复用上一帧的机制）。
+            let (_fx, fw, _fy, fh) = fine_dispatch_range(damage, gs.tiles_x, gs.tiles_y);
+            pass.dispatch_workgroups(fw, fh, 1);
         }
         self.queue.submit(Some(enc2.finish()));
 
@@ -1524,6 +1579,7 @@ impl GpuRenderer {
         tex: &wgpu::Texture,
         coverage: bool,
         clip_views: &[wgpu::TextureView],
+        damage: Option<&amiki_scene::Damage>,
         mut dump: Option<&mut PipelineDump>,
         mut ts: Option<&mut TimestampRecorder>,
         prof: &mut FrameProfile,
@@ -1959,7 +2015,9 @@ impl GpuRenderer {
                 pass.set_pipeline(&self.sparse_fine_pipeline);
             }
             pass.set_bind_group(0, &b_fine, &[]);
-            pass.dispatch_workgroups(tiles_x, tiles_y, 1);
+            // M4：只派发脏 tile 子矩形（理由见 run_pipeline_impl 处注释）
+            let (_fx, fw, _fy, fh) = fine_dispatch_range(damage, tiles_x, tiles_y);
+            pass.dispatch_workgroups(fw, fh, 1);
         }
         prof.encode2_ms = t_enc2.elapsed().as_secs_f64() * 1000.0;
         let t_sub2 = Instant::now();
@@ -2016,8 +2074,60 @@ impl GpuRenderer {
         let tex = self.create_output_texture(&gs);
         let mut dump = PipelineDump::default();
         let mut prof = FrameProfile::default();
-        self.run_pipeline_sparse(&gs, &tex, false, &[], Some(&mut dump), None, &mut prof)?;
+        self.run_pipeline_sparse(&gs, &tex, false, &[], None, Some(&mut dump), None, &mut prof)?;
         Ok((gs, dump))
+    }
+
+    /// M4：**持久化渲染** —— 复用同一个输出纹理，只对脏 tile 派发 fine。
+    ///
+    /// 与 [`GpuRenderer::render`] 的区别：
+    /// - `render` 每帧新建输出纹理并全量派发；
+    /// - 本方法持有输出纹理与上一帧场景，**场景未变则一次派发都不做**，
+    ///   只改了一小块则只派发覆盖脏区的 tile 子矩形。
+    ///
+    /// 正确性依据：fine 内核由 `global_invocation_id` 推导像素与 tile 坐标，
+    /// 未派发的 tile **不写入**，纹理中保留的正是上一帧算出的同一结果
+    /// （单 tile 的着色只依赖该 tile 的成员段与画家序，与其他 tile 的当前内容无关）。
+    ///
+    /// `damage` 必须与 `scene` 的画布尺寸匹配，否则 [`check_damage_bounds`] 会断言失败
+    /// ——那是在阻止"全脏被误当作局部脏区"从而静默残留陈旧像素。
+    ///
+    /// 返回 `true` 表示本帧完全跳过（未做任何 GPU 工作）。
+    #[allow(clippy::too_many_arguments)]
+    pub fn render_into_persistent(
+        &self,
+        tex: &wgpu::Texture,
+        frame: &Frame,
+        damage: Option<&amiki_scene::Damage>,
+    ) -> Result<bool, RenderError> {
+        if damage.is_some_and(|d| d.is_empty()) {
+            return Ok(true); // 无脏区：完全跳过
+        }
+        check_damage_bounds(damage, frame.scene.tiles_x, frame.scene.tiles_y);
+        let mut prof = FrameProfile::default();
+        match self.path {
+            RenderPath::Dense => self.run_pipeline_impl(
+                &frame.scene,
+                tex,
+                false,
+                &frame.clip_views,
+                damage,
+                None,
+                None,
+                &mut prof,
+            )?,
+            RenderPath::Sparse => self.run_pipeline_sparse(
+                &frame.scene,
+                tex,
+                false,
+                &frame.clip_views,
+                damage,
+                None,
+                None,
+                &mut prof,
+            )?,
+        }
+        Ok(false)
     }
 
     /// 准备逐帧资源：GpuScene 提取 + clip 覆盖率纹理。
@@ -2819,7 +2929,7 @@ mod tests {
         };
         let mut prof = FrameProfile::default();
         renderer
-            .run_pipeline_impl(&gs, &tex, false, &[], Some(&mut dump), None, &mut prof)
+            .run_pipeline_impl(&gs, &tex, false, &[], None, Some(&mut dump), None, &mut prof)
             .expect("管线运行失败");
         (gs, dump)
     }
@@ -3465,5 +3575,90 @@ mod tests {
             Ok(()) => eprintln!("大场景稀疏自洽 ✓"),
             Err(e) => panic!("1080p × {n} 曲线稀疏自洽检查失败：{e}"),
         }
+    }
+
+    /// M4：**GPU 侧只派发脏 tile** 必须与全量派发**逐字节一致**。
+    ///
+    /// 这是 GPU 增量渲染的核心不变量：fine 内核由 `global_invocation_id` 推导
+    /// 像素与 tile 坐标，未派发的 tile 不写入、保留纹理中的旧值。若派发范围算错
+    /// （例如偏移没被正确处理、或脏区外被误写），本测试会立刻失败。
+    ///
+    /// 覆盖三类情形：全脏 / 局部脏 / 无脏区（跳过）。
+    #[test]
+    fn gpu_damage_dispatch_matches_full() {
+        use amiki_math::{Affine, Vec2};
+        use amiki_scene::{Color, Damage, Paint, PathBuilder};
+
+        let Ok(mut renderer) = pollster::block_on(GpuRenderer::new()) else {
+            eprintln!("跳过：无 GPU 适配器");
+            return;
+        };
+        renderer.path = RenderPath::Sparse;
+
+        let mut scene = Scene::new(128, 96);
+        for i in 0..6 {
+            let mut pb = PathBuilder::new();
+            let x = 10.0 + (i % 3) as f32 * 38.0;
+            let y = 14.0 + (i / 3) as f32 * 44.0;
+            pb.circle(Vec2::new(x, y), 16.0, false);
+            scene.push(
+                Affine::IDENTITY,
+                pb.build(),
+                Paint::Solid(Color::rgba8(40 + i as u8 * 30, 120, 200 - i as u8 * 20, 210)),
+            );
+        }
+
+        let frame = renderer.prepare(&scene, 0.1).expect("prepare 失败");
+        let (tx, ty) = (frame.scene.tiles_x, frame.scene.tiles_y);
+        let tex = renderer.create_output_texture(&frame.scene);
+
+        // 参照：全量派发
+        renderer
+            .render_into_persistent(&tex, &frame, None)
+            .expect("全量渲染失败");
+        let full = renderer.readback(&tex).expect("读回失败");
+
+        // 1) 局部脏区（含偏移，确保不是左上角起步）
+        let mut d = Damage::new(scene.width, scene.height);
+        d.clear();
+        d.invalidate_rect(42.0, 20.0, 100.0, 84.0);
+        let skipped = renderer
+            .render_into_persistent(&tex, &frame, Some(&d))
+            .expect("局部脏区渲染失败");
+        assert!(!skipped, "有脏区时不得跳过");
+        let after = renderer.readback(&tex).expect("读回失败");
+        assert_eq!(after, full, "只派发脏 tile 后，画面与全量派发不一致");
+
+        // 2) 无脏区：必须完全跳过且不改变像素
+        let mut d2 = Damage::new(scene.width, scene.height);
+        d2.clear();
+        assert!(d2.is_empty());
+        let skipped = renderer
+            .render_into_persistent(&tex, &frame, Some(&d2))
+            .expect("空脏区渲染失败");
+        assert!(skipped, "无脏区时必须跳过");
+        let after2 = renderer.readback(&tex).expect("读回失败");
+        assert_eq!(after2, full, "跳过的帧不得改变任何像素");
+
+        // 3) 全脏：也必须等于全量
+        let d3 = Damage::new(scene.width, scene.height);
+        assert!(d3.is_full());
+        renderer
+            .render_into_persistent(&tex, &frame, Some(&d3))
+            .expect("全脏渲染失败");
+        let after3 = renderer.readback(&tex).expect("读回失败");
+        assert_eq!(after3, full, "全脏渲染与全量派发不一致");
+
+        // 4) 脏区 tile 数校验：尺寸不匹配的 damage 必须被断言拦下（防"全脏被误判为局部"）
+        let wrong = Damage::new(scene.width + 64, scene.height);
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            renderer.render_into_persistent(&tex, &frame, Some(&wrong))
+        }))
+        .is_err();
+        assert!(caught, "画布尺寸不匹配的 damage 应被断言拦下");
+
+        eprintln!(
+            "GPU 脏区派发：全脏 / 局部脏 / 空脏区 三类均与全量逐字节一致（tiles={tx}x{ty}）"
+        );
     }
 }

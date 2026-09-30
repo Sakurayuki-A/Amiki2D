@@ -62,6 +62,7 @@ cargo bench -p amiki-gpu                              # 基准（含显存与逐
 
 ## 文档
 
+- [**现状总览**](docs/OVERVIEW.md) —— 一页看清"这是什么、现在到哪了、接下来做什么"
 - [发布报告 0.1.0-alpha](docs/RELEASE_0.1.0-alpha.md) —— 门禁状态、能力清单、性能数据、已知问题
 - [变更记录](CHANGELOG.md)
 - [架构总览](docs/ARCHITECTURE.md)

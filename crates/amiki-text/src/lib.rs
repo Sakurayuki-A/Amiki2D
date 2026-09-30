@@ -255,6 +255,50 @@ impl Font {
 ///
 /// 忽略 advance 会让所有字形叠在同一处；忽略 offset 会丢掉 kerning 与 mark 定位。
 /// 两者都由 shaping 给出，都必须用上。
+/// shaping 产出的单个字形：位置（em 单位）**加上它对应的字符字节偏移**。
+///
+/// `cluster` 是 rustybuzz 给出的**字节偏移**（`text` 中的位置）。排版需要它才能
+/// 把字形的推进量映射回字符边界 —— 没有它就只能在"逐字符累加 advance"
+/// （丢掉字距与连字）和"对每个前缀各 shaping 一次"（O(n²)）之间二选一。
+///
+/// 连字会把多个字符映射到**同一个** cluster，这正是断行需要的语义：连字不可拆。
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ShapedGlyph {
+    pub id: u32,
+    pub x: f32,
+    pub y: f32,
+    pub cluster: u32,
+}
+
+/// shaping（含 cluster）。[`shape`] 是它的便捷包装。
+pub fn shape_clustered(font: &Font, text: &str) -> Result<Vec<ShapedGlyph>, TextError> {
+    let face = ttf_parser::Face::parse(&font.data, 0)
+        .map_err(|e| TextError::FontParse(format!("{e:?}")))?;
+    let upem = face.units_per_em() as f32;
+    let rb_face = rustybuzz::Face::from_face(face);
+
+    let mut buf = rustybuzz::UnicodeBuffer::new();
+    buf.push_str(text);
+    let out = rustybuzz::shape(&rb_face, &[], buf);
+
+    let infos = out.glyph_infos();
+    let positions = out.glyph_positions();
+    // 排版单位为字体单位 → 归一化成 em
+    let k = 1.0 / upem.max(1.0);
+
+    let mut glyphs = Vec::with_capacity(positions.len());
+    let mut pen_x = 0.0f32;
+    let mut pen_y = 0.0f32;
+    for (i, p) in positions.iter().enumerate() {
+        let x = pen_x + p.x_offset as f32 * k;
+        let y = pen_y - p.y_offset as f32 * k; // y 取负：与轮廓一致地翻转到屏幕朝向
+        glyphs.push(ShapedGlyph { id: infos[i].glyph_id, x, y, cluster: infos[i].cluster });
+        pen_x += p.x_advance as f32 * k;
+        pen_y -= p.y_advance as f32 * k;
+    }
+    Ok(glyphs)
+}
+
 pub fn shape(font: &Font, text: &str, size: f32) -> Result<TextRun, TextError> {
     let face = ttf_parser::Face::parse(&font.data, 0)
         .map_err(|e| TextError::FontParse(format!("{e:?}")))?;

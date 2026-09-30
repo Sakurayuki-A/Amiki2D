@@ -210,3 +210,51 @@ fn advance_of_each_glyph_matches_shaping_positions() {
     }
     eprintln!("逐字形 advance 与 shaping 位置严格一致（5 个 'l'）");
 }
+
+/// P2-2：**字距（kerning）必须生效**。
+///
+/// `advance_width` 是**逐字形累加**（不做 shaping），因此它是"无字距"的基线；
+/// `shape` 给出的字形位置经过 GPOS / kern。对经典字距对 `AV`，
+/// 两者的差值就是字距量 —— 若为 0，说明 shaping 没有启用字距特性。
+///
+/// 这条测试存在的理由：字距**很容易在无声中失效**（特性没开、字体换了、
+/// shape 调用变了），而画面只是"字距略松"，肉眼几乎看不出。
+#[test]
+fn kerning_is_applied() {
+    let Some(font) = load() else { return };
+    let run = shape(&font, "AV", 100.0).expect("shaping 应成功");
+    assert!(run.glyphs.len() >= 2, "AV 应产生至少两个字形：{:?}", run.glyphs);
+
+    // **单位**：`run.glyphs[i].x` 是 **em 单位**（`TextRun::size` 在渲染时才乘上去），
+    // 而 `advance_width` 也返回 em —— 两者直接比较，不要乘字号。
+    // （第一版在这里乘了字号，于是"H 的推进量"变成了 74 em，测试误报。）
+    let naive_x = font.advance_width("A");
+    let actual_x = run.glyphs[1].x;
+    assert!(
+        actual_x < naive_x - 0.005,
+        "AV 应有字距收紧：无字距时 V 在 x={naive_x:.4} em，实际 {actual_x:.4} em\
+         （差 {:.4} em）—— 若差为 0，说明 shaping 未启用字距特性",
+        naive_x - actual_x
+    );
+    eprintln!(
+        "字距生效：AV 的 V 从 {naive_x:.4} em 收到 {actual_x:.4} em（收紧 {:.4} em）",
+        naive_x - actual_x
+    );
+}
+
+/// P2-2 的反向对照：**没有字距对**的组合不应被收紧。
+///
+/// 否则上面那条测试可能只是"任何两字都被收紧了"，判别力不足。
+#[test]
+fn non_kerned_pair_is_not_tightened() {
+    let Some(font) = load() else { return };
+    // `HH` 是直边相邻，常规字体里没有字距对
+    let run = shape(&font, "HH", 100.0).expect("shaping 应成功");
+    assert!(run.glyphs.len() >= 2, "HH 应产生至少两个字形");
+    let naive_x = font.advance_width("H");
+    let actual_x = run.glyphs[1].x;
+    assert!(
+        (actual_x - naive_x).abs() < 0.005,
+        "HH 不该被收紧：期望 x={naive_x:.4} em，实际 {actual_x:.4} em"
+    );
+}

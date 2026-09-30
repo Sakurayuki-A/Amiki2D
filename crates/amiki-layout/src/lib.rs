@@ -258,23 +258,61 @@ struct CharMetrics {
 }
 
 fn measure_chars(font: &Font, para: &str, size: f32) -> CharMetrics {
+    // ① 字符表与断点类型（与宽度无关，先算）
     let mut chars = Vec::new();
-    let mut prefix = vec![0.0f32];
     let mut prev_cjk = false;
-    let mut acc = 0.0f32;
     for (i, c) in para.char_indices() {
-        let w = if c == '\t' {
-            font.advance_width("    ") * size
-        } else {
-            let mut buf = [0u8; 4];
-            font.advance_width(c.encode_utf8(&mut buf)) * size
-        };
         let kind = break_kind_after(c, prev_cjk);
         prev_cjk = is_cjk(c);
         chars.push((i, c.len_utf8(), kind));
-        acc += w;
-        prefix.push(acc);
     }
+
+    // ② 前缀宽度**必须来自 shaping 的结果**，而不是逐字符累加 `advance_width`。
+    //
+    // 逐字符累加会丢掉**字距与连字**：`AV` 渲染时 V 会向左收（Inter 实测
+    // 0.0684 em），而逐字符累加把它算成 0.69 em。后果是**排版宽度与渲染宽度
+    // 不一致** —— 断行偏保守、`LayoutResult::size` 与画面也对不上。
+    //
+    // 做法：整段 shaping 一次，用字形自带的 `cluster`（字节偏移）把推进量映射回
+    // 字符边界。连字会让多个字符落在同一 cluster，于是它们的前缀宽度相同 ——
+    // 这正是断行需要的语义（连字不可拆）。
+    let mut prefix = vec![0.0f32; chars.len() + 1];
+    match amiki_text::shape_clustered(font, para) {
+        Ok(glyphs) if !glyphs.is_empty() => {
+            // 段尾宽度 = 末字形起点 + 其推进量（推进量要查字体，TextRun 不带）
+            let last = glyphs[glyphs.len() - 1];
+            let end_pen = (last.x + font.advance(last.id).unwrap_or(0.0)) * size;
+            // 每个字形的**起点**推进量即它 cluster 处的边界宽度
+            let mut gi = 0usize;
+            for (k, &(off, _, _)) in chars.iter().enumerate() {
+                let off = off as u32;
+                // 沿字形前进，直到找到一个 cluster ≥ 当前字符偏移的字形
+                while gi < glyphs.len() && glyphs[gi].cluster < off {
+                    gi += 1;
+                }
+                prefix[k] = if gi < glyphs.len() { glyphs[gi].x * size } else { end_pen };
+            }
+            // 段尾宽度：末字形起点 + 其推进量
+            prefix[chars.len()] = end_pen;
+        }
+        // shaping 失败：**回退到逐字符累加**并明确记录（不静默给出不同结果）
+        _ => {
+            eprintln!("amiki-layout：shaping 失败，回退到逐字符 advance（字距与连字不参与排版）");
+            let mut acc = 0.0f32;
+            for (k, &(off, len, _)) in chars.iter().enumerate() {
+                let c = para[off..off + len].chars().next().unwrap_or(' ');
+                let w = if c == '\t' {
+                    font.advance_width("    ") * size
+                } else {
+                    let mut buf = [0u8; 4];
+                    font.advance_width(c.encode_utf8(&mut buf)) * size
+                };
+                acc += w;
+                prefix[k + 1] = acc;
+            }
+        }
+    }
+
     CharMetrics { chars, prefix }
 }
 

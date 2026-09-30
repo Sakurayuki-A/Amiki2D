@@ -195,3 +195,38 @@ fn line_spacing_scales_line_advance() {
     assert!((d2 - base * 2.0).abs() < 0.01, "2.0 倍行距应为 {:.2}，实际 {d2:.2}", base * 2.0);
     eprintln!("行距倍数：1.0 → {d1:.2}px，2.0 → {d2:.2}px");
 }
+
+/// P2-2：**排版宽度必须与渲染宽度一致** —— 即字距要参与断行计算。
+///
+/// 这里曾有一个自相矛盾之处：断行后的行宽（`measure_run`）用 shaping 结果，
+/// 而**断行决策用的前缀宽度**（`measure_chars`）却是逐字符 `advance_width` 累加
+/// —— 后者丢掉字距与连字。于是排版宽度比实际渲染宽度偏大、断行偏保守。
+///
+/// 判据：单行 `AV` 的行宽应当**严格小于**逐字符累加的宽度，
+/// 且**恰好等于** shaping 后的渲染宽度。
+#[test]
+fn layout_width_includes_kerning() {
+    let Some(f) = font() else { return };
+    let size = 100.0f32;
+    let opts = LayoutOptions::new(size, f32::INFINITY);
+    let r = layout(&f, "AV", &opts).expect("排版");
+    assert_eq!(r.lines.len(), 1);
+    let line_w = r.lines[0].width;
+
+    // 逐字符累加（无字距）—— 这是**错的**那个基线
+    let naive = f.advance_width("AV") * size;
+    assert!(
+        line_w < naive - 0.5,
+        "行宽应反映字距（严格小于逐字符累加 {naive:.2}），实际 {line_w:.2}"
+    );
+
+    // 与真实渲染宽度对拍：末字形起点 + 其推进量
+    let run = amiki_text::shape(&f, "AV", size).expect("shaping");
+    let last = run.glyphs.last().expect("应有字形");
+    let rendered = (last.x + f.advance(last.id).unwrap_or(0.0)) * size;
+    assert!(
+        (line_w - rendered).abs() < 0.05,
+        "行宽应与渲染宽度一致：排版 {line_w:.3} vs 渲染 {rendered:.3}"
+    );
+    eprintln!("排版宽度含字距：{line_w:.3}（逐字符累加会得到 {naive:.3}）");
+}

@@ -7,7 +7,7 @@
 use amiki::color::*;
 use amiki::math::Vec2;
 use amiki::raster;
-use amiki::scene::{BlendMode, Paint, PathBuilder};
+use amiki::scene::{BlendMode, LineCap, LineJoin, Paint, PathBuilder, StrokeStyle};
 use amiki::{Canvas, gpu};
 use std::time::Instant;
 
@@ -360,6 +360,47 @@ fn main() {
                 lc.circle(Vec2::new(1075.0, 460.0), 44.0, Paint::Solid(Color::rgb8(96, 170, 96)));
             },
         );
+
+        // 描边（P0-1）：三种典型情形各一个
+        //   ① 开放折线 + 圆端帽/圆角
+        //   ② 闭合三角形 + 尖角（miter）
+        //   ③ 描边圆 = **环**（外圈 + 反向内圈，靠绕数相减出中空）
+        // 三者都只产生普通填充 draw —— 后端不需要知道描边的存在。
+        {
+            let mut pb = PathBuilder::new();
+            pb.move_to(Vec2::new(70.0, 600.0));
+            pb.line_to(Vec2::new(140.0, 660.0));
+            pb.line_to(Vec2::new(210.0, 600.0));
+            pb.line_to(Vec2::new(280.0, 660.0));
+            c.stroke_path(
+                &pb.build(),
+                StrokeStyle { width: 11.0, cap: LineCap::Round, join: LineJoin::Round },
+                Color::rgb8(52, 120, 196),
+            );
+
+            let mut pb = PathBuilder::new();
+            pb.move_to(Vec2::new(392.0, 572.0));
+            pb.line_to(Vec2::new(452.0, 662.0));
+            pb.line_to(Vec2::new(332.0, 662.0));
+            pb.close();
+            c.stroke_path(
+                &pb.build(),
+                StrokeStyle {
+                    width: 11.0,
+                    cap: LineCap::Butt,
+                    join: LineJoin::Miter { limit: 4.0 },
+                },
+                Color::rgb8(186, 72, 44),
+            );
+
+            let mut pb = PathBuilder::new();
+            pb.circle(Vec2::new(540.0, 616.0), 45.0, false);
+            c.stroke_path(
+                &pb.build(),
+                StrokeStyle { width: 11.0, cap: LineCap::Butt, join: LineJoin::Bevel },
+                Color::rgb8(96, 150, 96),
+            );
+        }
 
         // 文字：用渐变着色，并叠在位图与渐变之上
         if let Some(font) = load_inter() {

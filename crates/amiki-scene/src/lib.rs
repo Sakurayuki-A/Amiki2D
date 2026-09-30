@@ -246,7 +246,7 @@ pub enum GradientKind {
 pub struct Gradient {
     pub kind: GradientKind,
     pub stops: Vec<GradientStop>,
-    /// 范围外行为：`t` 钳到 [0,1]（Clamp）或按 1 取模重复（Repeat）
+    /// 范围外行为：`t` 钳到 `[0,1]`（Clamp）或按 1 取模重复（Repeat）
     pub repeat: bool,
 }
 

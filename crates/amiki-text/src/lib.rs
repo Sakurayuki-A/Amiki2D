@@ -18,6 +18,9 @@
 //! 解析式覆盖率光栅器，**任意缩放下边缘都是精确面积积分** —— 这是架构带来的
 //! 质量优势，不是额外优化。
 
+//! API 稳定性：稳定面为 `Font` / `shape` / `shape_clustered` / `ShapedGlyph` /
+//! `TextRun` / `TextError`。完整划分见仓库 `docs/API.md`。
+
 #![forbid(unsafe_code)]
 
 use amiki_math::Vec2;

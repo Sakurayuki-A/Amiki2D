@@ -84,7 +84,7 @@ impl GpuRenderer {
 
     /// 读回纹理像素（直线 RGBA8）。
     ///
-    /// M3.6：暂存缓冲取自 [`Self::take_readback_buffer`] 池（同一画布尺寸逐帧复用）。
+    /// M3.6：暂存缓冲取自本模块的 `take_readback_buffer` 池（同一画布尺寸逐帧复用）。
     pub fn readback(&self, tex: &wgpu::Texture) -> Result<Vec<u8>, RenderError> {
         let w = tex.width();
         let h = tex.height();

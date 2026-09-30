@@ -95,6 +95,17 @@ cargo bench -p amiki-gpu                              # 基准（含显存与逐
 | 跨平台后端 | 多后端并行维护 | Windows | CPU | **wgpu 一套 WGSL 通吃 + CPU 兜底**（已验证 Vulkan / DX12 / GL 三个后端） |
 | 绑定生态 | C++ 核心 + 各语言绑定 | COM | C/C++ | **Rust 核心 + C ABI → 全生态** |
 
+## 文档
+
+| 文件 | 内容 |
+|---|---|
+| [`docs/OVERVIEW.md`](docs/OVERVIEW.md) | 用大白话讲这是什么、做到哪了 |
+| [`docs/API.md`](docs/API.md) | **API 稳定性**：稳定面 / 实验面 / 内部面的清单与承诺 |
+| [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | 分层与边界 |
+| [`docs/RENDERING_STRATEGY.md`](docs/RENDERING_STRATEGY.md) | 算法推导与实测数据 |
+| [`docs/RELEASE_PLAN.md`](docs/RELEASE_PLAN.md) | 发布计划、验收标准与当前状态 |
+| [`CHANGELOG.md`](CHANGELOG.md) | 逐项变更与踩过的坑 |
+
 ## 已验证的后端与已知限制
 
 后半句"一套 WGSL 通吃"是**实测过**的，不是宣称：同一份 WGSL 在三个 wgpu 后端上

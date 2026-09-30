@@ -226,8 +226,8 @@
 |---|---|---|
 | **多适配器验证** | 🔶 **部分完成** | 同一块 GPU 上**三个后端**跑通全部测试：默认（→Vulkan）**145/0**、DX12 **20/0**、GL **20/0**。**换厂商 GPU 仍需外部硬件**。过程中修好两个真问题（见下） |
 | **启动开销** | 🔶 **有条件达标** | 默认 **337 ms**（✗ > 200 ms）；`AMIKI_BACKENDS=vulkan` **154 ms**（✓） |
-| **文件规模** | ⬜ 未做 | `amiki-gpu/src/lib.rs` 现约 5700 行 |
-| **API 稳定性** | ⬜ 未做 | 未声明稳定 `pub` 面 |
+| **文件规模** | ✅ **已完成** | `amiki-gpu/src/lib.rs` **5719 → 1439 行**（−75%），拆出 tests / sparse / layer / dense / profile / extract / consistency / readback / blit |
+| **API 稳定性** | ✅ **已完成** | 新增 [`docs/API.md`](API.md)：稳定面 / 实验面 / 内部面三级清单与承诺；`cargo doc` 零警告；已在各 crate 的 crate 文档里写明 |
 | **dogfooding** | ⬜ 未做 | 只有示例，没有完整应用 |
 | **文档同步** | 🔶 进行中 | 本文件与 CHANGELOG/OVERVIEW 已按实测更正 |
 

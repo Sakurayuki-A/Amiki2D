@@ -2,6 +2,15 @@
 //!
 //! 门面 API：上层只需构造 [`Canvas`]，产出 [`Scene`]，再交给 GPU / CPU 后端。
 //! 详细架构见仓库 `docs/ARCHITECTURE.md`，算法推导见 `docs/RENDERING_STRATEGY.md`。
+//!
+//! # API 稳定性
+//!
+//! **本 crate 的公开项是稳定面**（0.3.x 内不破坏）。完整清单、实验面与内部面的
+//! 划分见仓库 `docs/API.md`。
+//!
+//! `amiki::{gpu, math, raster, scene}` 是再导出，其中带诊断性质的项
+//! （`FrameProfile`、`PipelineDump`、容量表等）属于**实验面** ——
+//! 能跑、有测试，但不承诺兼容。
 
 #![forbid(unsafe_code)]
 

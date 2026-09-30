@@ -31,6 +31,10 @@
 //! 贪心不是最优（不做 Knuth-Plass 全局最优断行），但对绝大多数文本与 UI
 //! 场景足够，且行为可预测。全局最优点是后续增强，不影响本层的接口。
 
+//! API 稳定性：稳定面为 `layout` / `LayoutOptions` / `LayoutResult` / `Line` /
+//! `Align` / `is_no_line_start` / `is_no_line_end`。
+//! 完整划分见仓库 `docs/API.md`。
+
 #![forbid(unsafe_code)]
 
 use amiki_math::Vec2;

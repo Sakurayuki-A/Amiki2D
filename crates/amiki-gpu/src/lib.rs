@@ -15,6 +15,11 @@
 //! 两条路径共用：GPU 均匀压平（闭式段数界）、通用三级前缀和、active tile 元数据
 //! （[`PipelineDump`] 可逐级读出）、GPU 时间戳分析（[`PassTimings`]）。
 
+//! API 稳定性：本 crate 的稳定面为 `GpuRenderer` / `RenderError` /
+//! `RenderPath` / `Frame` / `Blitter` / `GpuScene` / `build_gpu_scene`；
+//! `profile`、`consistency`、容量表与各内部模块属**实验面**。
+//! 完整划分见仓库 `docs/API.md`。
+
 #![forbid(unsafe_code)]
 
 use amiki_scene::Scene;
@@ -641,6 +646,7 @@ pub struct GpuRenderer {
 /// 临时 bind group 构建期间的 16B 垫片（满足 vec4 数组的最小绑定尺寸）。
 const PAD16: [u8; 16] = [0u8; 16];
 
+#[doc(hidden)] // 仅基准与诊断用，见 docs/API.md「实验面」
 /// 稠密网格（`(tile, draw, row)`）所需规模：`(元素数, 桶数)`。
 ///
 /// 布局见 `bins.wgsl`：`b = ((tr * tiles_x + col) * n_draws + draw) * 16 + row_local`。
@@ -650,6 +656,7 @@ pub fn dense_grid_shape(tiles_x: u32, tiles_y: u32, n_draws: u32) -> (u64, u64) 
     (n_grid, n_bucket)
 }
 
+#[doc(hidden)] // 仅基准与诊断用，见 docs/API.md「实验面」
 /// 稠密路径容量预检：`Ok((n_grid, n_bucket))` 或带具体数字的可读错误。
 ///
 /// # 为什么需要它
@@ -1463,7 +1470,7 @@ impl GpuRenderer {
     /// 未派发的 tile **不写入**，纹理中保留的正是上一帧算出的同一结果
     /// （单 tile 的着色只依赖该 tile 的成员段与画家序，与其他 tile 的当前内容无关）。
     ///
-    /// `damage` 必须与 `scene` 的画布尺寸匹配，否则 [`check_damage_bounds`] 会断言失败
+    /// `damage` 必须与 `scene` 的画布尺寸匹配，否则内部的 `check_damage_bounds` 会断言失败
     /// ——那是在阻止"全脏被误当作局部脏区"从而静默残留陈旧像素。
     ///
     /// 返回 `true` 表示本帧完全跳过（未做任何 GPU 工作）。

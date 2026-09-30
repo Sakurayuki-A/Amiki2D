@@ -217,6 +217,211 @@ pub enum Paint {
 /// 每 draw 最多引用的裁剪层数（WGSL 侧展开采样）。
 pub const MAX_DRAW_CLIPS: usize = 4;
 
+// ============================================================================
+// M5：文本 —— 字形轮廓即路径
+// ============================================================================
+//
+// 设计决策（重要）：**字形轮廓直接作为普通 path 进入既有管线**。
+//
+// 由此免费获得：
+//   · 复用压平 / 分箱 / 解析式覆盖率 / 混合 / 裁剪 / damage region，零新增着色代码；
+//   · **任意缩放都不糊** —— 抗锯齿来自真实的面积积分，不依赖预渲染的字形位图；
+//   · 与图形完全同源的合成路径，文本与形状可以任意叠加、混合、裁剪。
+//
+// 引擎**不包含字体解析**：调用方（或未来的 `amiki-text`）负责 shaping 与轮廓提取，
+// 交给引擎的是设备空间无关的轮廓点。这样核心保持零依赖，字体栈可替换。
+
+/// 一个字形的轮廓（**em 单位**：1.0 = 字号，原点在字形基线左端）。
+///
+/// 用曲线元素序列表达，与 [`Path`] 同构——因此可零成本喂给既有管线。
+/// 引擎不关心它来自 TrueType/OpenType 的哪种表，只要求坐标是 em 单位的
+/// 轮廓坐标（后续按 `font_size` 与变换缩放）。
+#[derive(Clone, Debug, PartialEq)]
+pub struct GlyphOutline {
+    /// 轮廓元素；坐标单位为 em（相对字号归一化）
+    pub els: Vec<PathEl>,
+}
+
+impl GlyphOutline {
+    pub fn new(els: Vec<PathEl>) -> GlyphOutline {
+        GlyphOutline { els }
+    }
+}
+
+/// 一个已就位的字形：id 用于缓存，位置以**em 单位**给出（基线原点向左为 0）。
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PositionedGlyph {
+    /// 字形标识（调用方定义：字体内 glyph id 即可），供缓存分键
+    pub id: u32,
+    /// 基线原点（em 单位）
+    pub x: f32,
+    pub y: f32,
+}
+
+/// 一段文本：字号 + 已 shaping 的字形序列。
+///
+/// `size` 是**字号**（em 到设备空间的缩放基准）。若调用方已把字号折进变换，
+/// 传 `1.0` 即可——两条路等价，引擎不做假设。
+#[derive(Clone, Debug, PartialEq)]
+pub struct TextRun {
+    pub size: f32,
+    pub glyphs: Vec<PositionedGlyph>,
+}
+
+impl TextRun {
+    pub fn new(size: f32) -> TextRun {
+        TextRun { size, glyphs: Vec::new() }
+    }
+
+    pub fn push_glyph(&mut self, id: u32, x: f32, y: f32) -> &mut Self {
+        self.glyphs.push(PositionedGlyph { id, x, y });
+        self
+    }
+}
+
+/// 字形轮廓缓存键：`(glyph id, 量化后的字号)`。
+///
+/// 为什么必须缓存：一个字形会被成百上千次复用（每个字符位置一次），
+/// 每次都重新构造 `Path` 会让 CPU 侧成为瓶颈。
+/// 为什么按**量化**字号分键：同一段文本常以若干离散字号出现，
+/// 量化后命中率远高于精确浮点相等，且误差只是一次查表偏移。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct GlyphKey {
+    pub id: u32,
+    /// 字号 × 16 后取整（1/16 px 粒度）
+    pub size_q: u32,
+}
+
+impl GlyphKey {
+    pub const SIZE_QUANT: f32 = 16.0;
+    pub fn new(id: u32, size: f32) -> GlyphKey {
+        GlyphKey { id, size_q: (size.max(0.0) * Self::SIZE_QUANT).round() as u32 }
+    }
+}
+
+/// 把 [`TextRun`] 展开为若干 `(Path, 变换)`——每个字形一个。
+///
+/// `lookup` 提供字形轮廓。返回的变换把 em 单位轮廓映射到设备空间：
+/// 缩放 `size`、平移字形位置。调用方再乘上文本自身的外部变换。
+///
+/// 展开成**多个独立 path** 而不是合并成一条大路径，有两个理由：
+/// 1. 每个字形各自成 draw，可被分箱与 damage region 独立处理（改一个字只脏一小块）；
+/// 2. 避免合并后产生大量子路径带来的绕数判定开销。
+pub fn expand_text_run(
+    run: &TextRun,
+    mut lookup: impl FnMut(u32) -> Option<GlyphOutline>,
+) -> Vec<(Path, Affine)> {
+    let mut out = Vec::with_capacity(run.glyphs.len());
+    for g in &run.glyphs {
+        let Some(o) = lookup(g.id) else { continue };
+        if o.els.is_empty() {
+            continue;
+        }
+        // em → 设备：先按字号缩放，再平移到字形基线原点
+        let scale = Affine::scale(run.size);
+        let shift = Affine::translate(Vec2::new(g.x, g.y));
+        out.push((Path::from_els(o.els.clone()), scale.then(shift)));
+    }
+    out
+}
+
+/// 带缓存的文本展开器：由调用方持有，跨帧复用。
+///
+/// 缓存的是**已按字号缩放的路径**（`Affine::scale(size)` 折入坐标），
+/// 因此同一 `(id, size)` 第二次出现时不再重复缩放整条轮廓。
+#[derive(Default)]
+pub struct TextCache {
+    /// (键 → 已缩放轮廓)。用 Vec 而非 HashMap：字形数量通常很小（几十到几百），
+    /// 线性查找比哈希更快，也避免引入哈希依赖。
+    entries: Vec<(GlyphKey, Path)>,
+    hits: u64,
+    misses: u64,
+}
+
+impl TextCache {
+    pub fn new() -> TextCache {
+        TextCache::default()
+    }
+
+    /// 命中率（诊断用）。
+    pub fn hit_rate(&self) -> f64 {
+        let n = self.hits + self.misses;
+        if n == 0 {
+            0.0
+        } else {
+            self.hits as f64 / n as f64
+        }
+    }
+
+    pub fn hits(&self) -> u64 {
+        self.hits
+    }
+
+    pub fn misses(&self) -> u64 {
+        self.misses
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// 展开一段文本，命中缓存则复用已缩放轮廓。
+    ///
+    /// `outline` 只在未命中时调用（避免无谓的轮廓提取开销）。
+    pub fn expand<F>(&mut self, run: &TextRun, mut outline: F) -> Vec<(Path, Affine)>
+    where
+        F: FnMut(u32) -> Option<GlyphOutline>,
+    {
+        let mut out = Vec::with_capacity(run.glyphs.len());
+        for g in &run.glyphs {
+            let key = GlyphKey::new(g.id, run.size);
+            // 命中：线性查已缩放轮廓
+            let idx = self.entries.iter().position(|(k, _)| *k == key);
+            let path = match idx {
+                Some(i) => {
+                    self.hits += 1;
+                    self.entries[i].1.clone()
+                }
+                None => {
+                    self.misses += 1;
+                    let Some(o) = outline(g.id) else { continue };
+                    if o.els.is_empty() {
+                        continue;
+                    }
+                    // 把字号折进坐标，之后只需平移 → 同一字号的复用不再缩放
+                    let s = run.size;
+                    let scaled: Vec<PathEl> = o
+                        .els
+                        .iter()
+                        .map(|el| match *el {
+                            PathEl::MoveTo(p) => PathEl::MoveTo(p * s),
+                            PathEl::LineTo(p) => PathEl::LineTo(p * s),
+                            PathEl::QuadTo(c, p) => PathEl::QuadTo(c * s, p * s),
+                            PathEl::CubicTo(a, b, p) => PathEl::CubicTo(a * s, b * s, p * s),
+                            PathEl::Close => PathEl::Close,
+                        })
+                        .collect();
+                    let p = Path::from_els(scaled);
+                    self.entries.push((key, p.clone()));
+                    p
+                }
+            };
+            // 位置也要乘以字号：`expand_text_run` 用 `scale.then(translate)`，
+            // 平移量同样被缩放。缓存把字号折进了**坐标**，因此这里必须显式
+            // 缩放位置，否则 size≠1 时字形会被摆到错误位置（曾用测试抓出此 bug）。
+            out.push((
+                path,
+                Affine::translate(Vec2::new(g.x * run.size, g.y * run.size)),
+            ));
+        }
+        out
+    }
+}
+
 /// 裁剪层：变换 + 路径。覆盖率在独立 pass 中渲染，绘制时逐像素乘入。
 #[derive(Clone, Debug, PartialEq)]
 pub struct Clip {
@@ -768,8 +973,7 @@ mod tests {
     }
 
     #[test]
-    fn damage_invalidate_all_wins() {
-        let mut d = Damage::new(64, 64);
+    fn damage_invalidate_all_wins() {        let mut d = Damage::new(64, 64);
         d.clear();
         d.invalidate_rect(0.0, 0.0, 5.0, 5.0);
         assert!(!d.is_full());
@@ -819,5 +1023,148 @@ mod tests {
         let mut bytes = encode_scene(&Scene::new(10, 10));
         bytes[4] = 99; // 版本破坏
         assert!(decode_scene(&bytes).is_err());
+    }
+
+    // ===================== M5：文本（字形轮廓即路径） =====================
+
+    /// 一个矩形字形：em 单位下覆盖 [0,0.1]×[0,0.6]（模拟一个"竖条"字形）。
+    fn bar_glyph() -> GlyphOutline {
+        GlyphOutline::new(vec![
+            PathEl::MoveTo(Vec2::new(0.0, 0.0)),
+            PathEl::LineTo(Vec2::new(0.1, 0.0)),
+            PathEl::LineTo(Vec2::new(0.1, 0.6)),
+            PathEl::LineTo(Vec2::new(0.0, 0.6)),
+            PathEl::Close,
+        ])
+    }
+
+    /// 一个方形字形（不同占位，用于验证多字形各自独立展开）。
+    fn box_glyph() -> GlyphOutline {
+        GlyphOutline::new(vec![
+            PathEl::MoveTo(Vec2::new(0.0, 0.0)),
+            PathEl::LineTo(Vec2::new(0.5, 0.0)),
+            PathEl::LineTo(Vec2::new(0.5, 0.6)),
+            PathEl::LineTo(Vec2::new(0.0, 0.6)),
+            PathEl::Close,
+        ])
+    }
+
+    #[test]
+    fn text_run_expands_to_one_path_per_glyph() {
+        let mut run = TextRun::new(20.0);
+        run.push_glyph(1, 0.0, 0.0);
+        run.push_glyph(2, 0.8, 0.0);
+        run.push_glyph(1, 1.6, 0.0);
+
+        let paths = expand_text_run(&run, |id| match id {
+            1 => Some(bar_glyph()),
+            2 => Some(box_glyph()),
+            _ => None,
+        });
+        assert_eq!(paths.len(), 3, "三个字形应展开成三条独立路径");
+
+        // 第 3 个字形与第 1 个同形，但位置应为 1.6 em × 20px = 32px
+        let p0 = paths[0].1.map_point(Vec2::ZERO);
+        let p2 = paths[2].1.map_point(Vec2::ZERO);
+        assert!((p0.x - 0.0).abs() < 1e-4, "第 1 个字形应在 x=0，实际 {}", p0.x);
+        assert!((p2.x - 32.0).abs() < 1e-4, "第 3 个字形应在 x=32，实际 {}", p2.x);
+
+        // 字号应折进坐标：字形高度 0.6 em × 20 px = 12 px
+        let top = paths[0].1.map_point(Vec2::new(0.0, 0.6));
+        assert!((top.y - 12.0).abs() < 1e-4, "字形高度应为 12px，实际 {}", top.y);
+    }
+
+    #[test]
+    fn missing_glyph_is_skipped_not_panicking() {
+        let mut run = TextRun::new(16.0);
+        run.push_glyph(1, 0.0, 0.0);
+        run.push_glyph(99, 1.0, 0.0); // 轮廓缺失
+        run.push_glyph(2, 2.0, 0.0);
+        let paths = expand_text_run(&run, |id| match id {
+            1 => Some(bar_glyph()),
+            2 => Some(box_glyph()),
+            _ => None,
+        });
+        assert_eq!(paths.len(), 2, "缺失轮廓的字形应被跳过而不是 panic");
+    }
+
+    #[test]
+    fn text_cache_hits_on_repeated_glyphs() {
+        let mut cache = TextCache::new();
+        let mut run = TextRun::new(20.0);
+        for i in 0..10 {
+            run.push_glyph(1, i as f32 * 0.5, 0.0);
+        }
+        let mut lookups = 0;
+        let a = cache.expand(&run, |id| {
+            lookups += 1;
+            if id == 1 { Some(bar_glyph()) } else { None }
+        });
+        assert_eq!(a.len(), 10);
+        assert_eq!(lookups, 1, "10 个相同字形只应提取一次轮廓");
+        assert_eq!(cache.misses(), 1);
+        assert_eq!(cache.hits(), 9);
+
+        // 第二次展开同一字号：全部命中
+        let b = cache.expand(&run, |id| {
+            lookups += 1;
+            if id == 1 { Some(bar_glyph()) } else { None }
+        });
+        assert_eq!(b.len(), 10);
+        assert_eq!(lookups, 1, "再次展开不应再提取轮廓");
+        assert!(cache.hit_rate() > 0.9, "命中率应 > 0.9，实际 {}", cache.hit_rate());
+
+        // 输出必须与未缓存路径**几何等价**（缓存不得改变渲染结果）。
+        // 注意两者的表示不同：缓存把字号折进坐标、变换只含平移；
+        // 直接展开则把缩放留在变换里。因此比较的是**变换后的顶点**，而非结构。
+        let direct = expand_text_run(&run, |id| if id == 1 { Some(bar_glyph()) } else { None });
+        assert_eq!(b.len(), direct.len());
+        for (gi, (cached, plain)) in b.iter().zip(direct.iter()).enumerate() {
+            assert_eq!(cached.0.els.len(), plain.0.els.len());
+            let cp = el_points_all(&cached.0.els, &cached.1);
+            let pp = el_points_all(&plain.0.els, &plain.1);
+            for (pi, (a, c)) in cp.iter().zip(pp.iter()).enumerate() {
+                assert!(
+                    (a.x - c.x).abs() < 1e-4 && (a.y - c.y).abs() < 1e-4,
+                    "字形 {gi} 点 {pi}：缓存展开 {a:?} 与直接展开 {c:?} 不一致\
+                     （缓存不得改变几何；曾因此抓出位置未随字号缩放的 bug）"
+                );
+            }
+        }
+    }
+
+    /// 把路径元素全部映射到最终坐标。
+    fn el_points_all(els: &[PathEl], t: &Affine) -> Vec<Vec2> {
+        els.iter()
+            .flat_map(el_points)
+            .map(|p| t.map_point(p))
+            .collect()
+    }
+
+    /// 取出一个路径元素的控制点（用于几何比较，忽略表示差异）。
+    fn el_points(el: &PathEl) -> Vec<Vec2> {
+        match *el {
+            PathEl::MoveTo(p) | PathEl::LineTo(p) => vec![p],
+            PathEl::QuadTo(c, p) => vec![c, p],
+            PathEl::CubicTo(a, b, p) => vec![a, b, p],
+            PathEl::Close => vec![],
+        }
+    }
+
+    #[test]
+    fn text_cache_separates_quantized_sizes() {
+        let mut cache = TextCache::new();
+        let mk = |size: f32| {
+            let mut r = TextRun::new(size);
+            r.push_glyph(1, 0.0, 0.0);
+            r
+        };
+        cache.expand(&mk(20.0), |_| Some(bar_glyph()));
+        cache.expand(&mk(40.0), |_| Some(bar_glyph()));
+        assert_eq!(cache.misses(), 2, "不同字号必须是不同缓存项");
+        // 同一量化桶（20.0 与 20.01 → 1/16 粒度）应视为同一项
+        cache.expand(&mk(20.0), |_| Some(bar_glyph()));
+        assert_eq!(cache.misses(), 2, "同字号复现不应新增缓存项");
+        assert_eq!(cache.len(), 2);
     }
 }

@@ -9,6 +9,8 @@ use amiki_math::{Affine, CubicBez, QuadBez, Vec2};
 
 mod damage;
 pub use damage::{changed_bounds, draw_device_bounds, edit_damage};
+mod stroke;
+pub use stroke::{stroke_polyline, LineCap, LineJoin, StrokeStyle};
 
 /// 路径元素。
 #[derive(Clone, Copy, Debug, PartialEq)]

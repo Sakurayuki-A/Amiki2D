@@ -529,9 +529,243 @@ pub fn decode_scene(bytes: &[u8]) -> Result<Scene, String> {
     Ok(scene)
 }
 
+// ============================================================================
+// M4：damage region —— tile 级脏区模型
+// ============================================================================
+//
+// 目的：让"与画面内容成比例"从**显存**扩展到 **CPU 时间与提交量**。
+// 保留模式下，只重算被改动区域覆盖的 tile；未改动区域复用上一帧结果。
+//
+// 与分箱的一致性：tile 粒度必须等于分箱粒度，否则增量结果会与全量结果
+// 边界不一致。`amiki-raster::TILE` / `amiki-gpu` 的分箱均取 16，此处同值。
+// 注意这是**跨 crate 的约定**，若将来调整分箱 tile 尺寸，这里必须同步。
+
+/// tile 边长（像素）—— 必须与分箱层的 tile 尺寸一致。
+pub const DAMAGE_TILE: u32 = 16;
+
+/// 一个 tile 级脏区：像素矩形 `[x0, x1) × [y0, y1)`，`f32` 以容纳半个像素的边界。
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DamageRect {
+    pub x0: f32,
+    pub y0: f32,
+    pub x1: f32,
+    pub y1: f32,
+}
+
+impl DamageRect {
+    /// 从任意两点构造（自动规范化，允许传入逆序坐标）。
+    pub fn new(x0: f32, y0: f32, x1: f32, y1: f32) -> DamageRect {
+        DamageRect {
+            x0: x0.min(x1),
+            y0: y0.min(y1),
+            x1: x0.max(x1),
+            y1: y0.max(y1),
+        }
+    }
+
+    /// 两矩形求并（外接包围盒）。
+    pub fn union(&self, o: &DamageRect) -> DamageRect {
+        DamageRect {
+            x0: self.x0.min(o.x0),
+            y0: self.y0.min(o.y0),
+            x1: self.x1.max(o.x1),
+            y1: self.y1.max(o.y1),
+        }
+    }
+
+    /// 是否为空（零面积或退化）。
+    pub fn is_empty(&self) -> bool {
+        self.x1 <= self.x0 || self.y1 <= self.y0
+    }
+}
+
+/// 脏区的三种状态。用显式枚举而非 `Option`：本模型有**三**种状态
+/// （全脏 / 部分脏 / 无脏），用 `Option` 会把"全脏"和"无脏"混为一谈。
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum DamageState {
+    /// 整幅画布都脏 —— 必须走全量渲染。
+    All,
+    /// 无脏区 —— 静态画面，可完全跳过重绘。
+    Clean,
+    /// 部分脏区 —— 走增量渲染。
+    Rect(DamageRect),
+}
+
+/// 一帧的脏区集合（tile 级）。
+///
+/// 语义要点：
+/// - **只增不减**：同一帧内多次 `invalidate` 取并集，不做精确的矩形差集
+///   （差集需要凸分解，收益低于复杂度）。
+/// - **`All` 是安全默认**：新建的 `Damage` 表示"整幅画布都脏"，
+///   因为新出现的帧没有可复用内容。要进入增量模式必须显式 `clear()`。
+/// - **tile 量化**：`tiles()` 把像素矩形向外扩到 tile 边界，
+///   保证"覆盖到脏像素的 tile 一定会被重算"。
+#[derive(Clone, Debug)]
+pub struct Damage {
+    width: u32,
+    height: u32,
+    state: DamageState,
+}
+
+impl Damage {
+    /// 新建 = **整幅全脏**（安全默认：没有可复用内容）。
+    pub fn new(width: u32, height: u32) -> Damage {
+        Damage { width, height, state: DamageState::All }
+    }
+
+    /// 清空为"无脏区"——进入增量模式。之后只有被 `invalidate` 的区域会重算。
+    pub fn clear(&mut self) {
+        self.state = DamageState::Clean;
+    }
+
+    /// 标记整幅画布为脏。
+    pub fn invalidate_all(&mut self) {
+        self.state = DamageState::All;
+    }
+
+    /// 标记一块像素矩形为脏（自动与已有脏区取并集）。
+    pub fn invalidate_rect(&mut self, x0: f32, y0: f32, x1: f32, y1: f32) {
+        let r = DamageRect::new(x0, y0, x1, y1);
+        if r.is_empty() {
+            return;
+        }
+        self.state = match self.state {
+            DamageState::All => DamageState::All,
+            DamageState::Clean => DamageState::Rect(r),
+            DamageState::Rect(d) => DamageState::Rect(d.union(&r)),
+        };
+    }
+
+    /// 标记某条路径的设备空间包围盒为脏。
+    ///
+    /// M4 的调用点是"场景被改动时"：调用方给出被改 draw 的设备空间 bbox 即可，
+    /// 无需自己算 tile。
+    pub fn invalidate_bounds(&mut self, bbox: [f32; 4]) {
+        self.invalidate_rect(bbox[0], bbox[1], bbox[2], bbox[3]);
+    }
+
+    /// 是否整幅全脏（调用方据此决定走全量路径）。
+    pub fn is_full(&self) -> bool {
+        matches!(self.state, DamageState::All)
+    }
+
+    /// 是否无脏区（静态画面：可以完全跳过重绘）。
+    pub fn is_empty(&self) -> bool {
+        matches!(self.state, DamageState::Clean)
+    }
+
+    /// tile 范围 `[tx0, tx1) × [ty0, ty1)`（半开区间）。
+    ///
+    /// `None` 表示**整幅全脏**（无边界可表达）；`Some` 且区间为空表示无脏区。
+    pub fn tiles(&self) -> Option<(u32, u32, u32, u32)> {
+        let d = match self.state {
+            DamageState::All => return None,
+            DamageState::Clean => return Some((0, 0, 0, 0)),
+            DamageState::Rect(d) => d,
+        };
+        let tiles_x = self.width.div_ceil(DAMAGE_TILE);
+        let tiles_y = self.height.div_ceil(DAMAGE_TILE);
+        // 向外扩到 tile 边界：floor 起、ceil 止，再钳到画布 tile 数
+        let tx0 = (d.x0.max(0.0) as u32 / DAMAGE_TILE).min(tiles_x);
+        let ty0 = (d.y0.max(0.0) as u32 / DAMAGE_TILE).min(tiles_y);
+        let tx1 = ((d.x1.max(0.0).ceil() as u32).div_ceil(DAMAGE_TILE)).min(tiles_x);
+        let ty1 = ((d.y1.max(0.0).ceil() as u32).div_ceil(DAMAGE_TILE)).min(tiles_y);
+        Some((tx0, ty0, tx1.max(tx0), ty1.max(ty0)))
+    }
+
+    /// 脏 tile 数量（全脏时 = 画布全部 tile，无脏区时 = 0）。
+    pub fn tile_count(&self) -> u32 {
+        match self.state {
+            DamageState::All => self.total_tiles(),
+            DamageState::Clean => 0,
+            DamageState::Rect(_) => match self.tiles() {
+                Some((tx0, ty0, tx1, ty1)) => (tx1 - tx0) * (ty1 - ty0),
+                None => self.total_tiles(),
+            },
+        }
+    }
+
+    /// 画布总 tile 数。
+    pub fn total_tiles(&self) -> u32 {
+        self.width.div_ceil(DAMAGE_TILE) * self.height.div_ceil(DAMAGE_TILE)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn damage_defaults_to_full() {
+        let d = Damage::new(128, 64);
+        assert!(d.is_full(), "新建 Damage 必须是全脏（无可复用内容）");
+        assert!(!d.is_empty());
+        assert_eq!(d.tiles(), None, "全脏用 None 表达");
+        assert_eq!(d.total_tiles(), 8 * 4);
+        assert_eq!(d.tile_count(), d.total_tiles());
+    }
+
+    #[test]
+    fn damage_clear_means_skip() {
+        let mut d = Damage::new(128, 64);
+        d.clear();
+        assert!(d.is_empty(), "clear 后应无脏区（静态画面可完全跳过重绘）");
+        assert!(!d.is_full());
+        assert_eq!(d.tile_count(), 0);
+    }
+
+    #[test]
+    fn damage_rect_quantizes_outward() {
+        let mut d = Damage::new(128, 64);
+        d.clear();
+        // 1 像素的改动必须把**覆盖它的那个 tile** 整个标记为脏
+        d.invalidate_rect(20.0, 20.0, 21.0, 21.0);
+        assert_eq!(d.tiles(), Some((1, 1, 2, 2)), "1px 改动应量化到 tile(1,1)");
+        assert_eq!(d.tile_count(), 1);
+    }
+
+    #[test]
+    fn damage_union_of_rects() {
+        let mut d = Damage::new(256, 256);
+        d.clear();
+        d.invalidate_rect(10.0, 10.0, 20.0, 20.0);   // tile (0,0)
+        d.invalidate_rect(200.0, 200.0, 210.0, 210.0); // tile (12,12)
+        // 并集是外接包围盒：覆盖 0..14 共 14x14 个 tile（保守，但保证不漏）
+        let (tx0, ty0, tx1, ty1) = d.tiles().unwrap();
+        assert_eq!((tx0, ty0), (0, 0));
+        assert_eq!((tx1, ty1), (14, 14));
+        assert_eq!(d.tile_count(), 14 * 14);
+        // 保守性的关键断言：两块脏区所在的 tile 都必须落在范围内
+        // （注意 tx0/ty0 是 u32，用 == 而非 <= 0，否则断言恒真、毫无价值）
+        assert_eq!((tx0, ty0), (0, 0));
+        assert!(tx1 > 13 && ty1 > 13, "并集必须覆盖到第二块脏区所在的 tile(13,13)");
+    }
+
+    #[test]
+    fn damage_clamps_to_canvas() {
+        let mut d = Damage::new(70, 40); // tiles_x = ceil(70/16) = 5, tiles_y = 3
+        d.clear();
+        // 越出画布右/下的改动必须被钳到画布 tile 数内
+        d.invalidate_rect(60.0, 30.0, 9999.0, 9999.0);
+        let (tx0, ty0, tx1, ty1) = d.tiles().unwrap();
+        assert_eq!((tx0, ty0), (3, 1));
+        assert_eq!((tx1, ty1), (5, 3), "必须钳到画布 tile 边界");
+        // 完全在画布外的改动不产生脏区
+        let mut d2 = Damage::new(70, 40);
+        d2.clear();
+        d2.invalidate_rect(-100.0, -100.0, -50.0, -50.0);
+        assert_eq!(d2.tile_count(), 0, "画布外的改动不应产生脏 tile");
+    }
+
+    #[test]
+    fn damage_invalidate_all_wins() {
+        let mut d = Damage::new(64, 64);
+        d.clear();
+        d.invalidate_rect(0.0, 0.0, 5.0, 5.0);
+        assert!(!d.is_full());
+        d.invalidate_all();
+        assert!(d.is_full(), "invalidate_all 后必须回到全脏");
+    }
 
     #[test]
     fn stream_round_trip() {

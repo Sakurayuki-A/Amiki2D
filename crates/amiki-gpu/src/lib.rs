@@ -727,9 +727,10 @@ fn reject_layers_for_frame_path(n_layers: u32) -> Result<(), RenderError> {
         return Ok(());
     }
     err(format!(
-        "GPU 侧尚未实现离屏层（滤镜）：场景含 {n_layers} 个层。\
-         请改用 CPU 引擎（amiki_raster::render）；\
-         GPU 层合成是已知未完成项，详见 CHANGELOG 的 M6 与 blur 模块说明"
+        "GPU 离屏层（滤镜）已实现但尚未启用：场景含 {n_layers} 个层。\
+         原因：模糊的预乘/反预乘顺序未与 CPU 语义对齐（Filter::Blur 差 64、\
+         DropShadow 差 103）；启用会静默画出与 CPU 不一致的效果，故暂由 CPU 承担。\
+         详见 CHANGELOG 的 M6「未完成项」"
     ))
 }
 

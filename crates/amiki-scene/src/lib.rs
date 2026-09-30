@@ -218,7 +218,7 @@ pub enum Paint {
 pub const MAX_DRAW_CLIPS: usize = 4;
 
 /// 裁剪层：变换 + 路径。覆盖率在独立 pass 中渲染，绘制时逐像素乘入。
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Clip {
     pub transform: Affine,
     pub path: Path,
@@ -241,7 +241,10 @@ pub struct Draw {
 }
 
 /// 场景：画布尺寸 + 有序绘制列表（画家算法，后绘制在上）+ 裁剪层。
-#[derive(Clone, Debug, Default)]
+///
+/// 派生 `PartialEq` 供 M4 判定"本帧场景与上一帧是否相同"——相同则**一次着色都不做**。
+/// 浮点字段按位比较：只要有一个比特变了就视为"变了"，宁可多算不可漏算。
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct Scene {
     pub width: u32,
     pub height: u32,

@@ -4,7 +4,7 @@
 //! 计数 x_cross > x 的穿越，delta = sign(dy)），覆盖 = mean([W ≠ 0])。
 //! 解析算法与之独立推导，二者一致即互证正确。
 
-use amiki_raster::{bin, flatten_draw, render, render_damage, render_tiles};
+use amiki_raster::{bin, flatten_draw, render, render_damage, render_tiles, PersistentRenderer};
 use amiki_math::{Affine, Vec2};
 use amiki_scene::{edit_damage, Color, Damage, Paint, PathBuilder, Scene};
 
@@ -607,4 +607,92 @@ fn edit_damage_covers_all_changed_pixels() {
 
     assert!(covered_rounds >= 20, "至少一半轮次应有真实像素变化，否则测试没有判别力（实际 {covered_rounds}）");
     eprintln!("40 轮随机场景编辑：覆盖性与增量一致性全部通过（{covered_rounds} 轮有真实像素变化）");
+}
+
+// ============================================================================
+// M4 帧间持久化：真的省掉工作，同时结果与"从零重算"逐字节一致
+// ============================================================================
+
+/// 场景未变时必须**零着色**（静态画面的收益就在这里）。
+#[test]
+fn persistence_skips_unchanged_scene() {
+    let scene = damage_scene();
+    let mut r = PersistentRenderer::new(0.05);
+
+    r.update(&scene);
+    let first = r.last_stats();
+    assert!(!first.skipped, "首帧必须真实渲染");
+    assert!(first.shaded_tiles > 0);
+    let img_first = r.image().to_vec();
+
+    // 再提交同一场景若干次：每次都必须完全跳过
+    for round in 0..5 {
+        r.update(&scene);
+        let st = r.last_stats();
+        assert!(st.skipped, "第 {round} 次重复提交未跳过（场景未变）");
+        assert_eq!(st.shaded_tiles, 0, "跳过的帧不得着色任何 tile");
+        assert_eq!(st.saved_ratio(), 1.0);
+        assert_eq!(r.image(), img_first.as_slice(), "跳过的帧不得改变任何像素");
+    }
+    eprintln!(
+        "静态场景：首帧着色 {}/{} tile，之后 5 帧全部零着色",
+        first.shaded_tiles, first.total_tiles
+    );
+}
+
+/// 随机编辑序列下，持久渲染器的输出必须**逐帧**等于"从零全量重算"。
+#[test]
+fn persistence_matches_full_render_across_edits() {
+    let mut rng = Lcg(0xFEED_FACE_CAFE_BEEF);
+    let mut edits: Vec<Edit> = (0..3).map(|_| random_edit(&mut rng, EDIT_W, EDIT_H)).collect();
+    let mut r = PersistentRenderer::new(0.05);
+
+    let mut frames_with_change = 0;
+    let mut total_shaded = 0u64;
+    let mut total_full = 0u64;
+
+    for round in 0..60 {
+        // 每帧随机做一次编辑：增 / 删 / 改
+        let op = rng.next_u32() % 3;
+        match (op, edits.len()) {
+            (0, _) => edits.push(random_edit(&mut rng, EDIT_W, EDIT_H)),
+            (1, n) if n > 0 => {
+                let i = (rng.next_u32() as usize) % n;
+                edits.remove(i);
+            }
+            (_, n) if n > 0 => {
+                let i = (rng.next_u32() as usize) % n;
+                edits[i] = random_edit(&mut rng, EDIT_W, EDIT_H);
+            }
+            _ => edits.push(random_edit(&mut rng, EDIT_W, EDIT_H)),
+        }
+
+        let scene = build_edit_scene(&edits);
+        r.update(&scene);
+
+        // 参照：从零全量重算
+        let reference = render(&bin(&scene, 0.05));
+        assert_eq!(
+            r.image(),
+            reference.as_slice(),
+            "第 {round} 轮（op={op}, {} draws）：持久渲染器输出与全量重算不一致",
+            edits.len()
+        );
+
+        let st = r.last_stats();
+        total_shaded += st.shaded_tiles as u64;
+        total_full += st.total_tiles as u64;
+        if !st.skipped {
+            frames_with_change += 1;
+        }
+    }
+
+    assert!(frames_with_change >= 40, "绝大多数帧应有变化（实际 {frames_with_change}）");
+    let saved = 1.0 - (total_shaded as f64 / total_full as f64);
+    eprintln!(
+        "60 帧随机编辑：逐帧与全量重算一致；累计着色 {total_shaded}/{total_full} tile，省下 {:.1}%",
+        saved * 100.0
+    );
+    // 每次只改一条 draw，脏区远小于全画布 → 必须省下可观的工作
+    assert!(saved > 0.30, "每次只改一条 draw，应省下 >30% 的 tile 着色（实际 {:.1}%）", saved * 100.0);
 }

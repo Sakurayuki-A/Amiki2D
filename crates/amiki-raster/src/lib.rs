@@ -35,6 +35,9 @@
 use amiki_math::{CubicBez, QuadBez};
 use amiki_scene::{PathEl, Paint, Scene};
 
+mod persist;
+pub use persist::{FrameStats, PersistentRenderer};
+
 /// tile 边长（像素）。
 pub const TILE: u32 = 16;
 const TILE_USIZE: usize = TILE as usize;

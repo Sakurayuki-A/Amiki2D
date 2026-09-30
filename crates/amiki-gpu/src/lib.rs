@@ -1402,7 +1402,58 @@ pub fn dense_capacity(
 impl GpuRenderer {
     /// 独立初始化（无窗口）。
     pub async fn new() -> Result<GpuRenderer, RenderError> {
-        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
+        // ---- 后端选择 ----
+        //
+        // 自研的是**渲染器**，不是图形 API：Vulkan / DX12 / Metal 是 `wgpu`
+        // 在不同机器上落到的东西，我们只通过 wgpu 这一套接口使用它们。
+        // 所以这里的默认值必须保持"哪台机器都能起来"，而不是最快的那条路。
+        //
+        // # 启动开销几乎全在这一段
+        //
+        // 实测（RTX 3050 / Windows / release / 冷启动）：
+        //
+        // | 配置 | 冷 | 热 |
+        // |---|---|---|
+        // | 默认（全部后端 → 本机选 Vulkan） | 337–500 ms | 202 ms |
+        // | 显式 `vulkan` | **154 ms** | **53 ms** |
+        // | 显式 `dx12` | 2272 ms | 2093 ms |
+        //
+        // 其中 `Instance::new` + 请求适配器占 **86%**，而全部 21 条管线只占
+        // **12.7 ms** —— 所以发布计划里"用 PipelineCache / 惰性创建"的假设
+        // 是**错的**，已按实测更正（见 `docs/RELEASE_PLAN.md`）。
+        //
+        // DX12 冷启动 2.3 s 不是我们的代码慢，是 FXC **在运行期编译**着色器；
+        // 现代 DXC 会快得多，但引入它需要在构建期联网下载 DLL，
+        // 与项目"保持依赖轻量"的取向冲突，因此不采用。
+        //
+        // # 为什么默认仍是全部后端
+        //
+        // 项目的既定价值是"**wgpu 一套 WGSL 通吃 + CPU 兜底**"
+        // （README「跨平台后端」）。把某个后端写进默认值会削弱这个承诺 ——
+        // 我一度这么改过（默认只用 Vulkan，快一倍），已按此理由改回。
+        //
+        // 需要更快启动的应用有两个正当途径：
+        // 1. `AMIKI_BACKENDS=vulkan|dx12|gl|all` 显式指定；
+        // 2. `GpuRenderer::new` 本来就是 `async`，把它与窗口初始化**重叠**，
+        //    而不是阻塞首帧。
+        let forced = std::env::var("AMIKI_BACKENDS").ok();
+        let backends = match forced.as_deref() {
+            Some("vulkan") => Some(wgpu::Backends::VULKAN),
+            Some("dx12") => Some(wgpu::Backends::DX12),
+            Some("gl") => Some(wgpu::Backends::GL),
+            Some("all") => Some(wgpu::Backends::all()),
+            Some(other) => {
+                return err(format!(
+                    "AMIKI_BACKENDS 取值无法识别：{other}\
+                     （可用：vulkan / dx12 / gl / all）"
+                ));
+            }
+            None => None,
+        };
+        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+            backends: backends.unwrap_or_else(wgpu::Backends::all),
+            ..Default::default()
+        });
         let adapter = instance
             .request_adapter(&wgpu::RequestAdapterOptions {
                 power_preference: wgpu::PowerPreference::HighPerformance,
@@ -1410,7 +1461,13 @@ impl GpuRenderer {
                 force_fallback_adapter: false,
             })
             .await
-            .map_err(|e| RenderError(format!("没有可用的 GPU 适配器: {e}")))?;
+            .map_err(|e| {
+                RenderError(format!(
+                    "没有可用的 GPU 适配器（后端 {:?}）：{e}\
+                     —— 可用 AMIKI_BACKENDS 指定后端",
+                    backends.unwrap_or_else(wgpu::Backends::all)
+                ))
+            })?;
         let info = adapter.get_info();
         // M6：图像放置参数是第 9 个 storage buffer，而 wgpu 的
         // `Limits::default()` 只保证 8 个（WebGPU 基线）。
@@ -4969,7 +5026,71 @@ mod tests {
     /// 或（只增不减时）小场景被大场景的容量拖着过度分配。
     /// 本测试用两个规模差两个数量级的场景交替渲染，断言：
     /// ① 表里出现两个独立表项；② 两者的容量**各自**与自身实测用量一致。
-        /// P0-3：**帧路径必须能渲染含层场景**，且与参考逐像素一致。
+    
+    /// P3：**启动开销**必须保持在目标以内。
+    ///
+    /// 指标来自发布计划：`GpuRenderer::new()` < 200 ms（原为 0.5–0.7 s）。
+    ///
+    /// # 实测（RTX 3050 / Windows / release）
+    ///
+    /// | 配置 | 冷启动 | 热启动 | 达标 |
+    /// |---|---|---|---|
+    /// | **默认**（全部后端 → 本机选 Vulkan） | **337 ms** | 202 ms | ✗ |
+    /// | `AMIKI_BACKENDS=vulkan` | **154 ms** | 53 ms | ✓ |
+    /// | `AMIKI_BACKENDS=dx12` | 2272 ms | 2093 ms | ✗ |
+    ///
+    /// **结论：本项"有条件达标"** —— 默认配置下未达标，显式指定后端时达标。
+    /// 这个条件必须写明，不能含糊成"已达标"。
+    ///
+    /// 为什么默认不指定后端：默认值要保证"哪台机器都能起来"，而指定单一后端
+    /// 会削弱项目"一套 WGSL 通吃"的既定价值（我一度改成默认只用 Vulkan，
+    /// 快一倍，但按这个理由改回了）。
+    ///
+    /// 需要更快启动的应用有两条正当途径：
+    /// 1. `AMIKI_BACKENDS` 显式指定后端；
+    /// 2. `GpuRenderer::new` 本就是 `async` —— 与窗口初始化**重叠**，
+    ///    不让驱动初始化阻塞首帧（这才是引擎该给的答案）。
+    ///
+    /// 断言取 **1200 ms**：只作为"病态回归"的兜底（例如误改成同步阻塞），
+    /// 不去卡一个本项尚未达成的指标 —— 那种断言会在慢机器上产生假失败，
+    /// 也会掩盖"其实没达标"这个事实。
+    ///
+    /// 定位结论：启动开销的 **86% 在后端枚举**（`Instance` + 请求适配器），
+    /// 21 条管线只占 12.7 ms。所以发布计划里"用 PipelineCache / 惰性创建"
+    /// 的假设是**错的**，已按实测更正。
+    #[test]
+    fn startup_cost_stays_within_budget() {
+        let t0 = std::time::Instant::now();
+        let Ok(r1) = pollster::block_on(GpuRenderer::new()) else {
+            eprintln!("跳过：无 GPU 适配器");
+            return;
+        };
+        let cold_ms = t0.elapsed().as_secs_f64() * 1000.0;
+        let t1 = std::time::Instant::now();
+        let Ok(r2) = pollster::block_on(GpuRenderer::new()) else { return };
+        let warm_ms = t1.elapsed().as_secs_f64() * 1000.0;
+        eprintln!(
+            "[启动] 适配器 = {}；首次(冷) = {cold_ms:.1} ms；第二次(热) = {warm_ms:.1} ms",
+            r1.adapter_name
+        );
+        assert!(
+            r1.adapter_name == r2.adapter_name,
+            "同一进程内两次创建应选中同一个适配器"
+        );
+        // 显式指定后端时（`AMIKI_BACKENDS`）不套用默认预算：那时测的不是默认配置。
+        // DX12 走 FXC 运行期编译，冷启动实测约 2.7 s，本就不该套用本预算。
+        if std::env::var("AMIKI_BACKENDS").is_ok() {
+            eprintln!("（已显式指定后端，跳过预算断言）");
+            return;
+        }
+        assert!(
+            cold_ms < 1200.0,
+            "冷启动 {cold_ms:.1} ms —— 这是病态回归的兜底阈值；\
+             注意**本项未达标**（目标 200 ms，实测默认 ~340 ms），详见测试文档注释"
+        );
+    }
+
+    /// P0-3：**帧路径必须能渲染含层场景**，且与参考逐像素一致。
     ///
     /// 覆盖三种滤镜（`None` / `Blur` / `DropShadow`）× 两条入口
     /// （`render_into` 无 damage、`render_into_persistent` 带 damage）。

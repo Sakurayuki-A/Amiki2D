@@ -446,6 +446,10 @@ pub struct FrameProfile {
     pub alloc_ms: f64,
     /// 上传（`create_buffer_init` / `write_buffer`）
     pub upload_ms: f64,
+    /// 第一次编码**与提交**（`enc1a` + `enc1b`：分箱结构 + 稀疏结构，
+    /// 含 10 个 pass 与 **2 次 submit 同步点**）。读回 1 夹在这两者之间，
+    /// 故单独计（`readback1_ms`）。
+    pub encode1_ms: f64,
     /// 第二次提交前的命令编码（含单元 CSR scan）
     pub encode2_ms: f64,
     /// 第二次提交
@@ -470,6 +474,7 @@ impl FrameProfile {
         self.extract_ms
             + self.alloc_ms
             + self.upload_ms
+            + self.encode1_ms
             + self.encode2_ms
             + self.submit2_ms
             + self.readback1_ms.unwrap_or(0.0)
@@ -490,6 +495,7 @@ impl FrameProfile {
         s.push_str(&format!(" [提取 {:.2}]", self.extract_ms));
         s.push_str(&format!(" [分配 {:.2}]", self.alloc_ms));
         s.push_str(&format!(" [上传 {:.2}]", self.upload_ms));
+        s.push_str(&format!(" [编码1+提交 {:.2}]", self.encode1_ms));
         s.push_str(&format!(" [编码2 {:.2}]", self.encode2_ms));
         s.push_str(&format!(" [提交2 {:.2}]", self.submit2_ms));
         push(&mut s, "读回1", self.readback1_ms);
@@ -2301,6 +2307,7 @@ impl GpuRenderer {
         });
 
         // ———— enc1a：分箱结构 ————
+        let t_enc1 = Instant::now();
         let mut enc1a = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("amiki_sparse_enc1a") });
@@ -2409,6 +2416,9 @@ impl GpuRenderer {
             dispatch_1d(&mut pass, total_segments);
         }
         self.queue.submit(Some(enc1b.finish()));
+
+        // enc1a + enc1b 的编码与提交到此结束（读回 1 夹在两者之间）
+        prof.encode1_ms = t_enc1.elapsed().as_secs_f64() * 1000.0;
 
         // 〖读回 2〗成员总数 → 分配段列表
         let t_rb2 = Instant::now();

@@ -101,6 +101,17 @@ impl Affine {
         Vec2::new(self.a * p.x + self.c * p.y + self.e, self.b * p.x + self.d * p.y + self.f)
     }
 
+    /// 变换的**最大尺度**：两个基向量像的长度的较大者。
+    ///
+    /// 用途：把"设备像素"量纲的容差折算回用户空间（`eps_user = eps / max_scale`），
+    /// 使压平精度在设备空间一致。对非等比缩放取较大者是**保守**选择
+    /// （宁可比需要的更细，也不要更粗）。
+    pub fn max_scale(&self) -> f32 {
+        let sx = (self.a * self.a + self.b * self.b).sqrt();
+        let sy = (self.c * self.c + self.d * self.d).sqrt();
+        sx.max(sy)
+    }
+
     /// 映射向量（不含平移）。
     pub fn map_vec(&self, v: Vec2) -> Vec2 {
         Vec2::new(self.a * v.x + self.c * v.y, self.b * v.x + self.d * v.y)

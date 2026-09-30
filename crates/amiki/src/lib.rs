@@ -91,6 +91,45 @@ impl Canvas {
         self.fill_path_with(path, paint)
     }
 
+    /// 描边一条路径，并可指定任意 paint（P0-1）。
+    ///
+    /// # 线宽是**用户单位**
+    ///
+    /// 描边在**用户空间**解析成填充轮廓，再由画布变换作用一次。
+    /// 因此 `scale(3.0)` 会把线宽一起放大 3 倍、旋转与非等比缩放都正确，
+    /// 而且**不会双重变换**（`stroke_path` 不接收变换，变换只在这里发生）。
+    ///
+    /// # 后端无感知
+    ///
+    /// 轮廓在提交前已退化成普通多边形，所以 CPU 与 GPU 两侧都**不需要**知道
+    /// 描边的存在 —— 也就没有"两端各写一份描边逻辑"的漂移风险。
+    ///
+    /// # 精度
+    ///
+    /// 曲线先按 `eps_device / 变换尺度` 的容差压平（`eps_device` 取 0.1px），
+    /// 于是设备空间的压平误差与填充路径同级。
+    pub fn stroke_path_with(
+        &mut self,
+        path: &Path,
+        style: amiki_scene::StrokeStyle,
+        paint: Paint,
+    ) -> &mut Self {
+        const EPS_DEVICE: f32 = 0.1;
+        let scale = self.transform.max_scale().max(1e-6);
+        let outline = amiki_scene::stroke_path(path, &style, EPS_DEVICE / scale);
+        self.fill_path_with(&outline, paint)
+    }
+
+    /// 描边的实心便捷形式（等价于 `stroke_path_with(path, style, Paint::Solid(color))`）。
+    pub fn stroke_path(
+        &mut self,
+        path: &Path,
+        style: amiki_scene::StrokeStyle,
+        color: amiki_scene::Color,
+    ) -> &mut Self {
+        self.stroke_path_with(path, style, Paint::Solid(color))
+    }
+
     /// 绘制一张位图（M6），放置到设备空间的矩形 `[x0,x1] × [y0,y1]`。
     ///
     /// 放置会经过画布当前变换，因此可以配合 `translate` / `rotate` / `scale`

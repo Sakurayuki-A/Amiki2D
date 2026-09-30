@@ -1,0 +1,41 @@
+P0-1 描边（第四步）：接门面 API —— 双端一致且后端零改动
+
+## 门面 API
+
+- `Canvas::stroke_path_with(path, style, paint)`：描边 + 任意 paint
+- `Canvas::stroke_path(path, style, color)`：实心便捷形式
+
+## 关键设计：避免双重变换
+
+`stroke_path`（scene 层）**不接收变换**，只产出**用户空间**的轮廓；
+变换只在 `Canvas` 推入时发生一次。
+
+早先的版本让 `stroke_path` 自己做变换，接入门面时就会**变换两次**
+（轮廓一次 + 画布一次）。把它改成"只做用户空间"后语义唯一：
+
+- 线宽是用户单位 → `scale(3.0)` 让线宽也 3 倍
+- 旋转与非等比缩放天然正确
+- 后端完全不需要知道描边的存在
+
+新增 `Affine::max_scale()` 用于把设备容差折算回用户空间
+（`eps_user = 0.1px / max_scale()`），保证压平精度在设备空间一致。
+
+## 新增测试（4 条，`crates/amiki/tests/stroke_api.rs`）
+
+- `canvas_transform_applies_exactly_once`：**这条专测变换的施加次数**。
+  用户空间 60×4=240；3 倍缩放下必须是 2160（长宽各 3 倍）。
+  若变换被施加两次会得到别的值 —— 而"画出来看着还行"会让这种错误活很久，
+  用面积可精确判定。
+- `stroke_width_is_user_units`：线宽加倍 → 面积加倍
+- `stroke_emits_an_ordinary_fill_draw`：描边只产生一条普通 draw，不引入层
+  （证明后端确实无需改动）
+- `gpu_stroke_matches_cpu`：**GPU 与 CPU 对拍，最大通道差 1** —— 覆盖
+  三种 join（bevel/round/miter）+ 圆端帽 + 闭合环
+
+## 过程中的一次测试自身错误
+
+`canvas_transform_applies_exactly_once` 第一版把线放在用户空间 y=60，
+3 倍缩放后落到 y=180，超出 120 高的画布 → 面积 0。是**测试画布太小**，
+不是代码问题。改用 260×200 并把线放在 y=40。
+
+门禁：119 测试全绿 / clippy 零警告

@@ -16,16 +16,17 @@
 > - **M6 的滤镜（离屏层）已在 CPU 与 GPU 两侧实现并逐像素对拍一致**。
 
 
-### P0-3 帧路径的层合成（部分完成）
+### P0-3 帧路径的层合成（已完成）
 
 GPU 帧路径（`render_into` / `render_into_persistent`）此前对含层场景**整体报错**。
 现在它在 **GPU 上直接合成层**（compute pass，不读回）：
 
-| 滤镜 | 帧路径 | 实测 |
-|---|---|---|
-| `None` | ✅ | 与 `render_blocking` 差 0、与 CPU 差 0 |
-| `Blur` | ✅ | 差 1 / 1 |
-| `DropShadow` | ❌ 显式报错 | GPU 单趟阴影与 CPU 仍差 122/255，未对齐不启用 |
+| 滤镜 | 与 `render_blocking` | 与 CPU | 帧持久路径 |
+|---|---|---|---|
+| `None`（分组） | 0 | 0 | 0 |
+| `Blur` | 1 | 1 | 1 |
+| `DropShadow` | 1 | 1 | 1 |
+| `DropShadow`（sigma=0） | 0 | 0 | 0 |
 
 **为什么是 compute 而不是 render pass**：调用方提供的输出纹理只有
 `STORAGE_BINDING | TEXTURE_BINDING | COPY_SRC` —— 没有 `RENDER_ATTACHMENT`
@@ -40,6 +41,11 @@ GPU 帧路径（`render_into` / `render_into_persistent`）此前对含层场景
    平移到左上角（差 179/255）。
 3. **乒乓写错**：第二、三轮横向 pass 仍读原始内容 → 等于只模糊一遍（差 45/255）。
 4. **`target` 是 WGSL 保留字** → 着色器解析失败。
+5. **参数传反**：`composite_pass` 的 `layer_tex` 与 `shadow_tex` 位置写反 ——
+   于是"模糊后的内容"被当成图层内容、阴影拿到未模糊的内容。症状是层边缘出现
+   一圈不该有的淡影（7567 个像素不同，首个差异点的值恰好等于模糊值）。
+   **这个错误只跟 `render_blocking` 对比会被漏掉**（两者都变了），
+   必须同时跟 CPU 对比才暴露 —— 所以测试里两个基准缺一不可。
 
 另把模糊从**线性采样改为整数抽头**（与 CPU 滑动窗口逐抽头一致）：线性过滤即使
 采样点落在纹素中心也会因浮点误差混入相邻纹素，在真实半径外漏出微小数值，

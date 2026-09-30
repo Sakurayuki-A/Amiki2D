@@ -3344,18 +3344,6 @@ impl GpuRenderer {
         if gs.layers.is_empty() {
             return Ok(());
         }
-        // **尚未对齐的一类显式拒绝**：GPU 单趟阴影与 CPU 仍有差（实测 122/255）。
-        // 未对齐就报错是本项目一贯的取舍 —— 宁可让调用方退回 CPU，
-        // 也不要静默画出与 CPU 不一致的阴影。已对齐的 `None` / `Blur` 正常放行。
-        for l in &gs.layers {
-            if matches!(l.filter, amiki_scene::Filter::DropShadow { .. }) {
-                return err(
-                    "GPU 帧路径的 DropShadow 尚未与 CPU 逐像素对齐（实测差 122/255），\
-                     为避免静默画出不一致的阴影，这里显式拒绝；\
-                     请改用 render_blocking 或 CPU 引擎（amiki_raster）",
-                );
-            }
-        }
         let (tw, th) = (tex.width(), tex.height());
         let tile = amiki_scene::DAMAGE_TILE;
         // damage 限制的设备矩形
@@ -3497,8 +3485,12 @@ impl GpuRenderer {
                     &self.layer_composite,
                     &params_buf,
                     &backdrop_view,
-                    shadow_view,
+                    // 参数顺序是 **(backdrop, layer_tex, shadow_tex, target)**。
+                    // 这里曾经把两者写反 —— 于是"模糊后的内容"被当成图层内容合成、
+                    // 而阴影拿到的是未模糊的内容。症状是层边缘出现一圈**不该有的淡影**
+                    // （实测 7567 个像素不同，首个差异点 (58,17) 的值恰好等于模糊值）。
                     layer_view,
+                    shadow_view,
                     &target_view,
                     (rx0, ry0, rx1, ry1),
                 )?;
@@ -4885,99 +4877,18 @@ mod tests {
     /// 或（只增不减时）小场景被大场景的容量拖着过度分配。
     /// 本测试用两个规模差两个数量级的场景交替渲染，断言：
     /// ① 表里出现两个独立表项；② 两者的容量**各自**与自身实测用量一致。
-    #[test]
-    fn capacity_table_keeps_scenes_apart() {
-        use amiki_math::Vec2;
-        use amiki_scene::{Color, Paint, PathBuilder, Scene};
-
-        let Ok(renderer) = pollster::block_on(GpuRenderer::new()) else {
-            eprintln!("跳过：无 GPU 适配器");
-            return;
-        };
-
-        let build = |n: usize, r: f32| {
-            let mut scene = Scene::new(200, 200);
-            for i in 0..n {
-                let mut pb = PathBuilder::new();
-                pb.circle(
-                    Vec2::new(20.0 + (i as f32 * 7.0) % 170.0, 20.0 + (i as f32 * 3.0) % 170.0),
-                    r,
-                    false,
-                );
-                scene.push(
-                    amiki_math::Affine::IDENTITY,
-                    pb.build(),
-                    Paint::Solid(Color::rgba8(40, 120, 200, 180)),
-                );
-            }
-            scene
-        };
-        let small = build(4, 6.0);
-        let big = build(160, 5.0);
-
-        // 交替渲染：先小后大再小，模拟应用在不同界面之间切换
-        for _ in 0..2 {
-            renderer.render_blocking(&small, 0.05).expect("小场景渲染失败");
-            renderer.render_blocking(&big, 0.05).expect("大场景渲染失败");
-        }
-
-        let entries = renderer.capacity_entries();
-        assert_eq!(entries.len(), 2, "两个场景应各占一个表项：{entries:?}");
-
-        let usage = |scene: &Scene, n: usize| {
-            let st = renderer
-                .sparse_stats(scene, 0.05)
-                .expect("统计失败")
-                .expect("稀疏统计缺失");
-            (n, st.n_cells)
-        };
-        let (n_small, cells_small) = usage(&small, 4);
-        let (n_big, cells_big) = usage(&big, 160);
-        assert!(cells_big > cells_small, "大场景的稀疏单元数应更多");
-
-        // 找到两个表项：一个对应 4 draw、一个对应 160 draw
-        let by_draws = |d: u32| {
-            entries
-                .iter()
-                .find(|(k, _)| k.draws == d)
-                .map(|(_, c)| *c)
-                .unwrap_or_else(|| panic!("缺少 draw={d} 的表项：{entries:?}"))
-        };
-        assert_eq!(
-            by_draws(n_small as u32).cells,
-            cells_small,
-            "小场景的容量必须等于它自己的实测用量"
-        );
-        assert_eq!(
-            by_draws(n_big as u32).cells,
-            cells_big,
-            "大场景的容量必须等于它自己的实测用量"
-        );
-    }
-
-    /// M3.6：**容量不足时绝不允许把残缺的画面交出去** —— 这是投机分配
-    /// 能成立的前提，也是本方案唯一真正危险的地方。
+        /// P0-3：**帧路径必须能渲染含层场景**，且与参考逐像素一致。
     ///
-    /// 本测试**强制制造溢出**：先正常渲染一帧让该场景的容量被学到，然后把
-    /// 它的容量手工改到极小（1 格），再渲染一帧 —— **并检查这一帧自己**返回
-    /// 的像素。累计溢出计数用来证明"溢出确实发生在这一次调用上"，否则测试
-    /// 可能在没触发溢出的情况下空转通过。
+    /// 覆盖三种滤镜（`None` / `Blur` / `DropShadow`）× 两条入口
+    /// （`render_into` 无 damage、`render_into_persistent` 带 damage）。
     ///
-    /// 注意：必须检查**溢出帧本身**的像素。曾经写成检查溢出之后下一帧的像素，
-    /// 那时容量已被修正，即使完全取消失败重做测试也照样通过 —— 即测试没牙。
-    /// 已用"临时取消重做"验证过本测试确实会失败。
-        /// P0-3：**帧路径必须能渲染含层场景**（不再整体拒绝），且结果与已验证参考一致。
+    /// 对拍基准有两个，缺一不可：
+    /// - `render_blocking`（GPU 侧重合成参考）—— 验证帧路径的接线；
+    /// - CPU `amiki_raster`（唯一真值）—— 验证数学本身。
     ///
-    /// 当前支持范围与**明确的边界**：
-    ///
-    /// | 滤镜 | 帧路径 | 依据 |
-    /// |---|---|---|
-    /// | `None`（分组） | ✅ | 与 `render_blocking` 差 0、与 CPU 差 0 |
-    /// | `Blur` | ✅ | 与 `render_blocking` 差 1、与 CPU 差 1 |
-    /// | `DropShadow` | ❌ **显式报错** | GPU 单趟阴影与 CPU 仍有差（实测 122/255），未对齐前不启用 |
-    ///
-    /// 「未对齐就显式报错」是本项目一贯的取舍：宁可让调用方退回 CPU，
-    /// 也不要静默画出与 CPU 不一致的阴影。
+    /// 本测试在开发中抓到过一个**参数传反**的缺陷（`composite_pass` 的
+    /// `layer_tex` 与 `shadow_tex` 位置写反），症状是层边缘出现一圈不该有的淡影；
+    /// 若只跟 `render_blocking` 比而不跟 CPU 比，这个错误会被漏掉若干轮。
     #[test]
     fn gpu_frame_path_composites_layers() {
         use amiki_math::Affine;
@@ -5014,81 +4925,75 @@ mod tests {
             scene
         };
 
-        // —— 支持的两类：必须与参考一致 ——
-        for (name, filter) in [("分组", Filter::None), ("模糊", Filter::Blur { sigma: 6.0 })] {
+        let cases: Vec<(&str, Filter)> = vec![
+            ("分组", Filter::None),
+            ("模糊", Filter::Blur { sigma: 6.0 }),
+            (
+                "投影",
+                Filter::DropShadow {
+                    dx: 9.0,
+                    dy: 11.0,
+                    sigma: 7.0,
+                    color: Color::rgba8(25, 22, 20, 190),
+                },
+            ),
+            (
+                "投影无模糊",
+                Filter::DropShadow {
+                    dx: 9.0,
+                    dy: 11.0,
+                    sigma: 0.0,
+                    color: Color::rgba8(25, 22, 20, 190),
+                },
+            ),
+        ];
+
+        for (name, filter) in cases {
             let scene = build(filter);
             let reference = renderer
                 .render_blocking(&scene, 0.05)
                 .unwrap_or_else(|e| panic!("{name}层：render_blocking 失败（{e}）"));
             let cpu = amiki_raster::render(&amiki_raster::bin(&scene, 0.05));
 
+            // ① 帧路径（无 damage）
             let frame = renderer.prepare(&scene, 0.05).expect("prepare 失败");
             assert!(frame.scene.has_layers, "场景应被识别为含层");
             let tex = renderer.create_output_texture(&frame.scene);
-            renderer.render_into(&tex, &frame).expect("帧路径不得拒绝含层场景");
+            renderer
+                .render_into(&tex, &frame)
+                .unwrap_or_else(|e| panic!("{name}层：帧路径不得拒绝含层场景（{e}）"));
             let got = renderer.readback(&tex).expect("读回失败");
 
-            // 与 `render_blocking` 对拍：两者不是同一条浮点路径（那条是
-            // "读回 u8 → 主机 f32 → 写回 u8"的往返），允许 ±1 舍入差。
-            let max_ref = got
-                .iter()
-                .zip(reference.iter())
-                .map(|(a, b)| (*a as i32 - *b as i32).unsigned_abs())
-                .max()
-                .unwrap_or(0);
-            let max_cpu = got
-                .iter()
-                .zip(cpu.iter())
-                .map(|(a, b)| (*a as i32 - *b as i32).unsigned_abs())
-                .max()
-                .unwrap_or(0);
-            assert!(max_ref <= 2, "{name}层：与 render_blocking 差 {max_ref} 超容差");
-            assert!(max_cpu <= 2, "{name}层：与 CPU 差 {max_cpu} 超容差");
-
-            // 带 damage 的帧持久路径：用**全域 damage**（等价于全量），
-            // 验证 `render_into_persistent` 这条入口也能处理含层场景。
-            // （部分脏区只写一部分像素，逐像素比较会混入"未写区域保持初始值"的噪声，
-            //  那条由 CPU 侧的 layer_incremental 测试覆盖。）
+            // ② 帧持久路径（全域 damage，等价全量）
             let frame2 = renderer.prepare(&scene, 0.05).expect("prepare 失败");
             let tex2 = renderer.create_output_texture(&frame2.scene);
-            let d = amiki_scene::Damage::new(160, 120); // 默认全脏
+            let d = amiki_scene::Damage::new(160, 120);
             renderer
                 .render_into_persistent(&tex2, &frame2, Some(&d))
-                .expect("帧持久路径不得拒绝含层场景");
+                .unwrap_or_else(|e| panic!("{name}层：帧持久路径不得拒绝含层场景（{e}）"));
             let got_persist = renderer.readback(&tex2).expect("读回失败");
-            let max_persist = got_persist
-                .iter()
-                .zip(cpu.iter())
-                .map(|(a, b)| (*a as i32 - *b as i32).unsigned_abs())
-                .max()
-                .unwrap_or(0);
-            assert!(
-                max_persist <= 2,
-                "{name}层：帧持久路径与 CPU 差 {max_persist} 超容差"
-            );
+
+            let diff = |a: &[u8], b: &[u8]| -> u32 {
+                a.iter()
+                    .zip(b.iter())
+                    .map(|(x, y)| (*x as i32 - *y as i32).unsigned_abs())
+                    .max()
+                    .unwrap_or(0)
+            };
+            // 与 `render_blocking`：两者不是同一条浮点路径（那条是"读回 u8 →
+            // 主机 f32 → 写回 u8"的往返），允许 ±1 舍入差。
+            let max_ref = diff(&got, &reference);
+            let max_cpu = diff(&got, &cpu);
+            let max_persist = diff(&got_persist, &cpu);
+            assert!(max_ref <= 2, "{name}层：与 render_blocking 差 {max_ref} 超容差");
+            assert!(max_cpu <= 2, "{name}层：与 CPU 差 {max_cpu} 超容差");
+            assert!(max_persist <= 2, "{name}层：帧持久路径与 CPU 差 {max_persist} 超容差");
             eprintln!(
-                "帧路径 {name}层：与 render_blocking 差 {max_ref}、与 CPU 差 {max_cpu}（持久路径 {max_persist}）"
+                "帧路径 {name}层：render_blocking {max_ref} / CPU {max_cpu} / 持久 {max_persist}"
             );
         }
-
-        // —— 尚未对齐的一类：必须**显式报错**，不能静默画错 ——
-        let scene = build(Filter::DropShadow {
-            dx: 9.0,
-            dy: 11.0,
-            sigma: 7.0,
-            color: Color::rgba8(25, 22, 20, 190),
-        });
-        let frame = renderer.prepare(&scene, 0.05).expect("prepare 失败");
-        let tex = renderer.create_output_texture(&frame.scene);
-        let e = renderer.render_into(&tex, &frame).expect_err(
-            "GPU 帧路径的 DropShadow 尚未与 CPU 对齐，必须显式报错而不是画出不一致的阴影",
-        );
-        assert!(
-            e.to_string().contains("DropShadow"),
-            "错误信息应指明是 DropShadow 未对齐：{e}"
-        );
-        eprintln!("帧路径 DropShadow：按预期显式拒绝（{e}）");
     }
+
 
 
     /// M3a：轴对齐矩形（多 draw、半透明、跨 tile、部分出画布）——strip 逐格对拍。

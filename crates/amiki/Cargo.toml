@@ -20,6 +20,7 @@ pollster = { workspace = true }
 # 文本层仅示例/测试需要；门面 amiki 本身仍不依赖它，
 # 故 amiki-math/scene/raster/gpu 的"核心零依赖"性质不受影响。
 amiki-text = { path = "../amiki-text" }
+amiki-layout = { path = "../amiki-layout" }
 
 [[example]]
 name = "headless_png"

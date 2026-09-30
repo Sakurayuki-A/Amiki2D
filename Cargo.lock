@@ -60,6 +60,7 @@ name = "amiki"
 version = "0.2.0-alpha"
 dependencies = [
  "amiki-gpu",
+ "amiki-layout",
  "amiki-math",
  "amiki-raster",
  "amiki-scene",
@@ -81,6 +82,15 @@ dependencies = [
  "criterion",
  "pollster",
  "wgpu",
+]
+
+[[package]]
+name = "amiki-layout"
+version = "0.2.0-alpha"
+dependencies = [
+ "amiki-math",
+ "amiki-scene",
+ "amiki-text",
 ]
 
 [[package]]

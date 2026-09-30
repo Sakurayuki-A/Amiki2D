@@ -17,7 +17,7 @@
 （含旋转/缩放/平铺）、**模糊与投影**（离屏层）。抗锯齿是**数学精确**的，
 而且**特别省显存**；进一步地，**只重画改动过的地方**（静态界面省 96.5% 的重画工作）。
 
-还不会：**换行与排版**、描边、**GPU 侧滤镜**、图像缩放时的 mipmap 过滤。
+还不会：描边、双向文本、**GPU 侧滤镜**、图像缩放时的 mipmap 过滤、全局最优断行。
 
 所以它现在**还不能直接用来做完整的 UI、文档、图表**——差的是排版。但**画面能力
 已经足够画出像样的界面元素**了。用一句话概括：**能画出成品画面了，但写不出排版好的文字。**
@@ -63,7 +63,7 @@ Amiki2D 让资源占用只随**画面实际内容**增长：
 | **M3.5** | 工程硬化：自洽检查、输出快照、容量预检、分段计时 | ✅ **完成** |
 | **M3.6** | 帧路径性能：读回缓冲池化 | 🔶 **部分**（85% 收益已拿到，剩余并入 M4） |
 | **M4** | damage region：只重画改动的地方 | ✅ **功能闭环**（静态界面省 96.5% tile 着色） |
-| **M5** | **文字**（shaping + 字形轮廓走解析覆盖率） | 🔶 **能渲染真字**，缺换行排版 |
+| **M5** | **文字**（shaping + 字形轮廓走解析覆盖率） | ✅ **真字可渲染 + 排版**（断行/行高/对齐/段落） |
 | **M6** | 渐变 / 位图 / 滤镜 | 🔶 渐变与位图双端一致；**滤镜仅 CPU**（GPU 显式报错） |
 | **M7** | CPU 引擎 SIMD + 多线程、C ABI、WASM、HDR | ⬜ 未开始 |
 
@@ -171,9 +171,9 @@ GPU 用均匀压平，两边不一致但很难发现）。
 | 里程碑 | 内容 | 状态 |
 |---|---|---|
 | M5 | 字形轮廓即路径 + shaping + 门面 API | ✅ **已完成** |
-| M5.1 | 字体度量（ascent / descent / line_gap / x_height） | ⬜ 布局的前提 |
-| M5.2 | `amiki-layout`：断行 / 行高 / 对齐 / 段落 | ⬜ 独立可选层 |
-| M5.3 | 双向文本、字距微调 | ⬜ |
+| M5.1 | 字体度量（ascent / descent / line_gap / x_height） | ✅ **已完成** |
+| M5.2 | `amiki-layout`：断行 / 行高 / 对齐 / 段落 | ✅ **已完成**（贪心断行） |
+| M5.3 | 双向文本、字距微调、全局最优断行（Knuth-Plass） | ⬜ |
 
 **布局层不需要新依赖**：`ttf-parser` 的 `Face` 已提供布局所需的一切——
 `ascender` / `descender` / `line_gap` / `height` / `x_height` / `capital_height` /
@@ -203,19 +203,21 @@ GPU 用均匀压平，两边不一致但很难发现）。
 ## 七、怎么自己看进度（不用读我的叙述）
 
 ```bash
-cargo run --release -p amiki --example headless_png   # 出图（三张）
-                                                      #   out/amiki_headless.png   图形能力
-                                                      #   out/amiki_text_demo.png  真字 + 渐变
-                                                      #   out/amiki_showcase.png   位图+渐变+文字+滤镜
+cargo run --release -p amiki --example headless_png   # 出图（四张）
+                                                      #   out/amiki_headless.png    图形能力
+                                                      #   out/amiki_text_demo.png   真字 + 渐变
+                                                      #   out/amiki_showcase.png    位图+渐变+文字+滤镜
+                                                      #   out/amiki_paragraph.png   排版（断行/行高）
 cargo run --release -p amiki --example window_demo     # 打开动画窗口（含真字）
-cargo test  --workspace                                # 86 个测试
+cargo test  --workspace                                # 98 个测试
 cargo bench -p amiki-gpu                               # 性能数据（含逐 pass 明细）
 
 git log --oneline                                      # 开发时间线
 ```
 
 `headless_png` 还会打印**可复现的量化证据**：
-M4 增量渲染的脏区占比（全屏动画 vs 静态界面）、真字的像素数与字形数。
+M4 增量渲染的脏区占比（全屏动画 vs 静态界面）、真字的像素数与字形数、
+排版的行数与排版块尺寸。
 
-**最诚实的进度说明就是那三张图**：`amiki_headless.png` 看图形能力，
+**最诚实的进度说明就是那四张图**：`amiki_headless.png` 看图形能力，
 `amiki_text_demo.png` 看文本，`amiki_showcase.png` 看位图/渐变/滤镜的综合效果。

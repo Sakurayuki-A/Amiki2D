@@ -1,0 +1,18 @@
+[package]
+name = "amiki-layout"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Amiki2D 排版层：断行、行高、对齐、段落（独立且可选）"
+
+# 定位：这是 shaping（amiki-text）与渲染（amiki-raster/gpu）之间的**独立一层**。
+#
+# 为什么独立且可选：只想画一行字的调用方（图表轴标签、按钮文字）不该被迫
+# 引入整套排版引擎。Skia 的 SkTextBlob 只承载"预先定位好的字形"，HarfBuzz
+# 明确声明不做断行 —— 分层是业界共识，不是偏好。
+#
+# 不需要新依赖：ttf-parser 的 Face 已提供排版所需的全部度量。
+[dependencies]
+amiki-math = { workspace = true }
+amiki-scene = { workspace = true }
+amiki-text = { path = "../amiki-text" }

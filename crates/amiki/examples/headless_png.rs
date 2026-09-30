@@ -396,6 +396,58 @@ fn main() {
         println!("M6：跳过图像演示（未找到 img.jpg，或文件存在但解码失败——原因见上方提示）");
     }
 
+    // ── M5.2：排版（断行 + 行高 + 对齐）──
+    // 排版是**独立的一层**：渲染器只接收"已定位的字形"，不需要排版概念。
+    if let Some(font) = load_inter() {
+        let body = "Amiki2D renders text through the same analytic-coverage pipeline used for shapes, \
+so glyph outlines stay crisp at any zoom. This paragraph is laid out by amiki-layout: \
+greedy line breaking at word boundaries, line height derived from the font's own metrics, \
+and left alignment within the given width.";
+        let opts = amiki_layout::LayoutOptions {
+            align: amiki_layout::Align::Left,
+            line_spacing: 1.35,
+            ..amiki_layout::LayoutOptions::new(26.0, 640.0)
+        };
+        match amiki_layout::layout(&font, body, &opts) {
+            Ok(res) => {
+                let mut c = amiki::Canvas::new(1280, 720);
+                c.rect(0.0, 0.0, 1280.0, 720.0, Paint::Solid(Color::rgb8(250, 248, 244)));
+                // 按排版结果逐行绘制：引擎只接收"已定位的字形"，不需要排版概念
+                let ox = 64.0;
+                let oy = 60.0;
+                for line in &res.lines {
+                    let origin = Vec2::new(ox + line.baseline.x, oy + line.baseline.y);
+                    c.text(
+                        &line.run,
+                        origin,
+                        Paint::Solid(Color::rgb8(28, 32, 40)),
+                        |id| font.outline(id).ok(),
+                    );
+                }
+                let out = raster::render(&raster::bin(&c.scene, 0.1));
+                image::save_buffer(
+                    "out/amiki_paragraph.png",
+                    &out,
+                    1280,
+                    720,
+                    image::ColorType::Rgba8,
+                )
+                .expect("保存排版 PNG 失败");
+                println!(
+                    "M5.2 排版：{} 字符 → {} 行（行距 1.35×，左对齐，宽上限 {:.0}px）→ out/amiki_paragraph.png",
+                    body.chars().count(),
+                    res.lines.len(),
+                    opts.max_width
+                );
+                println!(
+                    "           排版块尺寸 {:.1}×{:.1}px，overflow={}",
+                    res.size.x, res.size.y, res.overflow
+                );
+            }
+            Err(e) => println!("M5.2 排版失败：{e}"),
+        }
+    }
+
     let t1 = Instant::now();
     let img = match pollster::block_on(gpu::GpuRenderer::new()) {
         Ok(r) => match r.render_blocking(&scene, 0.1) {

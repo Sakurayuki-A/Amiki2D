@@ -184,6 +184,66 @@ fn main() {
     let binned = raster::bin(&scene, 0.1);
     let bin_ms = t0.elapsed().as_secs_f64() * 1000.0;
 
+    // ── M5：文本走同一管线（字形轮廓即路径，引擎无文本专用代码）──
+    // 演示用的极简字形由若干**有宽度的矩形笔画**组成（真实的 TrueType 轮廓
+    // 是填充区域而非单线，这里必须同样是区域，否则面积为零、渲染不出像素）。
+    {
+        use amiki::scene::{expand_text_run, Color, GlyphOutline, Paint, PathEl, TextRun};
+        /// 一段有宽度的笔画（矩形），坐标为归一化 [0,1]
+        fn stroke(x0: f32, y0: f32, x1: f32, y1: f32, w: f32) -> Vec<PathEl> {
+            let (dx, dy) = (x1 - x0, y1 - y0);
+            let len = (dx * dx + dy * dy).sqrt().max(1e-6);
+            // 垂直方向半宽
+            let (px, py) = (-dy / len * w * 0.5, dx / len * w * 0.5);
+            vec![
+                PathEl::MoveTo(Vec2::new(x0 + px, y0 + py)),
+                PathEl::LineTo(Vec2::new(x1 + px, y1 + py)),
+                PathEl::LineTo(Vec2::new(x1 - px, y1 - py)),
+                PathEl::LineTo(Vec2::new(x0 - px, y0 - py)),
+                PathEl::Close,
+            ]
+        }
+        // 演示字形：id 0 = "IⅤ" 竖+斜、id 1 = 竖、id 2 = 横
+        let glyphs: Vec<GlyphOutline> = vec![
+            GlyphOutline::new({
+                let mut v = stroke(0.0, 0.0, 0.0, 1.0, 0.16);
+                v.extend(stroke(0.0, 1.0, 1.0, 0.0, 0.16));
+                v
+            }),
+            GlyphOutline::new(stroke(0.0, 0.0, 0.0, 1.0, 0.16)),
+            GlyphOutline::new(stroke(0.0, 0.0, 1.0, 0.0, 0.16)),
+        ];
+        // 位置以 em 为单位（相对字号），故按设备坐标换算：设备位置 ÷ 字号 = em 位置
+        let size = 150.0f32;
+        let mut run = TextRun::new(size);
+        for (i, id) in [1u32, 0, 1, 2].iter().enumerate() {
+            let dev_x = 60.0 + i as f32 * 130.0; // 设备像素
+            let dev_y = 80.0;
+            run.push_glyph(*id, dev_x / size, dev_y / size);
+        }
+        let paths = expand_text_run(&run, |id| glyphs.get(id as usize).cloned());
+        let mut text = amiki::scene::Scene::new(1280, 720);
+        for (p, t) in paths {
+            text.push(t, p, Paint::Solid(Color::rgba8(255, 255, 255, 235)));
+        }
+        let t0 = Instant::now();
+        let tb = raster::bin(&text, 0.1);
+        let timg = raster::render(&tb);
+        let ms = t0.elapsed().as_secs_f64() * 1000.0;
+        let px = timg.as_chunks::<4>().0.iter().filter(|p| p[3] > 0).count();
+        image::save_buffer(
+            "out/amiki_text_demo.png",
+            &timg,
+            1280,
+            720,
+            image::ColorType::Rgba8,
+        )
+        .expect("保存文本演示 PNG 失败");
+        println!(
+            "M5 文本演示：字形轮廓走解析覆盖率管线，{px} 个不透明像素，{ms:.1} ms → out/amiki_text_demo.png"
+        );
+    }
+
     let t1 = Instant::now();
     let img = match pollster::block_on(gpu::GpuRenderer::new()) {
         Ok(r) => match r.render_blocking(&scene, 0.1) {

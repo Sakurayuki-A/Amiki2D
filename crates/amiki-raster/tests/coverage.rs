@@ -6,7 +6,10 @@
 
 use amiki_raster::{bin, flatten_draw, render, render_damage, render_tiles, PersistentRenderer};
 use amiki_math::{Affine, Vec2};
-use amiki_scene::{edit_damage, Color, Damage, Paint, PathBuilder, Scene};
+use amiki_scene::{
+    edit_damage, expand_text_run, Color, Damage, GlyphOutline, Paint, PathBuilder, PathEl,
+    TextRun, Scene,
+};
 
 const SS: u32 = 16; // 超采样率（顶点行量化误差 ~2/SS）
 
@@ -696,3 +699,119 @@ fn persistence_matches_full_render_across_edits() {
     // 每次只改一条 draw，脏区远小于全画布 → 必须省下可观的工作
     assert!(saved > 0.30, "每次只改一条 draw，应省下 >30% 的 tile 着色（实际 {:.1}%）", saved * 100.0);
 }
+
+// ============================================================================
+// M5：文本走完整管线 —— 端到端渲染 + brute-force 覆盖率互证
+// ============================================================================
+
+/// 一个矩形轮廓字形：em 单位下覆盖 [0, 0.1] × [0, 0.6]（模拟"竖条"字形）。
+fn bar_glyph() -> GlyphOutline {
+    GlyphOutline::new(vec![
+        PathEl::MoveTo(Vec2::new(0.0, 0.0)),
+        PathEl::LineTo(Vec2::new(0.1, 0.0)),
+        PathEl::LineTo(Vec2::new(0.1, 0.6)),
+        PathEl::LineTo(Vec2::new(0.0, 0.6)),
+        PathEl::Close,
+    ])
+}
+
+/// 一个带曲线的轮廓字形（验证"字形可含贝塞尔"，那是真实字体的形态）。
+fn bowl_glyph() -> GlyphOutline {
+    // 近似一个半圆碗形，用两段三次贝塞尔
+    GlyphOutline::new(vec![
+        PathEl::MoveTo(Vec2::new(0.0, 0.6)),
+        PathEl::CubicTo(Vec2::new(0.0, 0.0), Vec2::new(0.5, 0.0), Vec2::new(0.5, 0.6)),
+        PathEl::LineTo(Vec2::new(0.4, 0.6)),
+        PathEl::CubicTo(Vec2::new(0.4, 0.15), Vec2::new(0.1, 0.15), Vec2::new(0.1, 0.6)),
+        PathEl::Close,
+    ])
+}
+
+/// 用字形轮廓构造场景（每个字形一条独立 draw，与 `expand_text_run` 的设计一致）。
+fn text_scene(run: &TextRun, color: Color) -> Scene {
+    let paths = expand_text_run(run, |id| match id {
+        1 => Some(bar_glyph()),
+        2 => Some(bowl_glyph()),
+        _ => None,
+    });
+    let mut scene = Scene::new(160, 100);
+    for (path, t) in paths {
+        scene.push(t, path, Paint::Solid(color));
+    }
+    scene
+}
+
+/// 文本必须真的**渲染出像素**，且**与 brute-force 超采样一致**。
+///
+/// 这是"字形轮廓即路径"这一决策的端到端证明：
+/// 引擎没有任何文本专用代码，文字完全走既有的压平 → 分箱 → 解析覆盖率管线；
+/// 因此它必须与独立的超采样裁判一致（与几何图形同一容差）。
+#[test]
+fn text_renders_and_matches_bruteforce() {
+    let mut run = TextRun::new(60.0);
+    for i in 0..4 {
+        run.push_glyph(1, 0.2 + i as f32 * 0.5, 0.2);
+    }
+    let scene = text_scene(&run, Color::rgb8(20, 20, 20));
+
+    let binned = bin(&scene, 0.05);
+    let img = render(&binned);
+
+    // 1) 必须有可见像素（否则"渲染成功"是空话）
+    let opaque = img.as_chunks::<4>().0.iter().filter(|p| p[3] > 0).count();
+    assert!(opaque > 200, "文本应产生可观的不透明像素，实际只有 {opaque}");
+
+    // 2) 与 brute-force 超采样互证（与几何图形同容差）
+    //    单字形场景才适合逐像素对拍（混合由其它测试覆盖），故此处逐字形验证
+    for (gi, g) in run.glyphs.iter().enumerate() {
+        let mut one = TextRun::new(run.size);
+        one.push_glyph(g.id, g.x, g.y);
+        let s = text_scene(&one, Color::rgb8(20, 20, 20));
+        assert_scene_matches(&s, 0.03);
+        eprintln!(
+            "  字形 {gi}（id={}）覆盖率和 brute-force 一致（容差 0.03）",
+            g.id
+        );
+    }
+
+    // 3) 含曲线的字形也必须一致（真实字体形态）
+    let mut curved = TextRun::new(80.0);
+    curved.push_glyph(2, 0.1, 0.2);
+    let s = text_scene(&curved, Color::rgb8(20, 20, 20));
+    assert_scene_matches(&s, 0.03);
+    eprintln!("  曲线字形（bowl）覆盖率和 brute-force 一致");
+
+    eprintln!("文本端到端：{opaque} 个不透明像素，逐字形与超采样裁判一致");
+}
+
+/// 文本必须能参与 **damage region**：改一个字只脏一小块，而不是整行。
+///
+/// 这是"每字形一条独立 draw"这一设计的收益证明——若把整行合并成一条大路径，
+/// 改一个字就会让整行变脏。
+#[test]
+fn text_benefits_from_damage_region() {
+    let mk = |moved: bool| {
+        let mut run = TextRun::new(60.0);
+        for i in 0..6 {
+            // 只有第 3 个字形的位置发生变化
+            let dx = if moved && i == 3 { 0.06 } else { 0.0 };
+            run.push_glyph(1, 0.1 + i as f32 * 0.5 + dx, 0.2);
+        }
+        text_scene(&run, Color::rgb8(20, 20, 20))
+    };
+    let old = mk(false);
+    let new = mk(true);
+    let d = edit_damage(&old, &new);
+
+    let ratio = d.tile_count() as f64 / d.total_tiles() as f64;
+    assert!(
+        ratio < 0.25,
+        "只移动一个字，脏区应远小于整幅画面，实际 {:.1}%",
+        ratio * 100.0
+    );
+    eprintln!(
+        "文本 damage：只移动一个字 → 脏 tile {:.1}%（每字形独立 draw 的收益）",
+        ratio * 100.0
+    );
+}
+

@@ -464,6 +464,8 @@ pub struct FrameProfile {
     pub dump_ms: Option<f64>,
     /// `profile()` 专属：时间戳 resolve + 读回的额外开销（非渲染本身）
     pub resolve_ts_ms: Option<f64>,
+    /// M3.6：本帧因容量不足被作废重做的次数（正常应恒为 0）
+    pub capacity_overflows: u32,
     /// 逐 pass GPU 时长
     pub timestamps: PassTimings,
 }
@@ -2125,8 +2127,44 @@ impl GpuRenderer {
     /// enc1b: clear_sparse → emit（成员计数 + carry 定点桶）                 〖读回 stats〗
     /// enc2:  copy+scan(cell CSR) → tile_fill → scatter → carry → fine
     /// ```
+    /// M3.6：稀疏帧路径的**投机分配外壳**。
+    ///
+    /// 内部 [`Self::run_pipeline_sparse_once`] 在容量不足时会报告溢出
+    /// （返回 `true`）——此时那一帧的画面是**残缺的，必须重做**，绝不能交出去。
+    ///
+    /// 重做方式：清空容量缓存（`_once` 见容量无效即走精确测量路径），再跑一次。
+    /// 测量路径按实测值分配，因此第二次必然成功，所以这里只重试一次。
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn run_pipeline_sparse(
+        &self,
+        gs: &GpuScene,
+        tex: &wgpu::Texture,
+        coverage: bool,
+        clip_views: &[wgpu::TextureView],
+        damage: Option<&amiki_scene::Damage>,
+        dump: Option<&mut PipelineDump>,
+        ts: Option<&mut TimestampRecorder>,
+        prof: &mut FrameProfile,
+    ) -> Result<(), RenderError> {
+        let overflow = self.run_pipeline_sparse_once(
+            gs, tex, coverage, clip_views, damage, dump, ts, prof,
+        )?;
+        if !overflow {
+            return Ok(());
+        }
+
+        // 这一帧的产出不可用 → 作废容量，走测量路径重做。
+        // 诊断与时间戳只在第一次尝试时收集（第二次为的是正确性，不是测量）。
+        prof.capacity_overflows += 1;
+        self.store_sparse_capacity(SparseCapacity::default());
+        self.run_pipeline_sparse_once(gs, tex, coverage, clip_views, damage, None, None, prof)?;
+        Ok(())
+    }
+
+    /// M3.6：稀疏帧路径**主体**。返回值 `true` 表示本帧容量不足（已溢出），
+    /// 调用方须作废本帧重做 —— 见 [`Self::run_pipeline_sparse`]。
+    #[allow(clippy::too_many_arguments)]
+    fn run_pipeline_sparse_once(
         &self,
         gs: &GpuScene,
         tex: &wgpu::Texture,
@@ -2136,7 +2174,7 @@ impl GpuRenderer {
         mut dump: Option<&mut PipelineDump>,
         mut ts: Option<&mut TimestampRecorder>,
         prof: &mut FrameProfile,
-    ) -> Result<(), RenderError> {
+    ) -> Result<bool, RenderError> {
         let w = tex.width();
         let h = tex.height();
         if w != gs.width || h != gs.height {
@@ -2145,7 +2183,7 @@ impl GpuRenderer {
         let total_entries = gs.counts.len() as u32;
         let n_draws = gs.colors.len() as u32;
         if n_draws == 0 || total_entries == 0 || gs.total_segments == 0 {
-            return Ok(()); // 空场景：纹理保持零初始化（透明）
+            return Ok(false); // 空场景：纹理保持零初始化（透明）
         }
         // M3.6：投机分配的容量缓存只由**主色逐帧路径**维护。
         // - clip 覆盖率（`coverage`）是辅助 pass，规模与主场景无关：若它也读/写
@@ -2441,7 +2479,7 @@ impl GpuRenderer {
             }
         }
         if n_cells == 0 {
-            return Ok(()); // 无任何内容覆盖画布
+            return Ok(false); // 无任何内容覆盖画布
         }
         let cell_aux_buf = mk_storage("amiki_sparse_cell_aux", (n_cells as u64) * 8);
         let cell_csr_buf = mk_storage("amiki_sparse_cell_csr", ((n_cells + 1) as u64) * 4);
@@ -2651,7 +2689,7 @@ impl GpuRenderer {
             d.sparse_buckets = Some(bytemuck::cast_slice(&b).to_vec());
         }
         prof.dump_ms = Some(t_dump.elapsed().as_secs_f64() * 1000.0);
-        Ok(())
+        Ok(false)
     }
 
     /// M3.5：公开的稀疏诊断入口——跑一次稀疏管线并转储**全部**稀疏结构，

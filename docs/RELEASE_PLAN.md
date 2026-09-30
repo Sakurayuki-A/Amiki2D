@@ -228,8 +228,8 @@
 | **启动开销** | 🔶 **有条件达标** | 默认 **337 ms**（✗ > 200 ms）；`AMIKI_BACKENDS=vulkan` **154 ms**（✓） |
 | **文件规模** | ✅ **已完成** | `amiki-gpu/src/lib.rs` **5719 → 1439 行**（−75%），拆出 tests / sparse / layer / dense / profile / extract / consistency / readback / blit |
 | **API 稳定性** | ✅ **已完成** | 新增 [`docs/API.md`](API.md)：稳定面 / 实验面 / 内部面三级清单与承诺；`cargo doc` 零警告；已在各 crate 的 crate 文档里写明 |
-| **dogfooding** | ⬜ 未做 | 只有示例，没有完整应用 |
-| **文档同步** | 🔶 进行中 | 本文件与 CHANGELOG/OVERVIEW 已按实测更正 |
+| **dogfooding** | ✅ **已完成** | 窗口示例做成真应用（滚动 + 点击选中 + 文字 + 只画可见行）；**第一次真去跑就抓到「示例一直跑不起来」** |
+| **文档同步** | ✅ **已完成** | 五份文档与代码一致；新增 `docs/API.md` 含「已知使用限制」清单；`cargo doc` 零警告 |
 
 ### 多适配器验证的实质发现
 

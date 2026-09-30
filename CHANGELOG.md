@@ -16,6 +16,39 @@
 > - **M6 的滤镜（离屏层）已在 CPU 与 GPU 两侧实现并逐像素对拍一致**。
 
 
+### P3 dogfooding：把示例做成真应用 —— 第一次真去跑就抓到「示例一直跑不起来」
+
+`window_demo` 原本只是展示页（动画 + 混合模式画廊 + 文字），没有滚动与鼠标交互。
+按计划的 dogfooding 要求，加了**可滚动、可点击选中的 200 行长列表**（默认进入，
+Tab 切回展示页）：滚轮与方向键滚动、左键命中切换选中、每行一段 shaping、
+**只画可见行**、固定表头。
+
+**第一次真去跑它，启动即 panic：**
+
+```
+In Device::create_bind_group_layout, label = 'amiki_fine_bgl'
+  Too many bindings of type StorageBuffers in Stage COMPUTE, limit is 8, count was 9.
+```
+
+两处叠加：引擎的 `amiki_fine_bgl` 需要 **9 个** storage buffer（第 9 个是图像
+放置参数），而 `wgpu::Limits::default()` 只保证 **8 个**；`GpuRenderer::new()`
+会上调并检查，但 `from_device()` **不检查** —— 示例走的正是 `from_device`。
+**示例不在测试覆盖里，所以一直没被发现。**
+
+修法（两层防线）：
+- 新增 `amiki_gpu::required_limits()` 与 `REQUIRED_STORAGE_BUFFERS`，
+  函数文档把那条报错原样写进去（让搜索报错的人能搜到这里）
+- `from_device` **先校验设备上限再动任何资源**，不满足就返回明确错误，
+  而不是把问题留给 wgpu 深处的校验失败
+
+修后示例正常启动并持续渲染（运行 10 秒不崩、累计 CPU 1.89 s）。
+另用 `CopyFromScreen` 截图确认过画面正确（表头文字、行内容、色条、隔行底色都正常，
+静态时**脏 tile 0.0%**）。
+
+> 中途有一次看到 `滚动 2120`，怀疑"应用会自己滚"。加无条件事件打印后复跑：
+> **stderr 一条事件都没有、滚动为 0** —— 那次是环境真的送来了滚轮事件。
+> **不是代码问题。加个打印比继续猜快得多。**
+
 ### P3：多后端验证 —— 修好 DX12 与 GL，"一套 WGSL 通吃"原本是假的
 
 发布计划宣称"wgpu 一套 WGSL 通吃 + CPU 兜底"。**实测这句宣称，两个后端都跑不起来。**

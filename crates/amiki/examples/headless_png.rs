@@ -375,21 +375,34 @@ fn main() {
 
         let scene = c.scene;
         let t0 = Instant::now();
+        // 后端要**如实报告实际用了哪个**，不能写死。
+        // 这里曾经硬编码"滤镜走 CPU 参考实现"，而在 GPU 层合成实现之后，
+        // 那句话就变成了假信息（会让人以为滤镜没走 GPU）。
+        let backend;
         let mut img_rgba = match pollster::block_on(gpu::GpuRenderer::new()) {
-            Ok(r) => r.render_blocking(&scene, 0.1).unwrap_or_else(|e| {
-                println!("综合演示：GPU 渲染失败（{e}），改用 CPU");
+            Ok(r) => match r.render_blocking(&scene, 0.1) {
+                Ok(px) => {
+                    backend = "GPU (wgpu)";
+                    px
+                }
+                Err(e) => {
+                    println!("综合演示：GPU 渲染失败（{e}），改用 CPU");
+                    backend = "CPU（GPU 拒绝）";
+                    raster::render(&raster::bin(&scene, 0.1))
+                }
+            },
+            Err(e) => {
+                println!("综合演示：GPU 不可用（{e}），改用 CPU");
+                backend = "CPU（无 GPU 适配器）";
                 raster::render(&raster::bin(&scene, 0.1))
-            }),
-            Err(_) => raster::render(&raster::bin(&scene, 0.1)),
+            }
         };
-        let _ = &mut img_rgba;
         let ms = t0.elapsed().as_secs_f64() * 1000.0;
         image::save_buffer("out/amiki_showcase.png", &img_rgba, cw, ch, image::ColorType::Rgba8)
             .expect("保存综合演示 PNG 失败");
         println!(
             "M6 综合演示：位图（{}×{}，投影）+ 线性/径向渐变 + 渐变文字 + 模糊层\n\
-             \x20           注意：滤镜走 CPU 参考实现（GPU 侧尚未实现离屏层，已显式拒绝而非静默丢效果）\n\
-             \x20           → out/amiki_showcase.png（{ms:.0} ms 含设备创建）",
+             \x20           后端: {backend} → out/amiki_showcase.png（{ms:.0} ms 含设备创建）",
             img.width, img.height
         );
     } else {

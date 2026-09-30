@@ -135,10 +135,27 @@ fn image_color(d: u32, p: vec2<f32>) -> vec4<f32> {
         (va.y * r.x - va.x * r.y) / det,
         (-ua.y * r.x + ua.x * r.y) / det,
     );
-    if (e2.y > 0.5) {
+    let repeat = e2.y > 0.5;
+    if (repeat) {
         uv = uv - floor(uv);
+    } else {
+        uv = clamp(uv, vec2<f32>(0.0), vec2<f32>(1.0));
     }
-    return textureSampleLevel(image_tex, image_smp, uv, i32(layer), 0.0);
+    return image_sample(uv, i32(layer));
+}
+
+/// `i32` 的欧几里得取模（WGSL 的 `%` 取余数、符号随被除数，不等价）。
+fn wrap_i(v: i32, n: i32) -> i32 {
+    let m = v % n;
+    return select(m, m + n, m < 0);
+}
+
+/// 位图采样：经采样器做双线性。
+///
+/// 用 `textureSampleLevel` 而非 `textureSample`：后者要求一致控制流，
+/// 而这里在"逐 draw 循环 + 条件"内调用。本引擎位图无 mip 链，故 level 固定 0。
+fn image_sample(uv: vec2<f32>, layer: i32) -> vec4<f32> {
+    return textureSampleLevel(image_tex, image_smp, uv, layer, 0.0);
 }
 
 /// 该 draw 是否为图像（`image_place` 自描述）。

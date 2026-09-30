@@ -237,10 +237,10 @@ fn composite(dst: vec4<f32>, src: vec4<f32>, src_a: f32, mode: u32) -> vec4<f32>
 /// 裁剪采样展开（≤4 层，逐像素乘入）。
 fn clip_sample(ci: u32, gid: vec2<u32>, clip_tex0: texture_2d<f32>, clip_tex1: texture_2d<f32>,
                clip_tex2: texture_2d<f32>, clip_tex3: texture_2d<f32>) -> f32 {
-    if (ci == 0u) { return textureLoad(clip_tex0, gid, 0u).r; }
-    if (ci == 1u) { return textureLoad(clip_tex1, gid, 0u).r; }
-    if (ci == 2u) { return textureLoad(clip_tex2, gid, 0u).r; }
-    if (ci == 3u) { return textureLoad(clip_tex3, gid, 0u).r; }
+    if (ci == 0u) { return textureLoad(clip_tex0, gid, 0).r; }
+    if (ci == 1u) { return textureLoad(clip_tex1, gid, 0).r; }
+    if (ci == 2u) { return textureLoad(clip_tex2, gid, 0).r; }
+    if (ci == 3u) { return textureLoad(clip_tex3, gid, 0).r; }
     return 1.0;
 }
 

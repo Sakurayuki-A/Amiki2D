@@ -926,6 +926,29 @@ impl GpuRenderer {
         &self,
         images: &[(std::sync::Arc<amiki_scene::Image>, amiki_scene::ImagePlacement)],
     ) -> Result<(wgpu::TextureView, wgpu::Sampler), RenderError> {
+        // **GL 后端上禁用位图（显式报错）**。
+        //
+        // 实测：`Backends::GL` 下 `amiki-gpu` 的 20 条测试里 19 条通过，
+        // 唯独位图那条整张图**读不出来** —— 经采样器得到 `(0,0,0,1)`（不透明黑、
+        // GL 对"不完整纹理"的规定返回值），直接 `textureLoad` 得到 `(0,0,0,0)`，
+        // 也就是这张数组纹理在该后端上是空的。
+        //
+        // 已排除的原因：采样器 LOD 钳位、`textureSampleLevel` vs `textureSampleGrad`、
+        // 辅助函数内联、`write_texture` 行距 256 对齐 —— 都不是。
+        // 判断是 wgpu/naga 的 GL 后端在 `texture_2d_array` 上的问题，不在我方代码。
+        //
+        // 按本项目一贯约定：**不支持就显式报错，不静默画错**。
+        // 走到这里说明调用方要画位图，而该后端给不出正确结果 ——
+        // 与其画出空白，不如让调用方明确知道该换后端或走 CPU 引擎。
+        // **必须是"场景里确实有位图"才拦**：本函数在没有位图时也会被调用来
+        // 创建占位资源（绑定布局需要合法的非空绑定），那种情况与位图能力无关。
+        if self.backend == Some(wgpu::Backend::Gl) && !images.is_empty() {
+            return err(
+                "GL 后端无法正确读取位图（`texture_2d_array` 在该后端上读回为空，\
+                 实测采样恒为不透明黑）。请改用 Vulkan/DX12 后端，\
+                 或使用 CPU 引擎（amiki_raster）；可用 AMIKI_BACKENDS 指定后端",
+            );
+        }
         let max_dim = self.limits.max_texture_dimension_2d;
         let w = images.iter().map(|(i, _)| i.width).max().unwrap_or(1).min(max_dim);
         let h = images.iter().map(|(i, _)| i.height).max().unwrap_or(1).min(max_dim);
@@ -952,14 +975,15 @@ impl GpuRenderer {
         // 逐层上传（上层若比底图小，剩余部分保持透明）
         const BPP: usize = 4;
         let row_bytes = (w as usize) * BPP;
-        let mut layer_buf = vec![0u8; row_bytes * h as usize];
+        let stride = row_bytes;
+        let mut layer_buf = vec![0u8; stride * h as usize];
         for (li, (img, _)) in images.iter().enumerate() {
             layer_buf.fill(0);
             let cw = img.width.min(w) as usize;
             let ch = img.height.min(h) as usize;
             for y in 0..ch {
                 let src = (y * img.width as usize) * BPP;
-                let dst = (y * w as usize) * BPP;
+                let dst = y * stride;
                 layer_buf[dst..dst + cw * BPP].copy_from_slice(&img.data[src..src + cw * BPP]);
             }
             self.queue.write_texture(
@@ -972,7 +996,7 @@ impl GpuRenderer {
                 &layer_buf,
                 wgpu::TexelCopyBufferLayout {
                     offset: 0,
-                    bytes_per_row: Some(row_bytes as u32),
+                    bytes_per_row: Some(stride as u32),
                     rows_per_image: Some(h),
                 },
                 wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
@@ -994,6 +1018,15 @@ impl GpuRenderer {
             address_mode_w: wgpu::AddressMode::ClampToEdge,
             mag_filter: wgpu::FilterMode::Linear,
             min_filter: wgpu::FilterMode::Linear,
+            // **LOD 必须钳到 0**：图像纹理只有 1 级 mip，而 wgpu 的
+            // `SamplerDescriptor::default()` 里 `lod_max_clamp` 是 **32.0**。
+            // Vulkan/DX12 对此宽容，GL 则据 LOD 范围判定纹理**不完整** ——
+            // 不完整的纹理按 GL 规范采样为 `(0,0,0,1)`（不透明黑）。
+            // 症状就是整张位图在 GL 上变成纯黑（实测 768 个像素全错，
+            // 且值恰好是 (0,0,0,255)）。
+            lod_min_clamp: 0.0,
+            lod_max_clamp: 0.0,
+            mipmap_filter: wgpu::FilterMode::Nearest,
             ..Default::default()
         });
         Ok((view, sampler))
@@ -1270,6 +1303,8 @@ pub struct GpuRenderer {
     pub path: RenderPath,
     /// 适配器名称/后端（基准报告用；`new` 填充，`from_device` 为 "unknown"）
     pub adapter_name: String,
+    /// 实际使用的 wgpu 后端。`new` 填充；`from_device` 为 `None`（未知 ⇒ 不做后端相关判定）。
+    pub backend: Option<wgpu::Backend>,
     /// 适配器是否支持 GPU 时间戳（`profile` 的前提）
     pub has_timestamps: bool,
     /// 时间戳 tick → 纳秒
@@ -1499,6 +1534,7 @@ impl GpuRenderer {
             .map_err(|e| RenderError(format!("设备创建失败: {e}")))?;
         let mut renderer = GpuRenderer::from_device(device, queue)?;
         renderer.adapter_name = format!("{} ({:?})", info.name, info.backend);
+        renderer.backend = Some(info.backend);
         Ok(renderer)
     }
 
@@ -1777,6 +1813,7 @@ impl GpuRenderer {
         Ok(GpuRenderer {
             path: RenderPath::default(),
             adapter_name: "unknown".to_string(),
+            backend: None,
             has_timestamps: device.features().contains(wgpu::Features::TIMESTAMP_QUERY)
                 && timestamp_period_ns > 0.0,
             timestamp_period_ns,
@@ -4458,7 +4495,16 @@ mod tests {
                 Paint::Image { image: img.clone(), placement: place },
             );
 
-            let gpu = renderer.render_blocking(&scene, 0.05).expect("GPU 渲染失败");
+            // GL 后端读不出位图，引擎**显式报错**而不是画出空白
+            // （见 `mk_image_texture_array` 的说明）。该情形是已知且明确的。
+            let gpu = match renderer.render_blocking(&scene, 0.05) {
+                Ok(v) => v,
+                Err(e) if e.to_string().contains("GL 后端无法正确读取位图") => {
+                    eprintln!("GL 后端：位图按预期显式拒绝");
+                    return;
+                }
+                Err(e) => panic!("GPU 渲染失败：{e}"),
+            };
             let cpu = amiki_raster::render(&amiki_raster::bin(&scene, 0.05));
 
             let mut max_diff = 0u32;

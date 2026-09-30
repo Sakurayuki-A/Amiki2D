@@ -78,6 +78,10 @@ pub struct BinnedScene {
     /// M6：每 draw 的渐变下标；`u32::MAX` 表示纯实心色。
     /// 与 `colors` 平行；用独立表而非在颜色里编码下标，避免依赖浮点精确相等。
     pub gradient_index: Vec<u32>,
+    /// M6：每 draw 的图像下标；`u32::MAX` 表示非图像绘制。
+    pub image_index: Vec<u32>,
+    /// M6：本场景用到的位图及其放置方式。
+    pub images: Vec<(std::sync::Arc<amiki_scene::Image>, amiki_scene::ImagePlacement)>,
     /// 每 draw 的裁剪层索引（≤ MAX_DRAW_CLIPS，未用槽位为 0）。
     pub draw_clips: Vec<[u32; 4]>,
     /// 每 scene clip 的 CPU 覆盖率 alpha 图（GPU 侧为纹理，M2d）。
@@ -188,6 +192,8 @@ pub fn bin(scene: &Scene, flatten_eps: f32) -> BinnedScene {
         colors: Vec::new(),
         gradients: Vec::new(),
         gradient_index: Vec::new(),
+        image_index: Vec::new(),
+        images: Vec::new(),
         draw_clips: Vec::new(),
         clip_maps: Vec::new(),
     };
@@ -303,6 +309,7 @@ pub fn bin(scene: &Scene, flatten_eps: f32) -> BinnedScene {
 
         // 3) 生成 (tile, draw) 条目与逐行列表
         let mut grad_idx = u32::MAX;
+        let mut img_idx = u32::MAX;
         let color = match &draw.paint {
             Paint::Solid(c) => [c.r, c.g, c.b, c.a],
             Paint::Gradient(g) => {
@@ -318,9 +325,22 @@ pub fn bin(scene: &Scene, flatten_eps: f32) -> BinnedScene {
                 // colors 仍写入一个占位值（着色走 gradient_index，不读这里）
                 [0.0, 0.0, 0.0, 0.0]
             }
+            Paint::Image { image, placement } => {
+                // 同一位图 + 同一放置可复用；放置不同则各自成项（采样映射不同）
+                img_idx = out
+                    .images
+                    .iter()
+                    .position(|(x, p)| std::sync::Arc::ptr_eq(x, image) && p == placement)
+                    .unwrap_or_else(|| {
+                        out.images.push((image.clone(), *placement));
+                        out.images.len() - 1
+                    }) as u32;
+                [0.0, 0.0, 0.0, 0.0]
+            }
         };
         out.colors.push(color);
         out.gradient_index.push(grad_idx);
+        out.image_index.push(img_idx);
         let mut clip_idx = [0u32; 4];
         let nclip = draw.clips.len().min(4);
         clip_idx[..nclip].copy_from_slice(&draw.clips[..nclip]);
@@ -626,12 +646,32 @@ fn clear_tile(binned: &BinnedScene, img: &mut [u8], tx: usize, ty: usize) {
 /// 刻意不查表：查表会把着色量化到 1/255，而本项目对解析覆盖率有质量承诺，
 /// 不该在着色阶段引入额外近似。
 fn resolve_color(binned: &BinnedScene, draw: usize, x: f32, y: f32) -> [f32; 4] {
-    match gradient_of(binned, draw) {
-        Some(g) => {
-            let c = g.sample(g.param_at(amiki_math::Vec2::new(x, y)));
-            [c.r, c.g, c.b, c.a]
-        }
-        None => binned.colors[draw],
+    if let Some(g) = gradient_of(binned, draw) {
+        let c = g.sample(g.param_at(amiki_math::Vec2::new(x, y)));
+        return [c.r, c.g, c.b, c.a];
+    }
+    if let Some((img, place)) = image_of(binned, draw) {
+        // 设备坐标 → 图像空间 uv → 双线性采样。
+        // 仿射退化（行列式≈0）时返回透明：宁可该像素不画，也不要除零产出 NaN。
+        return match place.uv_at(amiki_math::Vec2::new(x, y)) {
+            Some(uv) => img.sample_bilinear(uv, place.repeat),
+            None => [0.0; 4],
+        };
+    }
+    binned.colors[draw]
+}
+
+/// 若该 draw 使用位图，返回位图与其放置方式。
+#[inline]
+fn image_of(
+    binned: &BinnedScene,
+    draw: usize,
+) -> Option<&(std::sync::Arc<amiki_scene::Image>, amiki_scene::ImagePlacement)> {
+    let idx = binned.image_index.get(draw).copied().unwrap_or(u32::MAX);
+    if idx == u32::MAX {
+        None
+    } else {
+        binned.images.get(idx as usize)
     }
 }
 

@@ -75,12 +75,75 @@ impl Canvas {
         self
     }
 
-    pub fn fill_path(&mut self, path: &Path, paint: Paint) -> &mut Self {
+    /// 绘制路径，并可指定**任意 paint**（含渐变/图像等非实心样式）。
+    ///
+    /// `fill_path` 是它的实心便捷形式。图像等样式需要它，因为
+    /// `Paint::Image` 携带放置信息，不能由路径自身推导。
+    pub fn fill_path_with(&mut self, path: &Path, paint: Paint) -> &mut Self {
         self.scene.push_blend(self.transform, path.clone(), paint, self.blend);
         if !self.clip_stack.is_empty() {
             self.scene.draws.last_mut().unwrap().clips = self.clip_stack.clone();
         }
         self
+    }
+
+    pub fn fill_path(&mut self, path: &Path, paint: Paint) -> &mut Self {
+        self.fill_path_with(path, paint)
+    }
+
+    /// 绘制一张位图（M6），放置到设备空间的矩形 `[x0,x1] × [y0,y1]`。
+    ///
+    /// 放置会经过画布当前变换，因此可以配合 `translate` / `rotate` / `scale`
+    /// 自由摆放、旋转、缩放图像。
+    ///
+    /// 采样用**双线性**（缩放时不产生最近邻的锯齿与抖动）；
+    /// 图像空间 y 向下，与引擎设备坐标一致，因此不需要翻转。
+    pub fn image(
+        &mut self,
+        image: std::sync::Arc<amiki_scene::Image>,
+        x0: f32,
+        y0: f32,
+        x1: f32,
+        y1: f32,
+    ) -> &mut Self {
+        let place = amiki_scene::ImagePlacement::rect(x0, y0, x1, y1);
+        self.image_with_placement(image, place)
+    }
+
+    /// 绘制位图并指定完整放置（含旋转/切变/平铺）。
+    ///
+    /// 放置的三个点会被画布当前变换作用 —— 与其它绘制保持一致。
+    pub fn image_with_placement(
+        &mut self,
+        image: std::sync::Arc<amiki_scene::Image>,
+        place: amiki_scene::ImagePlacement,
+    ) -> &mut Self {
+        let t = self.transform;
+        let transformed = amiki_scene::ImagePlacement {
+            origin: t.map_point(place.origin),
+            u_axis: t.map_vec(place.u_axis),
+            v_axis: t.map_vec(place.v_axis),
+            repeat: place.repeat,
+        };
+        // 覆盖范围 = 放置四角的包围盒（供分箱与 damage region 使用）
+        let mut pb = PathBuilder::new();
+        let p = |u: f32, v: f32| {
+            transformed.origin + transformed.u_axis * u + transformed.v_axis * v
+        };
+        let (a, b, c, d) = (p(0.0, 0.0), p(1.0, 0.0), p(1.0, 1.0), p(0.0, 1.0));
+        let (mut x0, mut y0) = (a.x, a.y);
+        let (mut x1, mut y1) = (a.x, a.y);
+        for q in [b, c, d] {
+            x0 = x0.min(q.x);
+            y0 = y0.min(q.y);
+            x1 = x1.max(q.x);
+            y1 = y1.max(q.y);
+        }
+        pb.rect(x0, y0, x1, y1);
+        self.fill_path_with(
+            &pb.build(),
+            amiki_scene::Paint::Image { image, placement: transformed },
+        )
     }
 
     pub fn rect(&mut self, x0: f32, y0: f32, x1: f32, y1: f32, paint: Paint) -> &mut Self {

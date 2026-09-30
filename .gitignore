@@ -8,3 +8,9 @@ Cargo.lock.orig
 # 以便示例与测试在干净检出后即可运行。
 /Inter-*.zip
 /assets/fonts/*.zip
+
+# 用户提供的演示位图（131 KB，非本项目资产）：
+# 示例会在文件存在时把它画进 out/amiki_showcase.png；
+# 不随仓库分发，避免带上来源与授权不明的图片。
+/img.jpg
+/img.png

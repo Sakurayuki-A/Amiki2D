@@ -331,6 +331,144 @@ impl Gradient {
     }
 }
 
+/// 位图：**线性（非预乘）RGBA8**，行优先，`data.len() == width * height * 4`。
+///
+/// 引擎只认这一种内存布局：调用方负责解码（PNG/JPEG/…）与色彩空间转换。
+/// 这样 amiki-scene / amiki-raster / amiki-gpu 都不需要引入任何图像解码库。
+#[derive(Clone, Debug, PartialEq)]
+pub struct Image {
+    pub width: u32,
+    pub height: u32,
+    pub data: Vec<u8>,
+}
+
+impl Image {
+    /// 从 RGBA8 数据构造；长度不符时返回 `None`。
+    pub fn from_rgba8(width: u32, height: u32, data: Vec<u8>) -> Option<Image> {
+        if width == 0 || height == 0 {
+            return None;
+        }
+        if data.len() != (width as usize) * (height as usize) * 4 {
+            return None;
+        }
+        Some(Image { width, height, data })
+    }
+
+    /// 取某像素（越界返回透明）。
+    #[inline]
+    pub fn texel(&self, x: u32, y: u32) -> [f32; 4] {
+        if x >= self.width || y >= self.height {
+            return [0.0; 4];
+        }
+        let o = ((y * self.width + x) * 4) as usize;
+        let d = &self.data;
+        [
+            d[o] as f32 / 255.0,
+            d[o + 1] as f32 / 255.0,
+            d[o + 2] as f32 / 255.0,
+            d[o + 3] as f32 / 255.0,
+        ]
+    }
+
+    /// 双线性采样，`uv ∈ [0,1]²` 为图像空间坐标。
+    ///
+    /// **用双线性而非最近邻**：图像常被缩放，最近邻会产生明显的锯齿与抖动；
+    /// 而本引擎的输出质量基准是解析覆盖率，采样阶段不该是质量瓶颈。
+    ///
+    /// `repeat` 为真时按 1 取模平铺，否则钳到边缘（clamp）。
+    pub fn sample_bilinear(&self, uv: Vec2, repeat: bool) -> [f32; 4] {
+        let (mut u, mut v) = (uv.x, uv.y);
+        if repeat {
+            u -= u.floor();
+            v -= v.floor();
+        } else {
+            u = u.clamp(0.0, 1.0);
+            v = v.clamp(0.0, 1.0);
+        }
+        // 映射到纹素坐标（像素中心对齐：u=0.5/w 应对应第 0 个纹素中心）
+        let fx = u * self.width as f32 - 0.5;
+        let fy = v * self.height as f32 - 0.5;
+        let x0 = fx.floor();
+        let y0 = fy.floor();
+        let tx = fx - x0;
+        let ty = fy - y0;
+
+        let fetch = |x: i32, y: i32| -> [f32; 4] {
+            let (xx, yy) = if repeat {
+                // 平铺时按尺寸取模，保证负坐标也正确回绕
+                (
+                    x.rem_euclid(self.width as i32) as u32,
+                    y.rem_euclid(self.height as i32) as u32,
+                )
+            } else {
+                (
+                    x.clamp(0, self.width as i32 - 1) as u32,
+                    y.clamp(0, self.height as i32 - 1) as u32,
+                )
+            };
+            self.texel(xx, yy)
+        };
+        let c00 = fetch(x0 as i32, y0 as i32);
+        let c10 = fetch(x0 as i32 + 1, y0 as i32);
+        let c01 = fetch(x0 as i32, y0 as i32 + 1);
+        let c11 = fetch(x0 as i32 + 1, y0 as i32 + 1);
+
+        let mut out = [0.0f32; 4];
+        for i in 0..4 {
+            let a = c00[i] + (c10[i] - c00[i]) * tx;
+            let b = c01[i] + (c11[i] - c01[i]) * tx;
+            out[i] = a + (b - a) * ty;
+        }
+        out
+    }
+}
+
+/// 图像的放置方式：把源图 `[0,1]²` 线性映射到设备空间的一个平行四边形。
+///
+/// 用**三个点**（原点 + 两个轴向量）而非四个角：图像放置本质是仿射映射，
+/// 三点即完整确定它，且天然表达旋转/切变；四点还会引入"四边形是否合法"的问题。
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ImagePlacement {
+    /// `uv = (0,0)` 对应的设备坐标
+    pub origin: Vec2,
+    /// `uv = (1,0)` 相对 `origin` 的向量
+    pub u_axis: Vec2,
+    /// `uv = (0,1)` 相对 `origin` 的向量
+    pub v_axis: Vec2,
+    /// 是否平铺（否则钳制到边缘）
+    pub repeat: bool,
+}
+
+impl ImagePlacement {
+    /// 轴对齐放置：把图像放进设备空间的矩形。`flip_y` 用于图像 y 向下与
+    /// 引擎设备坐标一致的情况（本项目设备坐标 y 向下，故通常传 `false`）。
+    pub fn rect(x0: f32, y0: f32, x1: f32, y1: f32) -> ImagePlacement {
+        ImagePlacement {
+            origin: Vec2::new(x0, y0),
+            u_axis: Vec2::new(x1 - x0, 0.0),
+            v_axis: Vec2::new(0.0, y1 - y0),
+            repeat: false,
+        }
+    }
+
+    /// 设备坐标 → 图像空间 `uv`。
+    ///
+    /// 解 `p = origin + u*u_axis + v*v_axis`。行列式接近 0（退化）时返回 `None`，
+    /// 由调用方决定降级行为 —— 而不是悄悄除零产出 NaN 像素。
+    #[inline]
+    pub fn uv_at(&self, p: Vec2) -> Option<Vec2> {
+        let (a, b) = (self.u_axis.x, self.v_axis.x);
+        let (c, d) = (self.u_axis.y, self.v_axis.y);
+        let det = a * d - b * c;
+        if det.abs() < 1e-12 {
+            return None;
+        }
+        let (px, py) = (p.x - self.origin.x, p.y - self.origin.y);
+        // 2×2 逆矩阵
+        Some(Vec2::new((d * px - b * py) / det, (-c * px + a * py) / det))
+    }
+}
+
 /// 绘制样式。
 ///
 /// **不是 `Copy`**：渐变经 `Arc` 共享，而 `Arc` 只能 `Clone`。
@@ -341,6 +479,11 @@ pub enum Paint {
     Solid(Color),
     /// 渐变着色。用 `Arc` 让渐变定义在多条 draw 间共享（避免逐字形深拷贝色标表）。
     Gradient(std::sync::Arc<Gradient>),
+    /// 位图着色（M6）。放置与采样方式见 [`ImagePlacement`]。
+    Image {
+        image: std::sync::Arc<Image>,
+        placement: ImagePlacement,
+    },
 }
 
 /// 每 draw 最多引用的裁剪层数（WGSL 侧展开采样）。
@@ -839,6 +982,22 @@ pub fn encode_scene(scene: &Scene) -> Vec<u8> {
                     put_color(&mut buf, &s.color);
                 }
             }
+            Paint::Image { image, placement } => {
+                // M6 现状：AMK1 流**不内嵌位图**（一张 717×692 的图就有约 2 MB，
+                // 内嵌会让"场景流"退化成图像容器，失去轻量优势）。
+                // 因此这里写入一个**显式的"含图像"标记**：解码方会明确报错，
+                // 而不是静默丢掉图像导致画面悄悄缺一块。
+                put_u32(&mut buf, 2); // 2 = 图像（当前不可序列化）
+                put_u32(&mut buf, image.width);
+                put_u32(&mut buf, image.height);
+                put_f32(&mut buf, placement.origin.x);
+                put_f32(&mut buf, placement.origin.y);
+                put_f32(&mut buf, placement.u_axis.x);
+                put_f32(&mut buf, placement.u_axis.y);
+                put_f32(&mut buf, placement.v_axis.x);
+                put_f32(&mut buf, placement.v_axis.y);
+                put_u32(&mut buf, u32::from(placement.repeat));
+            }
         }
         put_u32(&mut buf, draw.blend.id());
         put_u32(&mut buf, draw.clips.len() as u32);
@@ -905,9 +1064,17 @@ pub fn decode_scene(bytes: &[u8]) -> Result<Scene, String> {
                 }
                 Paint::Gradient(std::sync::Arc::new(Gradient { kind, stops, repeat }))
             }
+            2 => {
+                // 图像：AMK1 不内嵌位图（见编码侧说明）。
+                // 明确报错，而不是返回一个缺了图像的场景。
+                let (w, h) = (r.u32()?, r.u32()?);
+                return Err(format!(
+                    "AMK1 流不内嵌位图，无法解码 {w}×{h} 的图像绘制；\
+                     请在解码后重新插入图像"
+                ));
+            }
             other => return Err(format!("paint 类型不支持: {other}")),
-        };
-        let blend_id = r.u32()?;
+        };        let blend_id = r.u32()?;
         let n_refs = r.u32()? as usize;
         let mut clips = Vec::with_capacity(n_refs);
         for _ in 0..n_refs {

@@ -102,6 +102,29 @@ fn build_scene(t: f32) -> amiki::scene::Scene {
     canvas.scene
 }
 
+/// 加载根目录下的 `img.jpg` 作为演示用位图（存在才加载）。
+///
+/// 解码放在示例里而不是引擎里：引擎只认"线性 RGBA8"这一种内存布局，
+/// 因此不需要引入任何图像解码库。
+fn load_demo_image() -> Option<std::sync::Arc<amiki::scene::Image>> {
+    let p = std::path::Path::new("img.jpg");
+    if !p.exists() {
+        return None;
+    }
+    // 解码失败**必须区分于文件不存在**：早前这里用 `.ok()?` 把两者混为一谈，
+    // 结果"JPEG 解码未启用"被误报成"未找到 img.jpg"，白白浪费一轮排查。
+    let dynimg = match image::open(p) {
+        Ok(i) => i,
+        Err(e) => {
+            eprintln!("加载 img.jpg 失败（文件存在）：{e}");
+            return None;
+        }
+    };
+    let rgba = dynimg.to_rgba8();
+    let (w, h) = rgba.dimensions();
+    amiki::scene::Image::from_rgba8(w, h, rgba.into_raw()).map(std::sync::Arc::new)
+}
+
 /// 加载随仓库分发的 Inter 字体（`assets/fonts/Inter-Regular.ttf`，SIL OFL 1.1）。
 ///
 /// 找不到时返回 `None` 并提示，而不是让示例失败 —— 示例应当能在没有字体的
@@ -261,6 +284,85 @@ fn main() {
         }
     } else {
         println!("M5 文本：未找到 assets/fonts/Inter-Regular.ttf，跳过真字演示");
+    }
+
+    // ── M6：综合演示 —— 位图 + 渐变 + 文字 同场 ──
+    // 用示例自带的 img.jpg（存在才画），展示图像与图形/文字混合。
+    if let Some(img) = load_demo_image() {
+        use amiki::scene::{Color, Gradient, GradientStop, Paint};
+        let (cw, ch) = (1280u32, 720u32);
+        let mut c = amiki::Canvas::new(cw, ch);
+        c.rect(0.0, 0.0, cw as f32, ch as f32, Paint::Solid(Color::rgb8(246, 243, 238)));
+
+        // 位图：等比缩放 + 圆角外框（用裁剪展示图像与图形协作）
+        let (ix, iy, iw) = (64.0f32, 96.0f32, 420.0f32);
+        let ih = iw * (img.height as f32) / (img.width as f32);
+        {
+            let mut clip = PathBuilder::new();
+            clip.rect(ix - 6.0, iy - 6.0, ix + iw + 6.0, iy + ih + 6.0);
+            c.push_clip(&clip.build());
+            c.image(img.clone(), ix, iy, ix + iw, iy + ih);
+            c.pop_clip();
+        }
+
+        // 渐变横幅（线性 + 径向各一条，展示两种几何）
+        let linear = std::sync::Arc::new(
+            Gradient::linear(
+                Vec2::new(560.0, 0.0),
+                Vec2::new(1220.0, 0.0),
+                vec![
+                    GradientStop::new(0.0, Color::rgb8(28, 34, 46)),
+                    GradientStop::new(0.5, Color::rgb8(186, 72, 44)),
+                    GradientStop::new(1.0, Color::rgb8(232, 166, 46)),
+                ],
+            )
+            .expect("渐变色标有效"),
+        );
+        c.rect(560.0, 120.0, 1220.0, 208.0, Paint::Gradient(linear.clone()));
+        let radial = std::sync::Arc::new(
+            Gradient::radial(
+                Vec2::new(760.0, 420.0),
+                190.0,
+                vec![
+                    GradientStop::new(0.0, Color::rgba8(90, 150, 210, 255)),
+                    GradientStop::new(1.0, Color::rgba8(18, 30, 52, 255)),
+                ],
+            )
+            .expect("渐变色标有效"),
+        );
+        c.rect(600.0, 260.0, 920.0, 580.0, Paint::Gradient(radial));
+
+        // 文字：用渐变着色，并叠在位图与渐变之上
+        if let Some(font) = load_inter() {
+            if let Ok(run) = amiki_text::shape(&font, "Amiki2D", 96.0) {
+                c.text(
+                    &run,
+                    Vec2::new(600.0, 560.0),
+                    Paint::Gradient(linear),
+                    |id| font.outline(id).ok(),
+                );
+            }
+        }
+
+        let scene = c.scene;
+        let t0 = Instant::now();
+        let mut img_rgba = match pollster::block_on(gpu::GpuRenderer::new()) {
+            Ok(r) => r.render_blocking(&scene, 0.1).unwrap_or_else(|e| {
+                println!("综合演示：GPU 渲染失败（{e}），改用 CPU");
+                raster::render(&raster::bin(&scene, 0.1))
+            }),
+            Err(_) => raster::render(&raster::bin(&scene, 0.1)),
+        };
+        let _ = &mut img_rgba;
+        let ms = t0.elapsed().as_secs_f64() * 1000.0;
+        image::save_buffer("out/amiki_showcase.png", &img_rgba, cw, ch, image::ColorType::Rgba8)
+            .expect("保存综合演示 PNG 失败");
+        println!(
+            "M6 综合演示：位图（{}×{}）+ 线性/径向渐变 + 渐变文字 → out/amiki_showcase.png（{ms:.0} ms 含设备创建）",
+            img.width, img.height
+        );
+    } else {
+        println!("M6：跳过图像演示（未找到 img.jpg，或文件存在但解码失败——原因见上方提示）");
     }
 
     let t1 = Instant::now();

@@ -161,6 +161,10 @@ pub struct GpuScene {
     pub gradient_index: Vec<u32>,
     /// M6：本场景用到的渐变定义，按首次出现顺序排列（下标即 `gradient_index` 的值）。
     pub gradients: Vec<std::sync::Arc<amiki_scene::Gradient>>,
+    /// M6：每 draw 的图像下标；`u32::MAX` 表示非图像绘制。
+    pub image_index: Vec<u32>,
+    /// M6：本场景用到的位图与放置（下标即 `image_index` 的值，也是纹理数组的层号）。
+    pub images: Vec<(std::sync::Arc<amiki_scene::Image>, amiki_scene::ImagePlacement)>,
     pub draw_flags: Vec<u32>,
     pub draw_clips: Vec<[u32; 4]>,
     /// CPU 闭式段数（每入口：quad/cubic 变长，line=1）
@@ -204,6 +208,7 @@ pub fn build_gpu_scene(scene: &Scene, eps: f32) -> GpuScene {
     for (d, draw) in scene.draws.iter().enumerate() {
         let di = d as u32;
         let mut gi = u32::MAX;
+        let mut ii = u32::MAX;
         gs.colors.push(match &draw.paint {
             Paint::Solid(c) => [c.r, c.g, c.b, c.a],
             Paint::Gradient(g) => {
@@ -219,8 +224,20 @@ pub fn build_gpu_scene(scene: &Scene, eps: f32) -> GpuScene {
                 // colors 仍是占位：着色走 gradient_index
                 [0.0, 0.0, 0.0, 0.0]
             }
+            Paint::Image { image, placement } => {
+                ii = gs
+                    .images
+                    .iter()
+                    .position(|(x, p)| std::sync::Arc::ptr_eq(x, image) && p == placement)
+                    .unwrap_or_else(|| {
+                        gs.images.push((image.clone(), *placement));
+                        gs.images.len() - 1
+                    }) as u32;
+                [0.0, 0.0, 0.0, 0.0]
+            }
         });
         gs.gradient_index.push(gi);
+        gs.image_index.push(ii);
         let _ = di;
         let nclip = draw.clips.len().min(4);
         let mut ci = [0u32; 4];
@@ -570,8 +587,125 @@ fn pack_gradients(grads: &[std::sync::Arc<amiki_scene::Gradient>]) -> Vec<[f32; 
     }
     out
 }
+/// M6：把场景用到的位图上传为一个**纹理数组**（每张图一层）。
+///
+/// 用纹理数组而非逐图绑定：绑定槽位有限，而场景可能有很多张图；
+/// 数组 + 层号让 draw 只需在放置参数里带一个整数层号。
+///
+/// 尺寸不一致时**居中左上对齐、越界部分透明**：不做缩放，
+/// 因为缩放语义（拉伸/平铺/留白）应由调用方通过放置显式决定，
+/// 引擎在这里静默缩放会让"图像显示成什么样"变得不可预测。
+///
+/// 无图像时创建一个 1×1 的占位层，保证绑定始终合法。
+impl GpuRenderer {
+    fn mk_image_texture_array(
+        &self,
+        images: &[(std::sync::Arc<amiki_scene::Image>, amiki_scene::ImagePlacement)],
+    ) -> Result<(wgpu::TextureView, wgpu::Sampler), RenderError> {
+        let max_dim = self.limits.max_texture_dimension_2d;
+        let w = images.iter().map(|(i, _)| i.width).max().unwrap_or(1).min(max_dim);
+        let h = images.iter().map(|(i, _)| i.height).max().unwrap_or(1).min(max_dim);
+        let layers = images.len().max(1) as u32;
+        // 层数上限：不同后端不同，取保守值并在超出时明确报错
+        let max_layers = self.limits.max_texture_array_layers;
+        if layers > max_layers {
+            return err(format!(
+                "位图层数 {layers} 超出设备上限 {max_layers}；请合并图像或分帧绘制"
+            ));
+        }
 
+        let tex = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("amiki_image_array"),
+            size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: layers },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
 
+        // 逐层上传（上层若比底图小，剩余部分保持透明）
+        const BPP: usize = 4;
+        let row_bytes = (w as usize) * BPP;
+        let mut layer_buf = vec![0u8; row_bytes * h as usize];
+        for (li, (img, _)) in images.iter().enumerate() {
+            layer_buf.fill(0);
+            let cw = img.width.min(w) as usize;
+            let ch = img.height.min(h) as usize;
+            for y in 0..ch {
+                let src = (y * img.width as usize) * BPP;
+                let dst = (y * w as usize) * BPP;
+                layer_buf[dst..dst + cw * BPP].copy_from_slice(&img.data[src..src + cw * BPP]);
+            }
+            self.queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &tex,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d { x: 0, y: 0, z: li as u32 },
+                    aspect: wgpu::TextureAspect::All,
+                },
+                &layer_buf,
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(row_bytes as u32),
+                    rows_per_image: Some(h),
+                },
+                wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+            );
+        }
+
+        let view = tex.create_view(&wgpu::TextureViewDescriptor {
+            label: Some("amiki_image_array_view"),
+            dimension: Some(wgpu::TextureViewDimension::D2Array),
+            ..Default::default()
+        });
+        // 采样器：clamp-to-edge + 线性过滤。
+        // repeat 由 WGSL 侧取模实现（采样器同时服务 clip 纹理的钳制语义，
+        // 不能设成 repeat）。
+        let sampler = self.device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("amiki_image_sampler"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
+        Ok((view, sampler))
+    }
+}
+
+/// M6：把每个 draw 的图像放置打包成 `sparse_fine.wgsl` 期望的布局。
+///
+/// **每 draw 三个 vec4**，与 WGSL 的 `image_color` / `image_index_of` 严格对应：
+/// ```text
+/// [d*3+0] = (origin.x, origin.y, u_axis.x, u_axis.y)
+/// [d*3+1] = (v_axis.x, v_axis.y, tex_layer, 0)
+/// [d*3+2] = (bitcast<f32>(image_index), repeat, 0, 0)
+/// ```
+/// 把 `image_index` 放进放置数据自身，使该缓冲区**自描述**：
+/// "这个 draw 是不是图像"无需另占 `draw_meta` 分量，也不会与渐变下标争位置。
+/// 非图像 draw 在 `[d*3+2].x` 写 `u32::MAX` 的位模式（WGSL 用 bitcast 读回）。
+fn pack_image_place(gs: &GpuScene) -> Vec<[f32; 4]> {
+    let mut out = vec![[0.0f32; 4]; gs.image_index.len() * 3];
+    for (d, idx) in gs.image_index.iter().enumerate() {
+        let slot = d * 3;
+        if *idx == u32::MAX {
+            out[slot + 2][0] = f32::from_bits(u32::MAX);
+            continue;
+        }
+        let (_img, place) = &gs.images[*idx as usize];
+        out[slot] = [place.origin.x, place.origin.y, place.u_axis.x, place.u_axis.y];
+        // 纹理层号 = 该图像在纹理数组中的层（与 gs.images 同序）
+        out[slot + 1] = [place.v_axis.x, place.v_axis.y, *idx as f32, 0.0];
+        out[slot + 2] =
+            [f32::from_bits(*idx), if place.repeat { 1.0 } else { 0.0 }, 0.0, 0.0];
+    }
+    out
+}
+
+/// 校验脏区与画布 tile 尺寸一致。
 ///
 /// `Damage` 用的是它自己的画布 tile 数，而派发范围按当前场景的 tile 数钳制。
 /// 若两者不一致（例如调用方复用了为不同尺寸画布建的 `Damage`），
@@ -704,6 +838,12 @@ pub struct GpuRenderer {
     sparse_coverage_pipeline: wgpu::ComputePipeline,
     dummy_clip_view: wgpu::TextureView,
     _dummy_clip_tex: wgpu::Texture,
+    /// M6：图像绑定的占位（稠密路径不用图像，但共用同一 bind group layout）
+    dummy_img_view: wgpu::TextureView,
+    _dummy_img_tex: wgpu::Texture,
+    dummy_img_sampler: wgpu::Sampler,
+    /// M6：放置参数的占位缓冲（layout 共用，需要合法非空 storage buffer）
+    dummy_img_place: wgpu::Buffer,
 }
 
 /// 临时 bind group 构建期间的 16B 垫片（满足 vec4 数组的最小绑定尺寸）。
@@ -793,12 +933,29 @@ impl GpuRenderer {
             .await
             .map_err(|e| RenderError(format!("没有可用的 GPU 适配器: {e}")))?;
         let info = adapter.get_info();
+        // M6：图像放置参数是第 9 个 storage buffer，而 wgpu 的
+        // `Limits::default()` 只保证 8 个（WebGPU 基线）。
+        // 因此**按适配器能力上调**该上限，并在适配器不支持时明确报错，
+        // 而不是让 create_bind_group 在运行时抛出一句难以定位的校验失败。
+        let adapter_limits = adapter.limits();
+        let want_sb = 9u32;
+        if adapter_limits.max_storage_buffers_per_shader_stage < want_sb {
+            return err(format!(
+                "适配器仅支持 {} 个 storage buffer/阶段，图像绘制需要 {want_sb} 个；\
+                 请改用 CPU 引擎或不使用图像",
+                adapter_limits.max_storage_buffers_per_shader_stage
+            ));
+        }
+        let limits = wgpu::Limits {
+            max_storage_buffers_per_shader_stage: want_sb,
+            ..wgpu::Limits::default()
+        };
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("amiki2d"),
                 // 基准所需：适配器支持时启用 GPU 时间戳（其余保持最小特性集）
                 required_features: adapter.features() & wgpu::Features::TIMESTAMP_QUERY,
-                required_limits: wgpu::Limits::default(),
+                required_limits: limits,
                 memory_hints: wgpu::MemoryHints::default(),
                 trace: wgpu::Trace::Off,
             })
@@ -877,6 +1034,25 @@ impl GpuRenderer {
         for b in 10..=13u32 {
             fine_entries.push(texture_bgl_entry(b));
         }
+        // M6 图像：14 = 放置参数（与稠密路径共用，稠密永不用到），
+        //          15 = 位图纹理数组，16 = 采样器
+        fine_entries.push(storage_bgl_entry(14, true));
+        fine_entries.push(wgpu::BindGroupLayoutEntry {
+            binding: 15,
+            visibility: wgpu::ShaderStages::COMPUTE,
+            ty: wgpu::BindingType::Texture {
+                sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                view_dimension: wgpu::TextureViewDimension::D2Array,
+                multisampled: false,
+            },
+            count: None,
+        });
+        fine_entries.push(wgpu::BindGroupLayoutEntry {
+            binding: 16,
+            visibility: wgpu::ShaderStages::COMPUTE,
+            ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+            count: None,
+        });
         let fine_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("amiki_fine_bgl"),
             entries: &fine_entries,
@@ -1014,6 +1190,47 @@ impl GpuRenderer {
         );
         let dummy_clip_view = dummy_clip_tex.create_view(&wgpu::TextureViewDescriptor::default());
 
+        // M6：图像绑定的占位（稠密路径与本引擎的 clip-only 绑定需要合法资源）。
+        // 1×1 透明层，作为 D2Array 视图 + clamp 采样器。
+        let dummy_img_tex = device.create_texture_with_data(
+            &queue,
+            &wgpu::TextureDescriptor {
+                label: Some("amiki_dummy_image"),
+                size: wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba8Unorm,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                view_formats: &[],
+            },
+            wgpu::util::TextureDataOrder::LayerMajor,
+            &[0, 0, 0, 0],
+        );
+        let dummy_img_view = dummy_img_tex.create_view(&wgpu::TextureViewDescriptor {
+            label: Some("amiki_dummy_image_view"),
+            dimension: Some(wgpu::TextureViewDimension::D2Array),
+            ..Default::default()
+        });
+        let dummy_img_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("amiki_dummy_image_sampler"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
+
+        // M6：稠密路径的放置参数占位（layout 共用，需合法非空缓冲）
+        let dummy_img_place = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("amiki_dummy_imgplace"),
+            size: 3 * 16,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        queue.write_buffer(&dummy_img_place, 0, bytemuck::cast_slice(&[[0.0f32; 4]; 3]));
+
         let timestamp_period_ns = queue.get_timestamp_period();
         let limits = device.limits();
         Ok(GpuRenderer {
@@ -1057,6 +1274,10 @@ impl GpuRenderer {
             sparse_coverage_pipeline,
             dummy_clip_view,
             _dummy_clip_tex: dummy_clip_tex,
+            dummy_img_view,
+            _dummy_img_tex: dummy_img_tex,
+            dummy_img_sampler,
+            dummy_img_place,
         })
     }
 
@@ -1590,6 +1811,17 @@ impl GpuRenderer {
                 wgpu::BindGroupEntry { binding: 11, resource: wgpu::BindingResource::TextureView(views[1]) },
                 wgpu::BindGroupEntry { binding: 12, resource: wgpu::BindingResource::TextureView(views[2]) },
                 wgpu::BindGroupEntry { binding: 13, resource: wgpu::BindingResource::TextureView(views[3]) },
+                // M6：稠密路径不做图像着色，但 bind group layout 是共用的，
+                // 必须提供合法的 14/15/16（占位资源），否则创建绑定即校验失败。
+                wgpu::BindGroupEntry { binding: 14, resource: self.dummy_img_place.as_entire_binding() },
+                wgpu::BindGroupEntry {
+                    binding: 15,
+                    resource: wgpu::BindingResource::TextureView(&self.dummy_img_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 16,
+                    resource: wgpu::BindingResource::Sampler(&self.dummy_img_sampler),
+                },
             ],
         });
         {
@@ -1728,6 +1960,11 @@ impl GpuRenderer {
         // M6：渐变数据打包（定长条目，布局与 sparse_fine.wgsl 的 grad_color 对应）
         let grad_vec = pack_gradients(&gs.gradients);
         let grad_buf = mk_init("amiki_sparse_grad", bytemuck::cast_slice(&grad_vec));
+
+        // M6：图像放置参数 + 位图纹理数组（每 draw 3 个 vec4，自描述）
+        let place_vec = pack_image_place(gs);
+        let place_buf = mk_init("amiki_sparse_imgplace", bytemuck::cast_slice(&place_vec));
+        let (img_tex_view, img_sampler) = self.mk_image_texture_array(&gs.images)?;
 
         let data_buf = mk_init("amiki_sparse_data", bytemuck::cast_slice(&data));
         let entry_draws_buf = mk_init("amiki_sparse_edraws", bytemuck::cast_slice(&entry_draws));
@@ -2071,6 +2308,16 @@ impl GpuRenderer {
                 wgpu::BindGroupEntry { binding: 11, resource: wgpu::BindingResource::TextureView(views[1]) },
                 wgpu::BindGroupEntry { binding: 12, resource: wgpu::BindingResource::TextureView(views[2]) },
                 wgpu::BindGroupEntry { binding: 13, resource: wgpu::BindingResource::TextureView(views[3]) },
+                // M6 图像：放置参数、位图纹理数组、采样器
+                wgpu::BindGroupEntry { binding: 14, resource: place_buf.as_entire_binding() },
+                wgpu::BindGroupEntry {
+                    binding: 15,
+                    resource: wgpu::BindingResource::TextureView(&img_tex_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 16,
+                    resource: wgpu::BindingResource::Sampler(&img_sampler),
+                },
             ],
         });
         let t_enc2 = Instant::now();
@@ -2976,6 +3223,95 @@ mod tests {
         assert!(max_diff <= 2, "repeat 渐变：最大通道差 {max_diff} 超出容差");
         eprintln!("GPU repeat 渐变与 CPU 一致（最大通道差 {max_diff}）");
     }
+    /// M6：**GPU 位图采样必须与 CPU 参考实现一致**。
+    ///
+    /// 用一张**合成图案**（而非纯色）作测试图：纯色无法区分"采样正确"与
+    /// "把整张图当成一个颜色"这两种实现；棋盘 + 渐变的组合能同时检验
+    /// 坐标映射、双线性过滤与缩放。
+    #[test]
+    fn gpu_image_matches_cpu() {
+        use amiki_math::{Affine, Vec2};
+        use amiki_scene::{Color, Image, ImagePlacement, Paint, PathBuilder, Scene};
+
+        let Ok(renderer) = pollster::block_on(GpuRenderer::new()) else {
+            eprintln!("跳过：无 GPU 适配器");
+            return;
+        };
+
+        // 32×24 合成图：R/G 为渐变（检验坐标映射），B 为 4×4 棋盘（检验过滤）
+        let (iw, ih) = (32u32, 24u32);
+        let mut data = Vec::with_capacity((iw * ih * 4) as usize);
+        for y in 0..ih {
+            for x in 0..iw {
+                let checker = if ((x / 4) + (y / 4)) % 2 == 0 { 40u8 } else { 215u8 };
+                data.push((x * 255 / (iw - 1)) as u8);
+                data.push((y * 255 / (ih - 1)) as u8);
+                data.push(checker);
+                data.push(255);
+            }
+        }
+        let img = std::sync::Arc::new(Image::from_rgba8(iw, ih, data).expect("图像数据合法"));
+
+        // 三种放置：等比、放大（检验双线性）、旋转（检验仿射逆映射）
+        let cases: Vec<(&str, ImagePlacement, bool)> = vec![
+            ("等比", ImagePlacement::rect(8.0, 8.0, 40.0, 32.0), false),
+            ("放大", ImagePlacement::rect(4.0, 4.0, 68.0, 68.0), false),
+            (
+                "旋转",
+                ImagePlacement {
+                    origin: Vec2::new(36.0, 6.0),
+                    u_axis: Vec2::new(28.0, 14.0),
+                    v_axis: Vec2::new(-14.0, 28.0),
+                    repeat: false,
+                },
+                false,
+            ),
+            ("平铺", ImagePlacement { repeat: true, ..ImagePlacement::rect(10.0, 10.0, 30.0, 22.0) }, false),
+        ];
+
+        for (name, place, _) in cases {
+            let mut scene = Scene::new(72, 72);
+            let mut pb = PathBuilder::new();
+            // 覆盖范围按放置四角的包围盒（与 Canvas::image 一致）
+            let p = |u: f32, v: f32| place.origin + place.u_axis * u + place.v_axis * v;
+            let (mut x0, mut y0, mut x1, mut y1) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
+            for (u, v) in [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)] {
+                let q = p(u, v);
+                x0 = x0.min(q.x);
+                y0 = y0.min(q.y);
+                x1 = x1.max(q.x);
+                y1 = y1.max(q.y);
+            }
+            pb.rect(x0, y0, x1, y1);
+            // 底：不透明色，便于观察图像是否真的覆盖上去
+            scene.push(Affine::IDENTITY, pb.build(), Paint::Solid(Color::rgb8(250, 250, 250)));
+            scene.push(
+                Affine::IDENTITY,
+                pb.build(),
+                Paint::Image { image: img.clone(), placement: place },
+            );
+
+            let gpu = renderer.render_blocking(&scene, 0.05).expect("GPU 渲染失败");
+            let cpu = amiki_raster::render(&amiki_raster::bin(&scene, 0.05));
+
+            let mut max_diff = 0u32;
+            let mut worst = 0usize;
+            for (i, (a, b)) in gpu.iter().zip(cpu.iter()).enumerate() {
+                let d = (*a as i32 - *b as i32).unsigned_abs();
+                if d > max_diff {
+                    max_diff = d;
+                    worst = i;
+                }
+            }
+            // 双线性在 CPU 与 GPU 上的舍入不同，容差给 3（比纯几何的 2 略宽）
+            assert!(
+                max_diff <= 3,
+                "{name}放置：GPU 与 CPU 最大通道差 {max_diff}（字节偏移 {worst}）超出容差"
+            );
+            eprintln!("GPU 位图（{name}放置）与 CPU 一致（最大通道差 {max_diff}）");
+        }
+    }
+
     /// M2f-1：通用 GPU 前缀和 vs CPU 对拍（随机长度/数值）。
     #[test]
     fn gpu_scan_matches_cpu() {

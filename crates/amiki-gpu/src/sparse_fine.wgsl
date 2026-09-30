@@ -100,6 +100,52 @@ fn grad_color(g: u32, p: vec2<f32>) -> vec4<f32> {
     return vec4<f32>(prev_c, 1.0);
 }
 
+/// M6：按 draw 求位图颜色。
+///
+/// 布局（**每 draw 三个 vec4**，与宿主侧 `pack_image_place` 对应）：
+/// ```text
+/// image_place[d*3+0] = (origin.x, origin.y, u_axis.x, u_axis.y)
+/// image_place[d*3+1] = (v_axis.x, v_axis.y, tex_layer, 0)
+/// image_place[d*3+2] = (image_index, repeat, 0, 0)
+/// ```
+/// 把 `image_index` 与 `repeat` 放进**放置数据自身**，于是"这个 draw 是不是图像"
+/// 无需另占 draw_meta 分量 —— 放置缓冲区自描述，也不会与渐变下标争位置。
+/// （`0xFFFF_FFFF` 表示该 draw 不是图像。）
+///
+/// 放置是仿射映射：解 `p = origin + u*u_axis + v*v_axis` 得 uv。
+/// 退化（行列式≈0）时返回透明 —— 宁可该像素不画，也不要产出 NaN 像素。
+///
+/// 用 `textureSampleLevel` 而非 `textureSample`：后者要求一致控制流，
+/// 而这里在"逐 draw 循环 + 条件"内调用。本引擎位图无 mip 链，故 level 固定 0。
+fn image_color(d: u32, p: vec2<f32>) -> vec4<f32> {
+    let e0 = image_place[d * 3u];
+    let e1 = image_place[d * 3u + 1u];
+    let e2 = image_place[d * 3u + 2u];
+    let o = e0.xy;
+    let ua = e0.zw;
+    let va = e1.xy;
+    let layer = u32(e1.z + 0.5);
+
+    let det = ua.x * va.y - va.x * ua.y;
+    if (abs(det) < 1e-12) {
+        return vec4<f32>(0.0, 0.0, 0.0, 0.0);
+    }
+    let r = p - o;
+    var uv = vec2<f32>(
+        (va.y * r.x - va.x * r.y) / det,
+        (-ua.y * r.x + ua.x * r.y) / det,
+    );
+    if (e2.y > 0.5) {
+        uv = uv - floor(uv);
+    }
+    return textureSampleLevel(image_tex, image_smp, uv, i32(layer), 0.0);
+}
+
+/// 该 draw 是否为图像（`image_place` 自描述）。
+fn image_index_of(d: u32) -> u32 {
+    return bitcast<u32>(image_place[d * 3u + 2u].x);
+}
+
 struct FineParams {
     width: u32,
     height: u32,
@@ -121,6 +167,10 @@ struct FineParams {
 @group(0) @binding(11) var clip_tex1: texture_2d<f32>;
 @group(0) @binding(12) var clip_tex2: texture_2d<f32>;
 @group(0) @binding(13) var clip_tex3: texture_2d<f32>;
+// M6 图像：放置参数（每 draw 一个 vec4）、位图纹理数组、采样器
+@group(0) @binding(14) var<storage, read> image_place: array<vec4<f32>>;
+@group(0) @binding(15) var image_tex: texture_2d_array<f32>;
+@group(0) @binding(16) var image_smp: sampler;
 
 fn shade(gid: vec3<u32>, coverage_only: bool) -> vec4<f32> {
     let tile_x = gid.x / 16u;
@@ -161,13 +211,15 @@ fn shade(gid: vec3<u32>, coverage_only: bool) -> vec4<f32> {
             a *= clip_mul(dm.y, nclip, dm, gid.xy, clip_tex0, clip_tex1, clip_tex2, clip_tex3);
         }
         if (a > 0.0) {
-            // M6：draw_meta.w 是渐变下标；0xFFFF_FFFF 表示纯实心色。
-            // 索引存在**独立字段**而非从颜色里编码 —— 后者依赖浮点精确相等，
-            // 一旦有颜色恰好碰撞就会静默出错。
+            // M6：draw_meta 的 .w 是渐变下标，.z（见宿主）是图像下标，
+            // 0xFFFF_FFFF 均表示"不适用"。索引存在**独立字段**而非从颜色里编码
+            // —— 后者依赖浮点精确相等，一旦有颜色恰好碰撞就会静默出错。
             var c = colors[d];
             let gi = dm.w;
             if (gi != 0xFFFFFFFFu) {
                 c = grad_color(gi, center);
+            } else if (image_index_of(d) != 0xFFFFFFFFu) {
+                c = image_color(d, center);
             }
             col = composite(col, c, c.a * a, flags & 0xFFu);
         }

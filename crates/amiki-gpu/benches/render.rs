@@ -180,6 +180,10 @@ fn bench_extract(c: &mut Criterion) {
         let scene = curves_scene(1280, 720, 64, 10.0);
         b.iter(|| black_box(build_gpu_scene(black_box(&scene), EPS)));
     });
+    group.bench_function("1080p_10k_curves", |b| {
+        let scene = curves_scene(1920, 1080, 10_000, 5.0);
+        b.iter(|| black_box(build_gpu_scene(black_box(&scene), EPS)));
+    });
     group.bench_function("1080p_1000_curves", |b| {
         let scene = curves_scene(1920, 1080, 1000, 6.0);
         b.iter(|| black_box(build_gpu_scene(black_box(&scene), EPS)));

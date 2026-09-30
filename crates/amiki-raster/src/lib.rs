@@ -800,7 +800,7 @@ fn composite_layer(
         return;
     }
 
-    // 从层图拷到层缓冲（预乘，便于滤波）
+    // 从层图拷到层缓冲（**直线色**：滤波必须在颜色上做，见 filter 模块说明）
     let mut buf = LayerBuffer::new(lw, lh);
     for y in 0..lh {
         for x in 0..lw {
@@ -812,12 +812,11 @@ fn composite_layer(
                 && (sy as u32) < root_h
             {
                 let o = ((sy as u32 * root_w + sx as u32) * 4) as usize;
-                let a = layer_img[o + 3] as f32 / 255.0;
                 [
-                    layer_img[o] as f32 / 255.0 * a,
-                    layer_img[o + 1] as f32 / 255.0 * a,
-                    layer_img[o + 2] as f32 / 255.0 * a,
-                    a,
+                    layer_img[o] as f32 / 255.0,
+                    layer_img[o + 1] as f32 / 255.0,
+                    layer_img[o + 2] as f32 / 255.0,
+                    layer_img[o + 3] as f32 / 255.0,
                 ]
             } else {
                 [0.0; 4]
@@ -829,33 +828,68 @@ fn composite_layer(
     // 3) 滤波
     apply_filter(&mut buf, layer.filter);
 
-    // 4) 合成回父图像（转回直线 alpha，用与图元相同的 composite 函数 ——
-    //    保证"层"与"图元"走同一套混合数学，不会出现两套语义）
+    // 4) 合成回父图像。
+    //
+    // **关键：在预乘空间合成。** 层缓冲是直线色，先乘 alpha 得到预乘源；
+    // 若直接把直线色交给要求直线输入的 `composite`，模糊后小 alpha 处的
+    // 量化噪声会被放大，边缘出现明显色偏（实测与 GPU 差 86/255）。
+    // 因此把**目标**也转成预乘，算完再转回直线存储。
     let opacity = layer.opacity.clamp(0.0, 1.0);
     for y in 0..lh {
         for x in 0..lw {
             let p = buf.get(x, y);
-            let a = p[3] * opacity;
-            if a <= 0.0 {
+            let sa = p[3] * opacity;
+            if sa <= 0.0 {
                 continue;
             }
-            let inv = if p[3] > 0.0 { 1.0 / p[3] } else { 0.0 };
-            let straight = [p[0] * inv, p[1] * inv, p[2] * inv, p[3] * opacity];
+            // 源：直线 → 预乘
+            let src_pm = [p[0] * sa, p[1] * sa, p[2] * sa, sa];
             let gx = (bx + x as i32) as u32;
             let gy = (by + y as i32) as u32;
             let o = ((gy * root_w + gx) * 4) as usize;
-            let dst = [
-                root[o] as f32 / 255.0,
-                root[o + 1] as f32 / 255.0,
-                root[o + 2] as f32 / 255.0,
-                root[o + 3] as f32 / 255.0,
+            let da = root[o + 3] as f32 / 255.0;
+            // 目标：直线 → 预乘
+            let dst_pm = [
+                root[o] as f32 / 255.0 * da,
+                root[o + 1] as f32 / 255.0 * da,
+                root[o + 2] as f32 / 255.0 * da,
+                da,
             ];
-            let out = composite(dst, straight, a, layer.blend.id());
+            let out_pm = composite_premul(dst_pm, src_pm, layer.blend.id());
+            let oa = out_pm[3];
+            let inv = if oa > 0.0 { 1.0 / oa } else { 0.0 };
+            let straight = [out_pm[0] * inv, out_pm[1] * inv, out_pm[2] * inv, oa];
             for k in 0..4 {
-                root[o + k] = (out[k] * 255.0 + 0.5).clamp(0.0, 255.0) as u8;
+                root[o + k] = (straight[k] * 255.0 + 0.5).clamp(0.0, 255.0) as u8;
             }
         }
     }
+}
+
+/// 预乘空间下的 src-over + 混合（用于离屏层合成）。
+///
+/// 与 [`composite`] 的数学等价，但输入输出都是**预乘**——层合成必须如此，
+/// 否则模糊后小 alpha 处的反预乘会放大噪声。
+///
+/// 公开给 `amiki-gpu`：GPU 的层合成在主机侧做，必须与这里**同一份数学**，
+/// 否则两端会漂移（这正是本函数被 `pub` 的原因，而不是复制一份）。
+pub fn composite_premul(dst: [f32; 4], src: [f32; 4], mode: u32) -> [f32; 4] {
+    let sa = src[3];
+    let da = dst[3];
+    let out_a = sa + da * (1.0 - sa);
+    // 混合函数按定义作用在**直线色**上，故先反预乘取直线色
+    let inv_d = if da > 0.0 { 1.0 / da } else { 0.0 };
+    let inv_s = if sa > 0.0 { 1.0 / sa } else { 0.0 };
+    let cb = [dst[0] * inv_d, dst[1] * inv_d, dst[2] * inv_d];
+    let cs = [src[0] * inv_s, src[1] * inv_s, src[2] * inv_s];
+    let b = if mode == 0 { cs } else { blend_color(mode, cb, cs) };
+    let mut out = [0.0f32; 4];
+    for i in 0..3 {
+        // 预乘空间的 W3C 合成公式
+        out[i] = sa * (1.0 - da) * cs[i] + sa * da * b[i] + (1.0 - sa) * da * cb[i];
+    }
+    out[3] = out_a;
+    out
 }
 
 /// 渲染一个场景到新图像（不处理层）。

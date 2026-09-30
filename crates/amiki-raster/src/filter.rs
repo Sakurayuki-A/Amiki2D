@@ -22,11 +22,12 @@
 
 use amiki_scene::{Filter, LayerBounds};
 
-/// 一张离屏缓冲：**预乘** RGBA，f32 便于滤波中间结果不丢精度。
+/// 一张离屏缓冲：**直线（非预乘）** RGBA，f32 便于滤波中间结果不丢精度。
 ///
-/// 为什么存预乘：模糊是对**颜色**做加权平均，若存直线 alpha，
-/// 透明区域的"未定义颜色"会被平均进来，边缘出现暗边/亮边。
-/// 预乘后颜色已在 alpha=0 处归零，加权平均才是正确的。
+/// 为什么存**直线**而不是预乘：模糊是对颜色的加权平均。若存预乘值，
+/// 半透明边缘的 RGB 已被 alpha 压暗，平均后反预乘会**把颜色洗白/变亮**
+/// （实测边缘明显发白）。滤波必须在"颜色"上做，因此缓冲存直线色，
+/// 只有需要合成时才转预乘。
 #[derive(Clone, Debug)]
 pub struct LayerBuffer {
     pub width: u32,
@@ -180,19 +181,20 @@ pub fn apply(buf: &mut LayerBuffer, filter: Filter) {
         Filter::None => {}
         Filter::Blur { sigma } => blur(buf, sigma),
         Filter::DropShadow { dx, dy, sigma, color } => {
-            // 1) 复制一份作为阴影源，先按颜色着色（保留其 alpha 形状）
+            // 1) 复制一份作为阴影源，先按颜色着色（保留其 alpha 形状）。
+            //    缓冲是直线色，因此 RGB 直接取 color，只需按覆盖率缩放 alpha？
+            //    不——阴影颜色应当是**均匀**的，形状完全由 alpha 表达。
             let mut shadow = buf.clone();
             for px in shadow.data.iter_mut() {
-                // 阴影颜色固定，形状取源的 alpha
-                let a = px[3];
-                px[0] = color.r * color.a * a;
-                px[1] = color.g * color.a * a;
-                px[2] = color.b * color.a * a;
-                px[3] = color.a * a;
+                px[0] = color.r;
+                px[1] = color.g;
+                px[2] = color.b;
+                px[3] *= color.a;
             }
-            // 2) 模糊
+            // 2) 模糊（对直线色做，避免把颜色洗白）
             blur(&mut shadow, sigma);
-            // 3) 按 (dx,dy) 平移后叠加到原内容**下方**（源覆盖阴影）
+            // 3) 按 (dx,dy) 平移后叠加到原内容**下方**（源覆盖阴影）。
+            //    在直线 alpha 下做 src-over。
             for y in 0..buf.height {
                 for x in 0..buf.width {
                     let sx = x as i64 - dx.round() as i64;
@@ -203,18 +205,15 @@ pub fn apply(buf: &mut LayerBuffer, filter: Filter) {
                         [0.0; 4]
                     };
                     let d = buf.get(x, y);
-                    // src-over：源 d 覆盖阴影 s（预乘）
-                    let ia = 1.0 - d[3];
-                    buf.set(
-                        x,
-                        y,
-                        [
-                            d[0] + s[0] * ia,
-                            d[1] + s[1] * ia,
-                            d[2] + s[2] * ia,
-                            d[3] + s[3] * ia,
-                        ],
-                    );
+                    let ao = d[3] + s[3] * (1.0 - d[3]);
+                    let inv = if ao > 0.0 { 1.0 / ao } else { 0.0 };
+                    // src-over（直线色）：co = (cs*as + cd*ad*(1-as)) / ao
+                    let co = [
+                        (d[0] * d[3] + s[0] * s[3] * (1.0 - d[3])) * inv,
+                        (d[1] * d[3] + s[1] * s[3] * (1.0 - d[3])) * inv,
+                        (d[2] * d[3] + s[2] * s[3] * (1.0 - d[3])) * inv,
+                    ];
+                    buf.set(x, y, [co[0], co[1], co[2], ao]);
                 }
             }
         }

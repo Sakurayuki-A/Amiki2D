@@ -207,7 +207,7 @@ fn main() {
     // 字形轮廓 → 既有解析覆盖率管线。引擎无文本专用代码；
     // 抗锯齿来自真实面积积分，因此放大不糊（不依赖字形位图）。
     if let Some(font) = load_inter() {
-        use amiki::scene::{expand_text_run, Color, Paint, Scene};
+        use amiki::scene::{expand_text_run, Color, Gradient, GradientStop, Paint, Scene};
         let size = 110.0f32;
         let text = "Amiki2D";
         match amiki_text::shape(&font, text, size) {
@@ -223,13 +223,22 @@ fn main() {
                     Paint::Solid(Color::rgb8(248, 246, 242)),
                 );
                 let shift = amiki::math::Affine::translate(Vec2::new(60.0, 160.0));
+                // M6：文字用**渐变**着色 —— 同时验证 M5 与 M6 正交可组合
+                let grad = std::sync::Arc::new(
+                    Gradient::linear(
+                        Vec2::new(0.0, 0.0),
+                        Vec2::new(760.0, 60.0),
+                        vec![
+                            GradientStop::new(0.0, Color::rgb8(28, 34, 46)),
+                            GradientStop::new(0.45, Color::rgb8(196, 78, 40)),
+                            GradientStop::new(1.0, Color::rgb8(228, 158, 40)),
+                        ],
+                    )
+                    .expect("渐变色标有效"),
+                );
                 for (p, t) in paths.iter() {
                     // 每个字形一条独立 draw：可被分箱与 damage region 独立处理
-                    text_scene.push(
-                        shift.then(*t),
-                        p.clone(),
-                        Paint::Solid(Color::rgb8(24, 28, 34)),
-                    );
+                    text_scene.push(shift.then(*t), p.clone(), Paint::Gradient(grad.clone()));
                 }
                 let tb = raster::bin(&text_scene, 0.1);
                 let timg = raster::render(&tb);

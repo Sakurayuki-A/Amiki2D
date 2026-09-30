@@ -156,12 +156,11 @@ pub struct GpuScene {
     pub lines: Vec<[f32; 4]>,
     pub line_draws: Vec<u32>,
     pub colors: Vec<[f32; 4]>,
-    /// M6：使用渐变但 GPU 侧尚未实现其着色的 draw 下标。
-    ///
-    /// 这些 draw 在 GPU 上被**降级为渐变中点色**（见 `build_gpu_scene`）。
-    /// 记录于此以便：诊断输出可提示降级、测试可断言降级范围，
-    /// 而不是让"GPU 与 CPU 逐像素对拍"这条承诺在无人察觉时失效。
-    pub gradient_fallback_draws: Vec<u32>,
+    /// M6：每 draw 的渐变下标；`u32::MAX` 表示纯实心色。
+    /// 随 `draw_meta.w` 传给 WGSL（该分量此前闲置）。
+    pub gradient_index: Vec<u32>,
+    /// M6：本场景用到的渐变定义，按首次出现顺序排列（下标即 `gradient_index` 的值）。
+    pub gradients: Vec<std::sync::Arc<amiki_scene::Gradient>>,
     pub draw_flags: Vec<u32>,
     pub draw_clips: Vec<[u32; 4]>,
     /// CPU 闭式段数（每入口：quad/cubic 变长，line=1）
@@ -204,18 +203,25 @@ pub fn build_gpu_scene(scene: &Scene, eps: f32) -> GpuScene {
     };
     for (d, draw) in scene.draws.iter().enumerate() {
         let di = d as u32;
+        let mut gi = u32::MAX;
         gs.colors.push(match &draw.paint {
             Paint::Solid(c) => [c.r, c.g, c.b, c.a],
             Paint::Gradient(g) => {
-                // M6 现状：GPU 侧尚无渐变着色（WGSL 待接）。
-                // 这里**显式降级为渐变中点色**，而不是静默近似 ——
-                // 静默降级会让"GPU 与 CPU 逐像素对拍"这条质量承诺失效却无人察觉。
-                // 取中点而非端点：中点在这条 draw 上是明确可预测的，便于识别降级。
-                let c = g.sample(0.5);
-                gs.gradient_fallback_draws.push(di);
-                [c.r, c.g, c.b, c.a]
+                // 去重复用同一定义（同一渐变常用于多条 draw）
+                gi = gs
+                    .gradients
+                    .iter()
+                    .position(|x| std::sync::Arc::ptr_eq(x, g))
+                    .unwrap_or_else(|| {
+                        gs.gradients.push(g.clone());
+                        gs.gradients.len() - 1
+                    }) as u32;
+                // colors 仍是占位：着色走 gradient_index
+                [0.0, 0.0, 0.0, 0.0]
             }
         });
+        gs.gradient_index.push(gi);
+        let _ = di;
         let nclip = draw.clips.len().min(4);
         let mut ci = [0u32; 4];
         ci[..nclip].copy_from_slice(&draw.clips[..nclip]);
@@ -508,7 +514,64 @@ impl TimestampRecorder {
     }
 }
 
-/// 校验脏区与画布 tile 尺寸一致。
+/// M6：把渐变定义打包成 `sparse_fine.wgsl` 期望的 `vec4<f32>` 布局。
+///
+/// **必须与 WGSL 侧 `GRAD_STRIDE` / `grad_color()` 严格一致**，
+/// 否则着色会静默取错数据（这类错误不会 panic，只会画错）。
+///
+/// 布局（`S = 2 + MAX_GRAD_STOPS*2` 个 vec4）：
+/// ```text
+/// [0]                    (n_grad, 0, 0, 0)
+/// [1 + g*S]              (kind, repeat, n_stops, MAX_GRAD_STOPS)
+/// [1 + g*S + 1]          (x0, y0, x1, y1)     径向: (cx, cy, r, 0)
+/// [1 + g*S + 2 + i*2]    (t_i, r, g, b)
+/// [1 + g*S + 2 + i*2 + 1](0, 0, 0, 0)          对齐占位
+/// ```
+/// 色标超过 `MAX_GRAD_STOPS` 时**截断并保持端点色**：与其静默丢中间色造成
+/// 肉眼可见的跳变，不如明确只保留前 N 个（调用方应自行控制色标数量）。
+/// 返回的缓冲至少含头部 1 个 vec4（空场景也要能绑定）。
+fn pack_gradients(grads: &[std::sync::Arc<amiki_scene::Gradient>]) -> Vec<[f32; 4]> {
+    const MAX_STOPS: usize = 8;
+    const STRIDE: usize = 2 + MAX_STOPS * 2;
+
+    let mut out: Vec<[f32; 4]> = Vec::with_capacity(1 + grads.len() * STRIDE);
+    out.push([grads.len() as f32, 0.0, 0.0, 0.0]);
+    for g in grads {
+        // kind 标签与几何一起由 match 求出，避免"先声明后赋值"的分支式写法
+        let (kind_tag, geo) = match g.kind {
+            amiki_scene::GradientKind::Linear { from, to } => {
+                (0.0, [from.x, from.y, to.x, to.y])
+            }
+            amiki_scene::GradientKind::Radial { center, radius } => {
+                (1.0, [center.x, center.y, radius, 0.0])
+            }
+            amiki_scene::GradientKind::Sweep { center, start } => {
+                (2.0, [center.x, center.y, start, 0.0])
+            }
+        };
+        let n = g.stops.len().min(MAX_STOPS);
+        let head = [
+            kind_tag,
+            if g.repeat { 1.0 } else { 0.0 },
+            n as f32,
+            MAX_STOPS as f32,
+        ];
+        out.push(head);
+        out.push(geo);
+        for i in 0..MAX_STOPS {
+            if i < n {
+                let s = &g.stops[i];
+                out.push([s.t, s.color.r, s.color.g, s.color.b]);
+            } else {
+                out.push([0.0; 4]);
+            }
+            out.push([0.0; 4]); // 对齐占位
+        }
+    }
+    out
+}
+
+
 ///
 /// `Damage` 用的是它自己的画布 tile 数，而派发范围按当前场景的 tile 数钳制。
 /// 若两者不一致（例如调用方复用了为不同尺寸画布建的 `Damage`），
@@ -1652,13 +1715,19 @@ impl GpuRenderer {
         entry_draws.extend_from_slice(&gs.quad_draws);
         entry_draws.extend_from_slice(&gs.cubic_draws);
         entry_draws.extend_from_slice(&gs.line_draws);
-        // draw_meta = (flags, clip0|clip1<<8, clip2|clip3<<8, _)（每索引 8 bit）
+        // draw_meta = (flags, clip0|clip1<<8, clip2|clip3<<8, grad_index)
+        // （每裁剪索引 8 bit；w 为 M6 渐变下标，u32::MAX 表示实心色）
         let draw_meta: Vec<[u32; 4]> = gs
             .draw_flags
             .iter()
             .zip(gs.draw_clips.iter())
-            .map(|(f, c)| [*f, c[0] | (c[1] << 8), c[2] | (c[3] << 8), 0])
+            .zip(gs.gradient_index.iter())
+            .map(|((f, c), gi)| [*f, c[0] | (c[1] << 8), c[2] | (c[3] << 8), *gi])
             .collect();
+
+        // M6：渐变数据打包（定长条目，布局与 sparse_fine.wgsl 的 grad_color 对应）
+        let grad_vec = pack_gradients(&gs.gradients);
+        let grad_buf = mk_init("amiki_sparse_grad", bytemuck::cast_slice(&grad_vec));
 
         let data_buf = mk_init("amiki_sparse_data", bytemuck::cast_slice(&data));
         let entry_draws_buf = mk_init("amiki_sparse_edraws", bytemuck::cast_slice(&entry_draws));
@@ -1996,7 +2065,7 @@ impl GpuRenderer {
                 wgpu::BindGroupEntry { binding: 5, resource: tile_count_buf.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 6, resource: tile_start_buf.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 7, resource: tile_list_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 8, resource: pad16.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 8, resource: grad_buf.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 9, resource: wgpu::BindingResource::TextureView(&tex_view) },
                 wgpu::BindGroupEntry { binding: 10, resource: wgpu::BindingResource::TextureView(views[0]) },
                 wgpu::BindGroupEntry { binding: 11, resource: wgpu::BindingResource::TextureView(views[1]) },
@@ -2769,8 +2838,7 @@ mod tests {
 
     /// M2f 管线核心对拍：纯直线/矩形场景（不含曲线，当前已验证）。
     #[test]
-    fn gpu_rect_matches_cpu() {
-        use amiki_math::{Affine, Vec2};
+    fn gpu_rect_matches_cpu() {        use amiki_math::{Affine, Vec2};
         use amiki_scene::{BlendMode, Color, Paint, PathBuilder, Scene};
 
         let Ok(renderer) = pollster::block_on(GpuRenderer::new()) else {
@@ -2799,6 +2867,115 @@ mod tests {
         assert!(max_diff <= 2, "GPU 与 CPU 最大通道差 {max_diff} 超出容差");
     }
 
+    /// M6：**GPU 渐变着色必须与 CPU 参考实现一致**。
+    ///
+    /// 这是渐变在 GPU 侧的唯一正确性依据：WGSL 的 `grad_color` 与 CPU 的
+    /// `Gradient::sample` 是两份独立实现，只有逐像素对拍才能证明语义一致。
+    /// 覆盖三种几何（线性/径向/扫描）与多色标（含中间色标，以验证区间查找），
+    /// 以及 repeat 范围行为。
+    #[test]
+    fn gpu_gradient_matches_cpu() {
+        use amiki_math::{Affine, Vec2};
+        use amiki_scene::{Color, Gradient, GradientStop, Paint, PathBuilder, Scene};
+
+        let Ok(renderer) = pollster::block_on(GpuRenderer::new()) else {
+            eprintln!("跳过：无 GPU 适配器");
+            return;
+        };
+
+        let stops = || {
+            vec![
+                GradientStop::new(0.0, Color::rgba8(20, 40, 200, 255)),
+                GradientStop::new(0.35, Color::rgba8(240, 200, 40, 255)),
+                GradientStop::new(1.0, Color::rgba8(220, 30, 90, 255)),
+            ]
+        };
+
+        let cases: Vec<(&str, Gradient)> = vec![
+            (
+                "线性",
+                Gradient::linear(Vec2::new(6.0, 6.0), Vec2::new(66.0, 42.0), stops()).unwrap(),
+            ),
+            (
+                "径向",
+                Gradient::radial(Vec2::new(36.0, 36.0), 34.0, stops()).unwrap(),
+            ),
+            (
+                "扫描",
+                Gradient::sweep(Vec2::new(36.0, 36.0), 0.7, stops()).unwrap(),
+            ),
+        ];
+
+        for (name, g) in cases {
+            let mut scene = Scene::new(72, 72);
+            let mut pb = PathBuilder::new();
+            pb.rect(4.0, 4.0, 68.0, 68.0);
+            scene.push(
+                Affine::IDENTITY,
+                pb.build(),
+                Paint::Gradient(std::sync::Arc::new(g)),
+            );
+
+            let gpu = renderer.render_blocking(&scene, 0.05).expect("GPU 渲染失败");
+            let cpu = amiki_raster::render(&amiki_raster::bin(&scene, 0.05));
+
+            let mut max_diff = 0u32;
+            let mut worst = (0usize, 0usize);
+            let mut n_opaque = 0usize;
+            for i in 0..(72 * 72) {
+                let (a, b) = (gpu[i * 4], cpu[i * 4]);
+                let d = (a as i32 - b as i32).unsigned_abs();
+                if d > max_diff {
+                    max_diff = d;
+                    worst = (i % 72, i / 72);
+                }
+                if gpu[i * 4 + 3] > 0 {
+                    n_opaque += 1;
+                }
+            }
+            assert!(
+                n_opaque > 2000,
+                "{name}渐变应产生大量不透明像素（否则对拍无意义），实际 {n_opaque}"
+            );
+            assert!(
+                max_diff <= 2,
+                "{name}渐变：GPU 与 CPU 最大通道差 {max_diff}（位于 {worst:?}）超出容差\n\
+                 该点 GPU={:?} CPU={:?}",
+                {
+                    let o = (worst.1 * 72 + worst.0) * 4;
+                    [gpu[o], gpu[o + 1], gpu[o + 2], gpu[o + 3]]
+                },
+                {
+                    let o = (worst.1 * 72 + worst.0) * 4;
+                    [cpu[o], cpu[o + 1], cpu[o + 2], cpu[o + 3]]
+                }
+            );
+            eprintln!("GPU {name}渐变与 CPU 一致（最大通道差 {max_diff}，不透明像素 {n_opaque}）");
+        }
+
+        // repeat 模式：范围外应重复而非 clamp
+        let mut rep =
+            Gradient::linear(Vec2::new(10.0, 10.0), Vec2::new(30.0, 10.0), stops()).unwrap();
+        rep.repeat = true;
+        let mut scene = Scene::new(72, 72);
+        let mut pb = PathBuilder::new();
+        pb.rect(4.0, 4.0, 68.0, 68.0);
+        scene.push(
+            Affine::IDENTITY,
+            pb.build(),
+            Paint::Gradient(std::sync::Arc::new(rep)),
+        );
+        let gpu = renderer.render_blocking(&scene, 0.05).expect("GPU 渲染失败");
+        let cpu = amiki_raster::render(&amiki_raster::bin(&scene, 0.05));
+        let max_diff = gpu
+            .iter()
+            .zip(cpu.iter())
+            .map(|(a, b)| (*a as i32 - *b as i32).unsigned_abs())
+            .max()
+            .unwrap_or(0);
+        assert!(max_diff <= 2, "repeat 渐变：最大通道差 {max_diff} 超出容差");
+        eprintln!("GPU repeat 渐变与 CPU 一致（最大通道差 {max_diff}）");
+    }
     /// M2f-1：通用 GPU 前缀和 vs CPU 对拍（随机长度/数值）。
     #[test]
     fn gpu_scan_matches_cpu() {

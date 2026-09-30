@@ -719,6 +719,39 @@ pub fn dense_capacity(
     Ok((n_grid, n_bucket))
 }
 
+/// 引擎需要的**设备上限**。自己创建 `wgpu::Device` 的调用方**必须**用它。
+///
+/// # 为什么需要这个函数（dogfooding 抓到的真问题）
+///
+/// 引擎的 `amiki_fine_bgl` 有 **9 个 storage buffer**（第 9 个是图像放置参数），
+/// 而 `wgpu::Limits::default()` 只保证 **8** 个（WebGPU 基线）。
+///
+/// `GpuRenderer::new()` 会按适配器能力上调这个上限，但**自己建设备的调用方
+/// 不会** —— 那样会在 `create_bind_group_layout` 里抛出 wgpu 校验错误：
+///
+/// ```text
+/// In Device::create_bind_group_layout, label = 'amiki_fine_bgl'
+///   Too many bindings of type StorageBuffers in Stage COMPUTE, limit is 8, count was 9
+/// ```
+///
+/// 这个错误**深在 wgpu 内部**，调用方几乎无法从消息定位到"我该改 limits"。
+/// 窗口示例（`window_demo`）就踩了这个坑，而且因为示例不在测试覆盖里，
+/// **一直没被发现** —— 它是靠 dogfooding（真去跑那个应用）才暴露的。
+///
+/// 所以现在有两道防线：
+/// 1. 本函数给出正确的上限，调用方直接用它请求设备；
+/// 2. [`GpuRenderer::from_device`] **校验**传入的设备并**显式报错**，
+///    不再把问题留给 wgpu 深处的校验失败。
+pub fn required_limits() -> wgpu::Limits {
+    wgpu::Limits {
+        max_storage_buffers_per_shader_stage: REQUIRED_STORAGE_BUFFERS,
+        ..wgpu::Limits::default()
+    }
+}
+
+/// 引擎在单个着色阶段里需要的 storage buffer 数量（见 [`required_limits`]）。
+pub const REQUIRED_STORAGE_BUFFERS: u32 = 9;
+
 impl GpuRenderer {
     /// 独立初始化（无窗口）。
     pub async fn new() -> Result<GpuRenderer, RenderError> {
@@ -794,7 +827,7 @@ impl GpuRenderer {
         // 因此**按适配器能力上调**该上限，并在适配器不支持时明确报错，
         // 而不是让 create_bind_group 在运行时抛出一句难以定位的校验失败。
         let adapter_limits = adapter.limits();
-        let want_sb = 9u32;
+        let want_sb = REQUIRED_STORAGE_BUFFERS;
         if adapter_limits.max_storage_buffers_per_shader_stage < want_sb {
             return err(format!(
                 "适配器仅支持 {} 个 storage buffer/阶段，图像绘制需要 {want_sb} 个；\
@@ -802,10 +835,7 @@ impl GpuRenderer {
                 adapter_limits.max_storage_buffers_per_shader_stage
             ));
         }
-        let limits = wgpu::Limits {
-            max_storage_buffers_per_shader_stage: want_sb,
-            ..wgpu::Limits::default()
-        };
+        let limits = required_limits();
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("amiki2d"),
@@ -827,6 +857,19 @@ impl GpuRenderer {
         device: wgpu::Device,
         queue: wgpu::Queue,
     ) -> Result<GpuRenderer, RenderError> {
+        // **先校验设备上限，再动任何资源。** 否则失败会发生在
+        // `create_bind_group_layout` 内部，报一句调用方无法定位的
+        // wgpu 校验错误（窗口示例正是这样一直跑不起来的）。
+        let d_limits = device.limits();
+        if d_limits.max_storage_buffers_per_shader_stage < REQUIRED_STORAGE_BUFFERS {
+            return err(format!(
+                "传入的设备只支持 {} 个 storage buffer/阶段，引擎需要 {} 个。\
+                 请用 `amiki_gpu::required_limits()` 构造 `DeviceDescriptor::required_limits` \
+                 （或用 `GpuRenderer::new()` 让它自己请求）；\
+                 也可改用 CPU 引擎（amiki_raster）",
+                d_limits.max_storage_buffers_per_shader_stage, REQUIRED_STORAGE_BUFFERS
+            ));
+        }
         let fine_mod = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("amiki_fine"),
             source: wgpu::ShaderSource::Wgsl(format!("{FINE_MATH_WGSL}\n{FINE_WGSL}").into()),

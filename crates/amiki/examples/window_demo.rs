@@ -11,7 +11,7 @@ use amiki::scene::{edit_damage, BlendMode, Damage, Paint, PathBuilder};
 use amiki::Canvas;
 use std::time::Instant;
 use winit::application::ApplicationHandler;
-use winit::event::{ElementState, WindowEvent};
+use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Window, WindowId};
@@ -34,6 +34,11 @@ struct FrameState {
     /// 用 `RefCell`：`build_scene` 是 `&self`，而缓存的填充需要内部可变性。
     font: Option<amiki_text::Font>,
     text_cache: std::cell::RefCell<OutlineCache>,
+    /// dogfooding 列表视图的状态
+    show_list: bool,
+    scroll: f32,
+    selected: Option<usize>,
+    cursor: Vec2,
 }
 
 /// 字形轮廓缓存：`glyph id → 轮廓`。
@@ -78,7 +83,11 @@ impl FrameState {
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("amiki2d"),
             required_features: wgpu::Features::empty(),
-            required_limits: wgpu::Limits::default(),
+            // **必须用引擎给的上限**：`Limits::default()` 只保证 8 个 storage
+            // buffer/阶段，而引擎需要 9 个（第 9 个是图像放置参数）。
+            // 这里曾经写成 `Limits::default()`，于是示例一启动就 panic ——
+            // 而且因为示例不在测试覆盖里，一直没被发现（dogfooding 才跑出来）。
+            required_limits: amiki::gpu::required_limits(),
             memory_hints: wgpu::MemoryHints::default(),
             trace: wgpu::Trace::Off,
         }))
@@ -134,6 +143,122 @@ impl FrameState {
             last_dirty_ratio: 1.0,
             font,
             text_cache: std::cell::RefCell::new(OutlineCache::default()),
+            // 默认进**应用视图**（列表）；展示页用 Tab 切换。
+            show_list: true,
+            scroll: 0.0,
+            selected: None,
+            cursor: Vec2::ZERO,
+        }
+    }
+
+    /// **dogfooding：一个真实的应用视图** —— 可滚动、可点击选中的长列表。
+    ///
+    /// 这一页的存在意义不是"再画点东西"，而是**用引擎真的做一个应用**，
+    /// 从而暴露示例画面覆盖不到的问题。它同时压到了三条主线：
+    ///
+    /// - **文字**：每行一段 shaping（M5）；
+    /// - **增量**：改一行只脏那一行，滚动才脏一大片（M4）；
+    /// - **内容规模**：200 行只画可见的那些（与稀疏分箱同源的思想）。
+    fn build_list(&self) -> amiki::scene::Scene {
+        const ROW_H: f32 = 30.0;
+        const ROWS: usize = 200;
+        const HEADER: f32 = 44.0;
+
+        let w = self.surface_cfg.width as f32;
+        let h = self.surface_cfg.height as f32;
+        let mut canvas = Canvas::new(self.surface_cfg.width, self.surface_cfg.height);
+        canvas.rect(0.0, 0.0, w, h, Paint::Solid(INK));
+
+        // 只画可见行：内容再多，绘制量也只与**窗口高度**有关。
+        let first = (self.scroll / ROW_H).floor().max(0.0) as usize;
+        let last = (((self.scroll + h) / ROW_H).ceil() as usize).min(ROWS);
+        for i in first..last {
+            let y = HEADER + i as f32 * ROW_H - self.scroll;
+            if y > h || y + ROW_H < 0.0 {
+                continue;
+            }
+            let sel = self.selected == Some(i);
+            let bg = if sel {
+                Color::rgba8(41, 128, 185, 255)
+            } else if i % 2 == 0 {
+                Color::rgba8(28, 34, 40, 255)
+            } else {
+                Color::rgba8(22, 27, 32, 255)
+            };
+            canvas.rect(0.0, y, w, y + ROW_H - 1.0, Paint::Solid(bg));
+            // 左侧色条：颜色按行号变化，滚动时一眼能看出是否对齐
+            let hue = (i as f32) / ROWS as f32;
+            canvas.rect(
+                12.0,
+                y + 6.0,
+                22.0,
+                y + ROW_H - 7.0,
+                Paint::Solid(Color { r: 0.2 + 0.7 * hue, g: 0.7 - 0.4 * hue, b: 0.9 - 0.5 * hue, a: 1.0 }),
+            );
+            if let Some(font) = self.font.as_ref() {
+                let label = format!("第 {i} 行 · Amiki2D dogfooding");
+                if let Ok(run) = amiki_text::shape(font, &label, 15.0) {
+                    canvas.text(
+                        &run,
+                        Vec2::new(34.0, y + 20.0),
+                        Paint::Solid(if sel {
+                            Color::rgba8(250, 250, 250, 255)
+                        } else {
+                            Color::rgba8(200, 208, 214, 255)
+                        }),
+                        |id| self.text_cache.borrow_mut().get_or_insert(font, id),
+                    );
+                }
+            }
+        }
+
+        // 固定表头：**不随滚动移动**，于是滚动时它是唯一"每帧相同"的部分，
+        // 增量渲染会把它排除在脏区之外。
+        canvas.rect(0.0, 0.0, w, HEADER, Paint::Solid(Color::rgba8(12, 15, 18, 255)));
+        if let Some(font) = self.font.as_ref() {
+            let label = format!(
+                "Amiki2D 列表 · {ROWS} 行 · 滚动 {:.0} · Tab 切换视图 · 滚轮/↑↓ 滚动 · 点击选中",
+                self.scroll
+            );
+            if let Ok(run) = amiki_text::shape(font, &label, 15.0) {
+                canvas.text(
+                    &run,
+                    Vec2::new(16.0, 28.0),
+                    Paint::Solid(Color::rgba8(236, 240, 241, 255)),
+                    |id| self.text_cache.borrow_mut().get_or_insert(font, id),
+                );
+            }
+        }
+        canvas.scene
+    }
+
+    /// 列表的滚动上限（内容高度超出窗口的部分）。
+    fn max_scroll(&self) -> f32 {
+        const ROW_H: f32 = 30.0;
+        const ROWS: usize = 200;
+        const HEADER: f32 = 44.0;
+        (ROWS as f32 * ROW_H + HEADER - self.surface_cfg.height as f32).max(0.0)
+    }
+
+    fn scroll_by(&mut self, dy: f32) {
+        let m = self.max_scroll();
+        self.scroll = (self.scroll - dy).clamp(0.0, m);
+    }
+
+    /// 把窗口坐标换算成列表行号（考虑滚动与表头）。
+    fn row_at(&self, p: Vec2) -> Option<usize> {
+        const ROW_H: f32 = 30.0;
+        const ROWS: usize = 200;
+        const HEADER: f32 = 44.0;
+        if p.y < HEADER {
+            return None;
+        }
+        let idx = ((p.y + self.scroll - HEADER) / ROW_H).floor();
+        if idx < 0.0 {
+            None
+        } else {
+            let i = idx as usize;
+            (i < ROWS).then_some(i)
         }
     }
 
@@ -271,7 +396,7 @@ impl FrameState {
         // 场景每帧重建，但**静态部分**（背景、圆环、混合模式画廊）每帧构造结果相同，
         // 于是 `edit_damage` 只会把真正在动的那几个元素标脏 —— 这就是增量的收益来源。
         let t_frame = Instant::now();
-        let scene = self.build_scene(t);
+        let scene = if self.show_list { self.build_list() } else { self.build_scene(t) };
         let damage = match &self.prev_scene {
             Some(prev) => edit_damage(prev, &scene),
             None => Damage::new(scene.width, scene.height), // 首帧全脏
@@ -311,9 +436,14 @@ impl FrameState {
         // M4 收益可视化：帧耗时 + 脏 tile 占比。
         // 静态内容占比越高、动的元素越少，脏区占比就越小 —— 这就是增量渲染省下的工作。
         self.window.set_title(&format!(
-            "Amiki2D — 增量渲染 {:.2} ms/帧 · 脏 tile {:.1}%（M4 damage region）",
+            "Amiki2D [{}] — {:.2} ms/帧 · 脏 tile {:.1}%{}（M4 damage region）",
+            if self.show_list { "列表" } else { "展示" },
             self.last_ms,
-            self.last_dirty_ratio * 100.0
+            self.last_dirty_ratio * 100.0,
+            match self.selected {
+                Some(i) => format!(" · 选中第 {i} 行 · 滚动 {:.0}", self.scroll),
+                None => format!(" · 滚动 {:.0}", self.scroll),
+            }
         ));
     }
 }
@@ -333,10 +463,36 @@ impl ApplicationHandler for App {
         match event {
             WindowEvent::CloseRequested => el.exit(),
             WindowEvent::KeyboardInput { event, .. } => {
-                if event.state == ElementState::Pressed
-                    && event.physical_key == PhysicalKey::Code(KeyCode::Escape)
-                {
-                    el.exit();
+                if event.state == ElementState::Pressed {
+                    match event.physical_key {
+                        PhysicalKey::Code(KeyCode::Escape) => el.exit(),
+                        PhysicalKey::Code(KeyCode::Tab) => state.show_list = !state.show_list,
+                        PhysicalKey::Code(KeyCode::ArrowDown) => state.scroll_by(-60.0),
+                        PhysicalKey::Code(KeyCode::ArrowUp) => state.scroll_by(60.0),
+                        _ => {}
+                    }
+                }
+            }
+            // ---- dogfooding：应用交互 ----
+            WindowEvent::CursorMoved { position, .. } => {
+                state.cursor = Vec2::new(position.x as f32, position.y as f32);
+            }
+            WindowEvent::MouseWheel { delta, .. } => {
+                let dy = match delta {
+                    MouseScrollDelta::LineDelta(_, y) => y * 40.0,
+                    MouseScrollDelta::PixelDelta(p) => p.y as f32,
+                };
+                state.scroll_by(dy);
+            }
+            WindowEvent::MouseInput { state: bs, button, .. } => {
+                if bs == ElementState::Pressed && button == MouseButton::Left && state.show_list {
+                    // 命中测试 → 切换选中。**只改一行**，因此脏区只有那一行 ——
+                    // 这正是增量渲染要展示的效果。
+                    match state.row_at(state.cursor) {
+                        Some(i) if state.selected == Some(i) => state.selected = None,
+                        Some(i) => state.selected = Some(i),
+                        None => {}
+                    }
                 }
             }
             WindowEvent::Resized(size) => {

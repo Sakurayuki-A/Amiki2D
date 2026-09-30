@@ -1,0 +1,61 @@
+P3 dogfooding：把窗口示例做成真的应用 —— 并立刻抓到"示例一直跑不起来"
+
+## 做了什么
+
+`window_demo` 原本是个**展示页**（动画 + 混合模式画廊 + 文字），没有滚动、
+没有鼠标交互。dogfooding 要的是"用引擎真的做一个应用"，所以加了一页
+**可滚动、可点击选中的 200 行长列表**，默认进入，Tab 切回展示页：
+
+- **滚动**：滚轮（LineDelta / PixelDelta 都处理）+ ↑↓ 方向键，带边界钳制
+- **交互**：左键点击命中行 → 切换选中（再点取消）；命中测试考虑滚动与固定表头
+- **文字**：每行一段 shaping
+- **只画可见行**：绘制量只与窗口高度有关，与 200 行的内容规模无关
+- **固定表头**：滚动时它是唯一"每帧相同"的部分，增量渲染会把它排除在脏区外
+
+窗口标题扩为 `[列表|展示] · ms/帧 · 脏 tile % · 滚动位置[ · 选中第 N 行]`，
+一眼能看出增量收益（静态时**脏 tile 0.0%**）。
+
+## 立刻抓到的真问题：窗口示例**从来就跑不起来**
+
+第一次真去跑它，启动即 panic：
+
+```
+In Device::create_bind_group_layout, label = 'amiki_fine_bgl'
+  Too many bindings of type StorageBuffers in Stage COMPUTE, limit is 8, count was 9.
+  Check the limit `max_storage_buffers_per_shader_stage` passed to `request_device`
+```
+
+根因是两处叠加：
+
+1. 引擎的 `amiki_fine_bgl` 有 **9 个 storage buffer**（第 9 个是图像放置参数），
+   而 `wgpu::Limits::default()` 只保证 **8** 个（WebGPU 基线）；
+2. `GpuRenderer::new()` 会按适配器能力上调该上限并**检查**，
+   但 `GpuRenderer::from_device()` **不检查** —— 而示例走的正是 `from_device`
+   （它自己建 window surface，所以自己建了 device）。
+
+示例不在测试覆盖里，所以**一直没被发现**。这正是 dogfooding 的价值：
+单元测试测的是"引擎在被正确使用时的行为"，测不出"文档/示例教人怎么用"是不是错的。
+
+### 修法（两层防线）
+
+1. **新增 `amiki_gpu::required_limits()`**（与 `REQUIRED_STORAGE_BUFFERS = 9`）——
+   自己建设备的调用方直接用它，函数文档把上面那条报错原样写进去，
+   让搜索报错的人能搜到这里；
+2. **`from_device` 先校验设备上限再动任何资源**，不满足就返回**明确的中文错误**
+   （指明用 `required_limits()` 或用 `GpuRenderer::new()`，或改用 CPU 引擎），
+   而不是把问题留给 wgpu 深处的校验失败。
+
+示例改用 `required_limits()` 后**正常启动并持续渲染**（实测运行 10 秒不崩、
+累计 CPU 1.89 s）。
+
+## 还做了一次截图验证
+
+用 `CopyFromScreen` 把运行中的窗口截下来看过：表头文字、140–162 行、
+左侧渐变色条、隔行底色都正确，标题显示 **脏 tile 0.0%**。
+
+> 中途有一次看到标题里 `滚动 2120`，怀疑"应用会自己滚"。
+> 加了无条件事件打印后复跑：**stderr 一条事件都没有、滚动为 0** ——
+> 那次是环境真的送来了滚轮事件。**结论：不是代码问题。**
+> 值得记的是：**加个打印比继续猜快得多。**
+
+门禁：145 测试全绿 / clippy 零警告

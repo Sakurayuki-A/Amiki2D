@@ -7,7 +7,7 @@
 use amiki::color::*;
 use amiki::gpu::{Blitter, GpuRenderer};
 use amiki::math::Vec2;
-use amiki::scene::{BlendMode, Paint, PathBuilder};
+use amiki::scene::{edit_damage, BlendMode, Damage, Paint, PathBuilder};
 use amiki::Canvas;
 use std::time::Instant;
 use winit::application::ApplicationHandler;
@@ -25,6 +25,11 @@ struct FrameState {
     scene_tex: Option<(wgpu::Texture, wgpu::TextureView)>,
     scene_size: (u32, u32),
     start: Instant,
+    /// M4：上一帧的场景，用于推导脏区（`edit_damage` 做差分）
+    prev_scene: Option<amiki::scene::Scene>,
+    /// 最近一帧的耗时（ms）与脏 tile 占比，写进标题便于观察 M4 收益
+    last_ms: f64,
+    last_dirty_ratio: f64,
 }
 
 impl FrameState {
@@ -84,6 +89,9 @@ impl FrameState {
             scene_tex: None,
             scene_size: (0, 0),
             start: Instant::now(),
+            prev_scene: None,
+            last_ms: 0.0,
+            last_dirty_ratio: 1.0,
         }
     }
 
@@ -200,13 +208,32 @@ impl FrameState {
             self.scene_size = (w, h);
         }
 
-        // 每帧：构建场景 → prepare（分箱 + clip 覆盖率）→ GPU 计算着色器 → blit
+        // M4：只重画改动过的区域。
+        // 场景每帧重建，但**静态部分**（背景、圆环、混合模式画廊）每帧构造结果相同，
+        // 于是 `edit_damage` 只会把真正在动的那几个元素标脏 —— 这就是增量的收益来源。
+        let t_frame = Instant::now();
         let scene = self.build_scene(t);
+        let damage = match &self.prev_scene {
+            Some(prev) => edit_damage(prev, &scene),
+            None => Damage::new(scene.width, scene.height), // 首帧全脏
+        };
+        self.last_dirty_ratio = damage.tile_count() as f64 / damage.total_tiles().max(1) as f64;
+
         let frame = self.renderer.prepare(&scene, 0.1).expect("prepare 失败");
         let scene_tex = self.scene_tex.as_ref().expect("场景纹理未初始化");
-        self.renderer
-            .render_into(&scene_tex.0, &frame)
+        let skipped = self
+            .renderer
+            .render_into_persistent(&scene_tex.0, &frame, Some(&damage))
             .expect("GPU 渲染失败");
+        if skipped {
+            // 无脏区：连一帧 GPU 工作都不做（静态界面即此情形）
+            self.last_ms = 0.0;
+        } else {
+            // 等待本帧 GPU 完成，使标题里的耗时是真实帧成本而非排队时间
+            let _ = self.renderer.device.poll(wgpu::PollType::Wait);
+            self.last_ms = t_frame.elapsed().as_secs_f64() * 1000.0;
+        }
+        self.prev_scene = Some(scene);
 
         let surface_tex = self
             .surface
@@ -221,6 +248,14 @@ impl FrameState {
         }
         self.renderer.queue.submit(Some(encoder.finish()));
         surface_tex.present();
+
+        // M4 收益可视化：帧耗时 + 脏 tile 占比。
+        // 静态内容占比越高、动的元素越少，脏区占比就越小 —— 这就是增量渲染省下的工作。
+        self.window.set_title(&format!(
+            "Amiki2D — 增量渲染 {:.2} ms/帧 · 脏 tile {:.1}%（M4 damage region）",
+            self.last_ms,
+            self.last_dirty_ratio * 100.0
+        ));
     }
 }
 

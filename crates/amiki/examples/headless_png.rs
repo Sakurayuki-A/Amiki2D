@@ -104,6 +104,81 @@ fn build_scene(t: f32) -> amiki::scene::Scene {
 
 fn main() {
     std::fs::create_dir_all("out").ok();
+
+    // ── M4：增量渲染收益的实测（静态内容 + 少量动元素 是 UI 的典型形态）──
+    // 同一场景按动画参数推进，逐帧用 edit_damage 推导脏区，统计实际需要重画的 tile 占比。
+    {
+        use amiki::scene::{edit_damage, Damage};
+        let mut prev: Option<amiki::scene::Scene> = None;
+        let mut total_dirty = 0u64;
+        let mut total_all = 0u64;
+        let mut frames = 0u32;
+        let steps = 30;
+        for i in 0..=steps {
+            let scene = build_scene(i as f32 / steps as f32 * 2.0);
+            let d = match &prev {
+                Some(p) => edit_damage(p, &scene),
+                None => Damage::new(scene.width, scene.height),
+            };
+            total_dirty += d.tile_count() as u64;
+            total_all += d.total_tiles() as u64;
+            frames += 1;
+            prev = Some(scene);
+        }
+        let ratio = total_dirty as f64 / total_all.max(1) as f64;
+        println!(
+            "M4 增量渲染（全屏动画场景）：{frames} 帧平均重画 {:.1}% 的 tile（省下 {:.1}%）",
+            ratio * 100.0,
+            (1.0 - ratio) * 100.0
+        );
+    }
+
+    // ── M4 真正的目标场景：静态界面 + 少量元素变动（UI / 图表 / 文档的典型形态）──
+    {
+        use amiki::scene::{edit_damage, Damage};
+        let (w, h) = (1280u32, 720u32);
+        let mut prev: Option<amiki::scene::Scene> = None;
+        let mut total_dirty = 0u64;
+        let mut total_all = 0u64;
+        for i in 0..=30u32 {
+            let mut c = amiki::Canvas::new(w, h);
+            // 静态：背景 + 侧栏 + 两张面板 + 一行分隔线
+            c.rect(0.0, 0.0, w as f32, h as f32, Paint::Solid(INK));
+            c.rect(0.0, 0.0, 220.0, h as f32, Paint::Solid(amiki::scene::Color::rgb8(28, 34, 42)));
+            c.rect(248.0, 64.0, 616.0, 400.0, Paint::Solid(amiki::scene::Color::rgb8(38, 46, 56)));
+            c.rect(648.0, 64.0, 1240.0, 400.0, Paint::Solid(amiki::scene::Color::rgb8(38, 46, 56)));
+            c.rect(248.0, 440.0, 1240.0, 444.0, Paint::Solid(amiki::scene::Color::rgb8(60, 70, 84)));
+            // 侧栏 12 个静态条目
+            for k in 0..12 {
+                let y = 90.0 + k as f32 * 34.0;
+                c.rect(24.0, y, 196.0, y + 22.0, Paint::Solid(amiki::scene::Color::rgb8(44, 52, 64)));
+            }
+            // 静态折线图骨架
+            for k in 0..24 {
+                let x = 268.0 + k as f32 * 14.0;
+                c.rect(x, 340.0, x + 8.0, 392.0, Paint::Solid(amiki::scene::Color::rgb8(52, 62, 76)));
+            }
+            // 唯一在动的东西：一个进度点沿图表滑动（约 26×26 px）
+            let px = 270.0 + (i as f32 / 30.0) * 320.0;
+            c.circle(Vec2::new(px, 300.0), 13.0, Paint::Solid(ORANGE));
+
+            let scene = c.scene;
+            let d = match &prev {
+                Some(p) => edit_damage(p, &scene),
+                None => Damage::new(scene.width, scene.height),
+            };
+            total_dirty += d.tile_count() as u64;
+            total_all += d.total_tiles() as u64;
+            prev = Some(scene);
+        }
+        let ratio = total_dirty as f64 / total_all.max(1) as f64;
+        println!(
+            "M4 增量渲染（静态界面场景）：31 帧平均重画 {:.1}% 的 tile（省下 {:.1}%）← 这才是 damage region 的目标场景",
+            ratio * 100.0,
+            (1.0 - ratio) * 100.0
+        );
+    }
+
     let t0 = Instant::now();
     let scene = build_scene(0.7);
     let binned = raster::bin(&scene, 0.1);

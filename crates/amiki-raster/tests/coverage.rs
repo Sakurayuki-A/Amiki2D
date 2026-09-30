@@ -4,9 +4,9 @@
 //! 计数 x_cross > x 的穿越，delta = sign(dy)），覆盖 = mean([W ≠ 0])。
 //! 解析算法与之独立推导，二者一致即互证正确。
 
-use amiki_raster::{bin, flatten_draw, render};
+use amiki_raster::{bin, flatten_draw, render, render_damage};
 use amiki_math::{Affine, Vec2};
-use amiki_scene::{Color, Paint, PathBuilder, Scene};
+use amiki_scene::{Color, Damage, Paint, PathBuilder, Scene};
 
 const SS: u32 = 16; // 超采样率（顶点行量化误差 ~2/SS）
 
@@ -298,8 +298,7 @@ fn nested_clips_intersect() {
 }
 
 #[test]
-fn stream_round_trip_renders_identically() {
-    // M2c：编码→解码→渲染 必须与原场景逐字节一致
+fn stream_round_trip_renders_identically() {    // M2c：编码→解码→渲染 必须与原场景逐字节一致
     let mut scene = Scene::new(72, 72);
     let mut pb = PathBuilder::new();
     pb.rect(0.0, 0.0, 72.0, 72.0);
@@ -321,4 +320,132 @@ fn stream_round_trip_renders_identically() {
     let img_a = render(&bin(&scene, 0.05));
     let img_b = render(&bin(&back, 0.05));
     assert_eq!(img_a, img_b, "编码往返后渲染不一致");
+}
+
+// ============================================================================
+// M4：damage region 增量渲染的正确性铁律
+// ============================================================================
+
+/// 覆盖各类 tile 边界的场景（矩形 / 曲线+洞 / 自相交 / 越界 / 裁剪+混合）。
+fn damage_scene() -> Scene {
+    let mut scene = Scene::new(96, 96);
+    let mut pb = PathBuilder::new();
+    pb.rect(0.0, 0.0, 96.0, 96.0);
+    scene.push(Affine::IDENTITY, pb.build(), solid(Color::rgb8(240, 220, 200)));
+
+    let mut pb = PathBuilder::new();
+    pb.circle(Vec2::new(30.0, 30.0), 22.0, false);
+    pb.circle(Vec2::new(30.0, 30.0), 10.0, true);
+    scene.push(Affine::IDENTITY, pb.build(), solid(Color::rgba8(30, 160, 90, 220)));
+
+    let mut pb = PathBuilder::new();
+    pb.pentagram(Vec2::new(64.0, 64.0), 28.0);
+    scene.push_blend(
+        Affine::IDENTITY,
+        pb.build(),
+        solid(Color::rgba8(230, 120, 60, 200)),
+        amiki_scene::BlendMode::Multiply,
+    );
+
+    // 越出画布四缘（tile 钳制路径）
+    let mut pb = PathBuilder::new();
+    pb.rect(-20.0, 40.0, 20.0, 70.0);
+    scene.push(Affine::IDENTITY, pb.build(), solid(Color::rgb8(52, 152, 219)));
+
+    // 裁剪 + 旋转（斜边跨带）
+    let mut pb = PathBuilder::new();
+    pb.rect(10.0, 10.0, 86.0, 60.0);
+    let clip = scene.push_clip(Affine::rotate(0.2), pb.build());
+    let mut pb = PathBuilder::new();
+    pb.circle(Vec2::new(48.0, 48.0), 30.0, false);
+    scene.push(Affine::IDENTITY, pb.build(), solid(Color::rgba8(200, 60, 140, 200)));
+    scene.draws.last_mut().unwrap().clips = vec![clip];
+
+    scene
+}
+
+/// 种子化 LCG（测试可复现，不引入 rand 依赖）。
+struct Lcg(u64);
+impl Lcg {
+    fn next_u32(&mut self) -> u32 {
+        self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        (self.0 >> 33) as u32
+    }
+}
+
+/// **INV-3**：任意 invalidate 序列下，增量渲染必须与全量渲染**逐字节一致**。
+///
+/// 为什么必须用**随机序列**而不是几个样例：damage region 最典型的 bug 是
+/// "特定序列下才错"（例如某次并集恰好没覆盖到某个像素所在的 tile）。
+/// 样例测试抓不住这类漏覆盖，随机化 + 多轮才能。
+#[test]
+fn damage_incremental_matches_full_random_sequences() {
+    let scene = damage_scene();
+    let binned = bin(&scene, 0.05);
+    // 参考：全量渲染（唯一真值）
+    let full = render(&binned);
+    let (w, h) = (scene.width, scene.height);
+    assert_eq!(full.len(), (w * h * 4) as usize);
+
+    let mut rng = Lcg(0xDEAD_BEEF_1234_5678);
+    let mut worst_tiles = 0u32;
+    for round in 0..200 {
+        let mut damage = Damage::new(w, h);
+        damage.clear(); // 进入增量模式（无脏区）
+        // 每次 1..=6 个随机矩形，可能重叠、可能越界、可能退化
+        let n_rects = 1 + (rng.next_u32() % 6);
+        for _ in 0..n_rects {
+            let x0 = (rng.next_u32() % (w + 40)) as f32 - 20.0;
+            let y0 = (rng.next_u32() % (h + 40)) as f32 - 20.0;
+            let rw = (rng.next_u32() % 40) as f32;
+            let rh = (rng.next_u32() % 40) as f32;
+            damage.invalidate_rect(x0, y0, x0 + rw, y0 + rh);
+        }
+        worst_tiles = worst_tiles.max(damage.tile_count());
+
+        // 增量：起点取全量结果（模拟"上一帧已经是对的"）
+        let mut img = full.clone();
+        render_damage(&binned, &mut img, &damage);
+
+        assert_eq!(
+            img, full,
+            "第 {round} 轮：增量渲染与全量不一致（脏 tile {} 个）—— 存在漏覆盖",
+            damage.tile_count()
+        );
+    }
+    assert!(worst_tiles > 0, "随机序列应至少产生过脏 tile，否则测试没有判别力");
+    eprintln!("200 轮随机 invalidate 序列全部与全量逐字节一致（最大脏 tile {worst_tiles}）");
+}
+
+/// 边界情形：无脏区时必须**完全跳过**（结果 = 传入的上一帧缓冲原样）。
+#[test]
+fn damage_empty_skips_everything() {
+    let scene = damage_scene();
+    let binned = bin(&scene, 0.05);
+    let full = render(&binned);
+    let (w, h) = (scene.width, scene.height);
+
+    let mut damage = Damage::new(w, h);
+    damage.clear();
+    assert!(damage.is_empty());
+
+    // 故意传入"被污染的"缓冲：若无脏区却有任何写入，断言会立刻失败
+    let mut img = vec![7u8; full.len()];
+    render_damage(&binned, &mut img, &damage);
+    assert!(img.iter().all(|&b| b == 7), "无脏区时不得写入任何像素");
+}
+
+/// 全脏时必须与全量渲染等价（`Damage::new` 的默认态）。
+#[test]
+fn damage_full_equals_full_render() {
+    let scene = damage_scene();
+    let binned = bin(&scene, 0.05);
+    let full = render(&binned);
+    let (w, h) = (scene.width, scene.height);
+
+    let damage = Damage::new(w, h);
+    assert!(damage.is_full());
+    let mut img = vec![0u8; full.len()];
+    render_damage(&binned, &mut img, &damage);
+    assert_eq!(img, full, "全脏渲染必须等于全量渲染");
 }

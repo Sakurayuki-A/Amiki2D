@@ -572,58 +572,118 @@ pub fn composite(dst: [f32; 4], src: [f32; 4], src_a: f32, mode: u32) -> [f32; 4
     [out_rgb[0], out_rgb[1], out_rgb[2], ao]
 }
 
-/// CPU 光栅化：输出直线 RGBA8（未预乘）。
-pub fn render(binned: &BinnedScene) -> Vec<u8> {
+/// 渲染单个 tile 到 `img`（tile 内逐像素解析覆盖率 + 画家序合成）。
+///
+/// M4：全量 `render` 与增量 `render_damage` **共用**此函数——增量路径绝不复制
+/// 一份着色数学，否则两条路径会漂移（这正是本项目历史上踩过的坑）。
+fn shade_tile(binned: &BinnedScene, img: &mut [u8], tx: usize, ty: usize) {
     let w = binned.width as usize;
     let h = binned.height as usize;
-    let mut img = vec![0u8; w * h * 4];
     let tiles_x = binned.tiles_x as usize;
-
-    for ty in 0..binned.tiles_y as usize {
-        let y0 = ty * TILE_USIZE;
-        let y1 = (y0 + TILE_USIZE).min(h);
-        for tx in 0..tiles_x {
-            let off = binned.tile_draw_offsets[ty * tiles_x + tx];
-            if off[1] == 0 {
-                continue;
-            }
-            let x0 = tx * TILE_USIZE;
-            let x1 = (x0 + TILE_USIZE).min(w);
-            for py in y0..y1 {
-                let row = py % TILE_USIZE;
-                for px in x0..x1 {
-                    let cx = px as f32 + 0.5;
-                    let cy = py as f32 + 0.5;
-                    let mut col = [0.0f32; 4];
-                    for mi in off[0]..off[0] + off[1] {
-                        let m = binned.tile_draw_meta[mi as usize];
-                        let rl = binned.row_lists[m[1] as usize + row];
-                        let mut area = binned.carries[m[2] as usize + row];
-                        for k in 0..rl[1] {
-                            let seg = binned.segments[binned.seg_refs[(rl[0] + k) as usize] as usize];
-                            area += seg_area(seg[0], seg[1], seg[2], seg[3], cx, cy);
-                        }
-                        let mut a = area.abs().min(1.0);
-                        let nclip = ((m[3] >> 8) & 0xF) as usize;
-                        if nclip > 0 && a > 0.0 {
-                            let pix = py * w + px;
-                            let clips = &binned.draw_clips[m[0] as usize];
-                            for &clip_idx in &clips[..nclip] {
-                                a *= binned.clip_maps[clip_idx as usize][pix] as f32 / 255.0;
-                            }
-                        }
-                        if a > 0.0 {
-                            let c = binned.colors[m[0] as usize];
-                            col = composite(col, c, c[3] * a, m[3] & 0xFF);
-                        }
-                    }
-                    let o = (py * w + px) * 4;
-                    for k in 0..4 {
-                        img[o + k] = (col[k] * 255.0 + 0.5).clamp(0.0, 255.0) as u8;
+    let off = binned.tile_draw_offsets[ty * tiles_x + tx];
+    if off[1] == 0 {
+        return; // 本 tile 无任何绘制：保留 img 原值（增量路径即"不触碰"）
+    }
+    let x0 = tx * TILE_USIZE;
+    let x1 = (x0 + TILE_USIZE).min(w);
+    let y0 = ty * TILE_USIZE;
+    let y1 = (y0 + TILE_USIZE).min(h);
+    for py in y0..y1 {
+        let row = py % TILE_USIZE;
+        for px in x0..x1 {
+            let cx = px as f32 + 0.5;
+            let cy = py as f32 + 0.5;
+            let mut col = [0.0f32; 4];
+            for mi in off[0]..off[0] + off[1] {
+                let m = binned.tile_draw_meta[mi as usize];
+                let rl = binned.row_lists[m[1] as usize + row];
+                let mut area = binned.carries[m[2] as usize + row];
+                for k in 0..rl[1] {
+                    let seg = binned.segments[binned.seg_refs[(rl[0] + k) as usize] as usize];
+                    area += seg_area(seg[0], seg[1], seg[2], seg[3], cx, cy);
+                }
+                let mut a = area.abs().min(1.0);
+                let nclip = ((m[3] >> 8) & 0xF) as usize;
+                if nclip > 0 && a > 0.0 {
+                    let pix = py * w + px;
+                    let clips = &binned.draw_clips[m[0] as usize];
+                    for &clip_idx in &clips[..nclip] {
+                        a *= binned.clip_maps[clip_idx as usize][pix] as f32 / 255.0;
                     }
                 }
+                if a > 0.0 {
+                    let c = binned.colors[m[0] as usize];
+                    col = composite(col, c, c[3] * a, m[3] & 0xFF);
+                }
+            }
+            let o = (py * w + px) * 4;
+            for k in 0..4 {
+                img[o + k] = (col[k] * 255.0 + 0.5).clamp(0.0, 255.0) as u8;
             }
         }
     }
+}
+
+/// CPU 光栅化：输出直线 RGBA8（未预乘）。
+pub fn render(binned: &BinnedScene) -> Vec<u8> {
+    assert_eq!(
+        TILE,
+        amiki_scene::DAMAGE_TILE,
+        "分箱 tile 尺寸与 damage 的 tile 尺寸必须一致，否则增量渲染会与全量不一致"
+    );
+    let w = binned.width as usize;
+    let h = binned.height as usize;
+    let mut img = vec![0u8; w * h * 4];
+    for ty in 0..binned.tiles_y as usize {
+        for tx in 0..binned.tiles_x as usize {
+            shade_tile(binned, &mut img, tx, ty);
+        }
+    }
     img
+}
+
+/// M4 **增量渲染**：只重算与脏区相交的 tile，其余保留 `img` 原有像素。
+///
+/// 语义契约（这是 damage region 的正确性铁律）：
+///
+/// ```text
+/// 任意 invalidate 序列下，render_damage(.., damage) 的结果
+/// 必须与 render(..) 全量渲染【逐字节一致】
+/// ```
+///
+/// 成立的理由：
+/// - 脏区经 `Damage::tiles()` 已**向外扩到 tile 边界**，故任何被改动的像素都在
+///   被重算的 tile 内；
+/// - 单个 tile 的着色只依赖该 tile 的成员段与画家序（`shade_tile`），
+///   与其他 tile 的**当前**内容无关，也与"这是第几帧"无关；
+/// - 未被重算的 tile 保留的正是上一帧（或全量）算出的同一结果。
+///
+/// `img` 尺寸必须是 `width * height * 4`；`damage` 的 tile 尺寸必须与分箱一致。
+pub fn render_damage(binned: &BinnedScene, img: &mut [u8], damage: &amiki_scene::Damage) {
+    assert_eq!(
+        TILE,
+        amiki_scene::DAMAGE_TILE,
+        "分箱 tile 尺寸与 damage 的 tile 尺寸必须一致，否则增量渲染会与全量不一致"
+    );
+    let tiles_x = binned.tiles_x;
+    let tiles_y = binned.tiles_y;
+    let (tx0, ty0, tx1, ty1) = match damage.tiles() {
+        Some(t) => t,
+        // 全脏：等价于全量渲染（调用方也可直接走 render）
+        None => {
+            for ty in 0..tiles_y as usize {
+                for tx in 0..tiles_x as usize {
+                    shade_tile(binned, img, tx, ty);
+                }
+            }
+            return;
+        }
+    };
+    // 钳到画布 tile 范围（damage 的 tiles() 已按 damage 自己的画布钳过，
+    // 但 binned 的画布可能不同，故此处再钳一次）
+    for ty in ty0.min(tiles_y)..ty1.min(tiles_y) {
+        for tx in tx0.min(tiles_x)..tx1.min(tiles_x) {
+            shade_tile(binned, img, tx as usize, ty as usize);
+        }
+    }
 }

@@ -4,9 +4,9 @@
 //! 计数 x_cross > x 的穿越，delta = sign(dy)），覆盖 = mean([W ≠ 0])。
 //! 解析算法与之独立推导，二者一致即互证正确。
 
-use amiki_raster::{bin, flatten_draw, render, render_damage};
+use amiki_raster::{bin, flatten_draw, render, render_damage, render_tiles};
 use amiki_math::{Affine, Vec2};
-use amiki_scene::{Color, Damage, Paint, PathBuilder, Scene};
+use amiki_scene::{edit_damage, Color, Damage, Paint, PathBuilder, Scene};
 
 const SS: u32 = 16; // 超采样率（顶点行量化误差 ~2/SS）
 
@@ -448,4 +448,163 @@ fn damage_full_equals_full_render() {
     let mut img = vec![0u8; full.len()];
     render_damage(&binned, &mut img, &damage);
     assert_eq!(img, full, "全脏渲染必须等于全量渲染");
+}
+
+// ============================================================================
+// M4 编辑契约：随机改动场景，用 edit_damage 推导脏区并验证增量 == 全量
+// ============================================================================
+
+const EDIT_W: u32 = 112;
+const EDIT_H: u32 = 112;
+
+/// 一条可随机增删改的绘制。
+#[derive(Clone, Copy, Debug)]
+enum Edit {
+    Rect { x: f32, y: f32, w: f32, h: f32, c: Color },
+    Circle { x: f32, y: f32, r: f32, c: Color },
+    Pentagram { x: f32, y: f32, r: f32, c: Color },
+}
+
+impl Edit {
+    fn push_into(&self, scene: &mut Scene) {
+        let mut pb = PathBuilder::new();
+        let (t, paint) = match *self {
+            Edit::Rect { x, y, w, h, c } => {
+                pb.rect(x, y, x + w, y + h);
+                (Affine::IDENTITY, Paint::Solid(c))
+            }
+            Edit::Circle { x, y, r, c } => {
+                pb.circle(Vec2::new(x, y), r, false);
+                (Affine::IDENTITY, Paint::Solid(c))
+            }
+            Edit::Pentagram { x, y, r, c } => {
+                pb.pentagram(Vec2::new(x, y), r);
+                (Affine::IDENTITY, Paint::Solid(c))
+            }
+        };
+        scene.push(t, pb.build(), paint);
+    }
+}
+
+fn build_edit_scene(edits: &[Edit]) -> Scene {
+    let mut scene = Scene::new(EDIT_W, EDIT_H);
+    // 底：整幅不透明背景，保证"删除"也有可观察的变化
+    let mut pb = PathBuilder::new();
+    pb.rect(0.0, 0.0, EDIT_W as f32, EDIT_H as f32);
+    scene.push(Affine::IDENTITY, pb.build(), Paint::Solid(Color::rgb8(250, 246, 240)));
+    for e in edits {
+        e.push_into(&mut scene);
+    }
+    scene
+}
+
+fn random_edit(rng: &mut Lcg, w: u32, h: u32) -> Edit {
+    let x = (rng.next_u32() % w) as f32;
+    let y = (rng.next_u32() % h) as f32;
+    let r = 6.0 + (rng.next_u32() % 22) as f32;
+    let c = Color::rgba8(
+        (rng.next_u32() % 256) as u8,
+        (rng.next_u32() % 256) as u8,
+        (rng.next_u32() % 256) as u8,
+        120 + (rng.next_u32() % 136) as u8,
+    );
+    match rng.next_u32() % 3 {
+        0 => Edit::Rect { x, y, w: 8.0 + (rng.next_u32() % 30) as f32, h: 8.0 + (rng.next_u32() % 30) as f32, c },
+        1 => Edit::Circle { x, y, r, c },
+        _ => Edit::Pentagram { x, y, r, c },
+    }
+}
+
+/// `edit_damage` 的**覆盖性**：任何发生变化的像素，都必须落在脏 tile 范围内。
+///
+/// 这是整个增量方案的地基——若此断言失败，说明有人会漏标、画面会残留陈旧像素。
+#[test]
+fn edit_damage_covers_all_changed_pixels() {
+    let mut rng = Lcg(0x1234_ABCD_5678_EF01);
+    let mut covered_rounds = 0;
+
+    for round in 0..40 {
+        // 随机生成"旧"—"新"两个场景（同尺寸，所以比较是有意义的）
+        let n_old = rng.next_u32() % 5;
+        let n_new = rng.next_u32() % 5;
+        let old_edits: Vec<Edit> = (0..n_old).map(|_| random_edit(&mut rng, EDIT_W, EDIT_H)).collect();
+        let new_edits: Vec<Edit> = (0..n_new).map(|_| random_edit(&mut rng, EDIT_W, EDIT_H)).collect();
+        let old = build_edit_scene(&old_edits);
+        let new = build_edit_scene(&new_edits);
+
+        let damage = edit_damage(&old, &new);
+        let (w, h) = (new.width, new.height);
+
+        let b_old = bin(&old, 0.05);
+        let b_new = bin(&new, 0.05);
+        let img_old = render(&b_old);
+        let img_new = render(&b_new);
+
+        // 1) 覆盖性：所有变化像素必须落在脏 tile 内
+        let tiles: Vec<(u32, u32)> = match damage.tiles() {
+            // 全脏 = 覆盖一切
+            None => (0..h.div_ceil(16)).flat_map(|ty| (0..w.div_ceil(16)).map(move |tx| (tx, ty))).collect(),
+            Some((tx0, ty0, tx1, ty1)) => {
+                (ty0..ty1).flat_map(|ty| (tx0..tx1).map(move |tx| (tx, ty))).collect()
+            }
+        };
+        let set: std::collections::HashSet<(u32, u32)> = tiles.iter().copied().collect();
+        let mut changed_px = 0u32;
+        let mut uncovered = 0u32;
+        for py in 0..h {
+            for px in 0..w {
+                let o = ((py * w + px) * 4) as usize;
+                if img_old[o..o + 4] != img_new[o..o + 4] {
+                    changed_px += 1;
+                    if !set.contains(&(px / 16, py / 16)) {
+                        uncovered += 1;
+                    }
+                }
+            }
+        }
+        if changed_px > 0 {
+            covered_rounds += 1;
+        }
+        assert_eq!(
+            uncovered, 0,
+            "第 {round} 轮：有 {uncovered} 个变化像素不在脏 tile 内（共变化 {changed_px}）——\
+             edit_damage 漏覆盖，增量渲染会残留陈旧像素"
+        );
+
+        // 2) 增量正确性：以"上一帧结果"为底，只重算脏 tile，必须与全量逐字节一致。
+        //    （不能用 render_tiles 返回的全新缓冲去比全量渲染——那在未脏 tile 上是
+        //     零初始化的透明像素，与"复用上一帧"无关，比较本身没有意义。）
+        let mut carried = img_old.clone();
+        render_damage(&b_new, &mut carried, &damage);
+        assert_eq!(
+            carried, img_new,
+            "第 {round} 轮：在上帧结果上按脏区增量更新后与全量不一致"
+        );
+
+        // 3) `render_tiles` 本身的自洽性：以全量为底、只重算"全部 tile"，
+        //    必须仍是全量（验证 clear+shade 对每个 tile 都是幂等的）
+        let all: Vec<(u32, u32)> = (0..h.div_ceil(16))
+            .flat_map(|ty| (0..w.div_ceil(16)).map(move |tx| (tx, ty)))
+            .collect();
+        let mut base = img_new.clone();
+        let tiles_full = render_tiles(&b_new, Some(&all));
+        // render_tiles 返回的是"只含这些 tile"的图，未列出的 tile 为透明；
+        // 这里只需验证它列出的 tile 与全量一致
+        for &(tx, ty) in &all {
+            for py in ty * 16..((ty + 1) * 16).min(h) {
+                for px in tx * 16..((tx + 1) * 16).min(w) {
+                    let o = ((py * w + px) * 4) as usize;
+                    assert_eq!(
+                        tiles_full[o..o + 4],
+                        img_new[o..o + 4],
+                        "第 {round} 轮：render_tiles 在 tile ({tx},{ty}) 像素 ({px},{py}) 与全量不一致"
+                    );
+                }
+            }
+        }
+        let _ = &mut base;
+    }
+
+    assert!(covered_rounds >= 20, "至少一半轮次应有真实像素变化，否则测试没有判别力（实际 {covered_rounds}）");
+    eprintln!("40 轮随机场景编辑：覆盖性与增量一致性全部通过（{covered_rounds} 轮有真实像素变化）");
 }

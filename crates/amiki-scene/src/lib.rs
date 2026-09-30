@@ -7,6 +7,9 @@
 
 use amiki_math::{Affine, CubicBez, QuadBez, Vec2};
 
+mod damage;
+pub use damage::{changed_bounds, draw_device_bounds, edit_damage};
+
 /// 路径元素。
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum PathEl {
@@ -222,7 +225,11 @@ pub struct Clip {
 }
 
 /// 一次绘制：变换 + 路径 + 样式 + 混合模式 + 裁剪引用。
-#[derive(Clone, Debug)]
+///
+/// 派生 `PartialEq` 供 M4 的 [`edit_damage`] 判定"这条 draw 是否被改动"：
+/// 任一字段不同即视为改动（含浮点按位比较——对 damage 判定而言这是**正确**语义，
+/// 只要有一个比特变了就必须重算，宁可多标不可漏标）。
+#[derive(Clone, Debug, PartialEq)]
 pub struct Draw {
     pub transform: Affine,
     pub path: Path,

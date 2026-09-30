@@ -572,10 +572,32 @@ pub fn composite(dst: [f32; 4], src: [f32; 4], src_a: f32, mode: u32) -> [f32; 4
     [out_rgb[0], out_rgb[1], out_rgb[2], ao]
 }
 
+/// 把某个 tile 清零为透明（未预乘 RGBA 全 0）。
+///
+/// **为什么必须清零**：脏 tile 可能"从有内容变成无内容"（例如删掉一条 draw）。
+/// `shade_tile` 在 tile 无绘制时是 early-return（保留原像素）——那对**未脏**的 tile
+/// 是复用的正确语义；但**已脏**的 tile 必须从零开始重算，否则旧内容永久残留。
+fn clear_tile(binned: &BinnedScene, img: &mut [u8], tx: usize, ty: usize) {
+    let w = binned.width as usize;
+    let h = binned.height as usize;
+    let x0 = tx * TILE_USIZE;
+    let x1 = (x0 + TILE_USIZE).min(w);
+    let y0 = ty * TILE_USIZE;
+    let y1 = (y0 + TILE_USIZE).min(h);
+    for py in y0..y1 {
+        let o = (py * w + x0) * 4;
+        let n = (x1 - x0) * 4;
+        img[o..o + n].fill(0);
+    }
+}
+
 /// 渲染单个 tile 到 `img`（tile 内逐像素解析覆盖率 + 画家序合成）。
 ///
 /// M4：全量 `render` 与增量 `render_damage` **共用**此函数——增量路径绝不复制
 /// 一份着色数学，否则两条路径会漂移（这正是本项目历史上踩过的坑）。
+///
+/// 注意：本函数在 tile 无绘制时 **early-return（保留原像素）**。
+/// 这对"未脏、复用上一帧"是正确语义；对"已脏"的 tile 必须先 `clear_tile`。
 fn shade_tile(binned: &BinnedScene, img: &mut [u8], tx: usize, ty: usize) {
     let w = binned.width as usize;
     let h = binned.height as usize;
@@ -624,8 +646,12 @@ fn shade_tile(binned: &BinnedScene, img: &mut [u8], tx: usize, ty: usize) {
     }
 }
 
-/// CPU 光栅化：输出直线 RGBA8（未预乘）。
-pub fn render(binned: &BinnedScene) -> Vec<u8> {
+/// 从零渲染，但**只清/着色指定的 tile 列表**（`None` = 全部 tile）。
+///
+/// M4 测试用：全量 `render` 与"只重算部分 tile"之间需要一条**可控**的中间路径，
+/// 以便区分"damage 覆盖不全"与"着色本身不一致"这两类失败。
+/// 注意 `clear_tile` 先行使 `None`（全部 tile）与本函数的增量形式语义一致。
+pub fn render_tiles(binned: &BinnedScene, tiles: Option<&[(u32, u32)]>) -> Vec<u8> {
     assert_eq!(
         TILE,
         amiki_scene::DAMAGE_TILE,
@@ -634,12 +660,32 @@ pub fn render(binned: &BinnedScene) -> Vec<u8> {
     let w = binned.width as usize;
     let h = binned.height as usize;
     let mut img = vec![0u8; w * h * 4];
-    for ty in 0..binned.tiles_y as usize {
-        for tx in 0..binned.tiles_x as usize {
-            shade_tile(binned, &mut img, tx, ty);
+    match tiles {
+        None => {
+            for ty in 0..binned.tiles_y as usize {
+                for tx in 0..binned.tiles_x as usize {
+                    clear_tile(binned, &mut img, tx, ty);
+                    shade_tile(binned, &mut img, tx, ty);
+                }
+            }
+        }
+        Some(list) => {
+            for &(tx, ty) in list {
+                let (tx, ty) = (tx as usize, ty as usize);
+                if tx >= binned.tiles_x as usize || ty >= binned.tiles_y as usize {
+                    continue;
+                }
+                clear_tile(binned, &mut img, tx, ty);
+                shade_tile(binned, &mut img, tx, ty);
+            }
         }
     }
     img
+}
+
+/// CPU 光栅化：输出直线 RGBA8（未预乘）。
+pub fn render(binned: &BinnedScene) -> Vec<u8> {
+    render_tiles(binned, None)
 }
 
 /// M4 **增量渲染**：只重算与脏区相交的 tile，其余保留 `img` 原有像素。
@@ -673,6 +719,7 @@ pub fn render_damage(binned: &BinnedScene, img: &mut [u8], damage: &amiki_scene:
         None => {
             for ty in 0..tiles_y as usize {
                 for tx in 0..tiles_x as usize {
+                    clear_tile(binned, img, tx, ty);
                     shade_tile(binned, img, tx, ty);
                 }
             }
@@ -683,7 +730,10 @@ pub fn render_damage(binned: &BinnedScene, img: &mut [u8], damage: &amiki_scene:
     // 但 binned 的画布可能不同，故此处再钳一次）
     for ty in ty0.min(tiles_y)..ty1.min(tiles_y) {
         for tx in tx0.min(tiles_x)..tx1.min(tiles_x) {
-            shade_tile(binned, img, tx as usize, ty as usize);
+            let (tx, ty) = (tx as usize, ty as usize);
+            // 先清零再着色：脏 tile 必须从零重算，否则"由有内容变无内容"会残留
+            clear_tile(binned, img, tx, ty);
+            shade_tile(binned, img, tx, ty);
         }
     }
 }

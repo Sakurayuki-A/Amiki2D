@@ -209,7 +209,10 @@ impl Color {
 }
 
 /// 绘制样式。M1 支持实心色；渐变 / 图像在路线图 M4。
-#[derive(Clone, Debug, PartialEq)]
+///
+/// `Copy`：样式是纯数据（当前仅一个 `Color`），按值传递更自然——
+/// 文本绘制会对**每个字形**重复使用同一个样式，流动语义会让调用方别扭。
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Paint {
     Solid(Color),
 }

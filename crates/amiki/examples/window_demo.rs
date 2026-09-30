@@ -30,6 +30,31 @@ struct FrameState {
     /// 最近一帧的耗时（ms）与脏 tile 占比，写进标题便于观察 M4 收益
     last_ms: f64,
     last_dirty_ratio: f64,
+    /// M5：字体与字形轮廓缓存（轮廓解析一次后复用，避免每帧重新解析）。
+    /// 用 `RefCell`：`build_scene` 是 `&self`，而缓存的填充需要内部可变性。
+    font: Option<amiki_text::Font>,
+    text_cache: std::cell::RefCell<OutlineCache>,
+}
+
+/// 字形轮廓缓存：`glyph id → 轮廓`。
+///
+/// 为什么必须缓存：轮廓解析（含二次曲线还原）比拷贝一条路径贵得多，
+/// 而同一个字形每帧都会被复用。缓存让"每帧重新 shaping"变得廉价。
+/// 用 `Vec` 而非 `HashMap`：字形数量小（几十到几百），线性查找更快且无哈希依赖。
+#[derive(Default)]
+struct OutlineCache {
+    entries: Vec<(u32, amiki::scene::GlyphOutline)>,
+}
+
+impl OutlineCache {
+    fn get_or_insert(&mut self, font: &amiki_text::Font, id: u32) -> Option<amiki::scene::GlyphOutline> {
+        if let Some((_, o)) = self.entries.iter().find(|(k, _)| *k == id) {
+            return Some(o.clone());
+        }
+        let o = font.outline(id).ok()?;
+        self.entries.push((id, o.clone()));
+        Some(o)
+    }
 }
 
 impl FrameState {
@@ -80,6 +105,21 @@ impl FrameState {
         surface.configure(&device, &surface_cfg);
 
         let renderer = GpuRenderer::from_device(device, queue).expect("渲染器初始化失败");
+        // 字体可选：缺失时示例仍应能演示图形能力
+        let font = match amiki_text::Font::from_file("assets/fonts/Inter-Regular.ttf") {
+            Ok(f) => {
+                println!(
+                    "已加载 Inter：units_per_em = {}, 字形数 = {}",
+                    f.units_per_em(),
+                    f.glyph_count()
+                );
+                Some(f)
+            }
+            Err(e) => {
+                eprintln!("未加载字体（{e}）；文本部分将跳过");
+                None
+            }
+        };
         FrameState {
             window,
             surface,
@@ -92,6 +132,8 @@ impl FrameState {
             prev_scene: None,
             last_ms: 0.0,
             last_dirty_ratio: 1.0,
+            font,
+            text_cache: std::cell::RefCell::new(OutlineCache::default()),
         }
     }
 
@@ -178,6 +220,23 @@ impl FrameState {
             );
         }
         canvas.set_blend(BlendMode::Normal);
+
+        // 6) 文本（M5）：字形轮廓直入解析覆盖率管线 —— 任意缩放不糊。
+        //    每帧重新 shaping（很快），但轮廓只解析一次并缓存；
+        //    文字随时间轻微缩放，用来直观展示"放大不糊"。
+        if let Some(font) = self.font.as_ref() {
+            let size = (h * 0.10) * (1.0 + 0.25 * (t * 0.8).sin());
+            if let Ok(run) = amiki_text::shape(font, "Amiki2D", size) {
+                let ox = w * 0.5 - size * 1.75;
+                let oy = h * 0.46;
+                canvas.text(
+                    &run,
+                    Vec2::new(ox, oy),
+                    Paint::Solid(Color { r: 0.96, g: 0.94, b: 0.90, a: 0.96 }),
+                    |id| self.text_cache.borrow_mut().get_or_insert(font, id),
+                );
+            }
+        }
 
         canvas.scene
     }

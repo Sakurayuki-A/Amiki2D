@@ -230,3 +230,92 @@ fn layout_width_includes_kerning() {
     );
     eprintln!("排版宽度含字距：{line_w:.3}（逐字符累加会得到 {naive:.3}）");
 }
+
+/// P2-1：**CJK 断行的端到端验证**（含禁则）。
+///
+/// # 字体从哪来
+///
+/// 仓库里目前**没有 CJK 字体**（只有 Inter，它不含汉字）。这里按优先级找：
+/// 1. `assets/fonts/` 下的常见 OFL 中文字体（将来入库后自动生效）
+/// 2. 系统字体（Windows 的雅黑/黑体等）—— **仅用于本地验证，不入库**
+///    （系统字体不是 OFL，不能进仓库）
+///
+/// 两者都没有就**跳过并说明**，不静默通过。
+fn cjk_font() -> Option<Font> {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(|p| p.parent())
+        .expect("仓库根");
+    for n in [
+        "NotoSansSC-Regular.otf",
+        "NotoSansCJKsc-Regular.otf",
+        "SourceHanSansSC-Regular.otf",
+    ] {
+        let p = root.join("assets/fonts").join(n);
+        if p.exists() {
+            return Font::from_file(&p).ok();
+        }
+    }
+    for p in [
+        r"C:\Windows\Fonts\msyh.ttc",
+        r"C:\Windows\Fonts\simhei.ttf",
+        r"C:\Windows\Fonts\Deng.ttf",
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+        "/System/Library/Fonts/PingFang.ttc",
+    ] {
+        let p = std::path::Path::new(p);
+        if p.exists() {
+            if let Ok(f) = Font::from_file(p) {
+                eprintln!("（P2-1 使用系统 CJK 字体做验证：{}）", p.display());
+                return Some(f);
+            }
+        }
+    }
+    eprintln!("跳过：未找到 CJK 字体（仓库 assets/fonts 与系统都没有）");
+    None
+}
+
+#[test]
+fn cjk_wraps_and_respects_kinsoku() {
+    let Some(f) = cjk_font() else { return };
+    let text = "这是一段用来验证中文断行的文本，它包含标点符号（括号）与「引号」，\
+                还有拉丁文 mixed text 混排，以及一个很长的不可断片段 https://example.com/a/b/c。";
+    // 窄宽度强制换行
+    let opts = LayoutOptions::new(20.0, 140.0);
+    let r = layout(&f, text, &opts).expect("排版应成功");
+    assert!(
+        r.lines.len() >= 3,
+        "窄宽度下中文应断成多行，实际 {} 行",
+        r.lines.len()
+    );
+
+    // ① 内容不得丢失：各行文本拼起来（去掉行尾空白）应还原原文
+    let joined: String = r
+        .lines
+        .iter()
+        .map(|l| &text[l.text_range.clone()])
+        .collect();
+    assert_eq!(
+        joined.chars().filter(|c| !c.is_whitespace()).collect::<String>(),
+        text.chars().filter(|c| !c.is_whitespace()).collect::<String>(),
+        "断行不得丢字或重字"
+    );
+
+    // ② 禁则：行首不能是收尾标点，行尾不能是起始括号
+    for (i, l) in r.lines.iter().enumerate() {
+        let seg = &text[l.text_range.clone()];
+        if let Some(c) = seg.chars().next() {
+            assert!(
+                !amiki_layout::is_no_line_start(c),
+                "第 {i} 行以禁则字符 `{c}` 开头：{seg:?}"
+            );
+        }
+        if let Some(c) = seg.chars().last() {
+            assert!(
+                !amiki_layout::is_no_line_end(c),
+                "第 {i} 行以禁则字符 `{c}` 结尾：{seg:?}"
+            );
+        }
+    }
+    eprintln!("CJK 断行：{} 行，禁则检查通过", r.lines.len());
+}

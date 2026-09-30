@@ -97,6 +97,64 @@ fn break_kind_after(c: char, prev_is_cjk: bool) -> BreakKind {
     BreakKind::No
 }
 
+/// **行首禁则**：这些字符不得出现在行首（收尾类标点与右括号）。
+///
+/// 中日文排版的"禁则处理"（kinsoku shori）。不做的话，`「你好。」` 断行后
+/// 可能变成下一行以 `」` 开头 —— 这是明显不合格的排版，但**只有中文内容
+/// 才会暴露**，英文测试永远看不到。
+pub fn is_no_line_start(c: char) -> bool {
+    matches!(
+        c,
+        '。' | '、' | '，' | '．' | '！' | '？' | '：' | '；'
+            | '）' | '〕' | '］' | '｝' | '〉' | '》' | '」' | '』' | '】' | '〗' | '〙' | '〛'
+            | '｀' | '´' | '％' | '‰' | '°' | '℃' | '々' | 'ー' | '～' | '·'
+    )
+}
+
+/// **行尾禁则**：这些字符不得出现在行尾（起始类括号与开引号）。
+pub fn is_no_line_end(c: char) -> bool {
+    matches!(
+        c,
+        '（' | '〔' | '［' | '｛' | '〈' | '《' | '「' | '『' | '【' | '〖' | '〘' | '〚'
+            | '“' | '‘' | '＄' | '￥' | '＃'
+    )
+}
+
+/// 在 `before` 与 `after` 之间断行是否**被禁则禁止**。
+///
+/// 禁则是**排版偏好而非硬约束**：当整行都找不到合规断点时，调用方会退回
+/// "最后一个可断点"（宁可破坏禁则，也不要溢出成超长行）。
+fn kinsoku_forbids_break(before: char, after: char) -> bool {
+    is_no_line_start(after) || is_no_line_end(before)
+}
+
+/// 在一行的 `[start, end)` 内挑选断点。
+///
+/// 返回 `(选中的断点, 本行是否存在任何可断点)`：
+/// - 优先选**满足禁则**的最后一个断点；
+/// - 若可断点全被禁则否决，退回**最后一个可断点**（禁则不是硬约束）；
+/// - `false` 表示本行根本没有可断点（调用方走"不可断片段"的溢出路径）。
+///
+/// 抽成**纯函数**是为了可测：禁则只与字符有关、与字体无关，
+/// 而这个仓库里没有 CJK 字体，靠端到端排版是验证不了它的。
+fn pick_break(kinds: &[(BreakKind, char)], start: usize, end: usize) -> (Option<usize>, bool) {
+    let mut any: Option<usize> = None;
+    let mut kinsoku_ok: Option<usize> = None;
+    for k in (start + 1)..end {
+        let Some(&(kind, _)) = kinds.get(k - 1) else { break };
+        if kind == BreakKind::No {
+            continue;
+        }
+        any = Some(k);
+        let before = kinds.get(k - 1).map(|x| x.1).unwrap_or(' ');
+        let after = kinds.get(k).map(|x| x.1).unwrap_or(' ');
+        if !kinsoku_forbids_break(before, after) {
+            kinsoku_ok = Some(k);
+        }
+    }
+    (kinsoku_ok.or(any), any.is_some())
+}
+
 /// 是否为需要逐字断行的表意文字（CJK 及常见全角标点范围）。
 fn is_cjk(c: char) -> bool {
     matches!(c as u32,
@@ -251,8 +309,10 @@ fn measure_run(font: &Font, run: &TextRun, size: f32) -> f32 {
 /// 容易在空白吞并、制表符等情况下算错，且很难验证。
 /// 前缀数组让"任意切片宽度 = prefix[b] - prefix[a]"恒等成立。
 struct CharMetrics {
-    /// (字节偏移, 字节长度, 其后断点类型)
-    chars: Vec<(usize, usize, BreakKind)>,
+    /// (字节偏移, 字节长度, 其后断点类型, 字符本身)
+    ///
+    /// 带上字符本身是因为**禁则要判断断点两侧是什么字**（如 `」` 不得在行首）。
+    chars: Vec<(usize, usize, BreakKind, char)>,
     /// prefix[k] = 前 k 个字符的累计宽度
     prefix: Vec<f32>,
 }
@@ -264,7 +324,7 @@ fn measure_chars(font: &Font, para: &str, size: f32) -> CharMetrics {
     for (i, c) in para.char_indices() {
         let kind = break_kind_after(c, prev_cjk);
         prev_cjk = is_cjk(c);
-        chars.push((i, c.len_utf8(), kind));
+        chars.push((i, c.len_utf8(), kind, c));
     }
 
     // ② 前缀宽度**必须来自 shaping 的结果**，而不是逐字符累加 `advance_width`。
@@ -284,7 +344,7 @@ fn measure_chars(font: &Font, para: &str, size: f32) -> CharMetrics {
             let end_pen = (last.x + font.advance(last.id).unwrap_or(0.0)) * size;
             // 每个字形的**起点**推进量即它 cluster 处的边界宽度
             let mut gi = 0usize;
-            for (k, &(off, _, _)) in chars.iter().enumerate() {
+            for (k, &(off, _, _, _)) in chars.iter().enumerate() {
                 let off = off as u32;
                 // 沿字形前进，直到找到一个 cluster ≥ 当前字符偏移的字形
                 while gi < glyphs.len() && glyphs[gi].cluster < off {
@@ -299,7 +359,7 @@ fn measure_chars(font: &Font, para: &str, size: f32) -> CharMetrics {
         _ => {
             eprintln!("amiki-layout：shaping 失败，回退到逐字符 advance（字距与连字不参与排版）");
             let mut acc = 0.0f32;
-            for (k, &(off, len, _)) in chars.iter().enumerate() {
+            for (k, &(off, len, _, _)) in chars.iter().enumerate() {
                 let c = para[off..off + len].chars().next().unwrap_or(' ');
                 let w = if c == '\t' {
                     font.advance_width("    ") * size
@@ -323,7 +383,7 @@ impl CharMetrics {
     /// 第 k 个字符的字节偏移（k == n 时返回段末）
     fn byte_at(&self, k: usize) -> usize {
         if k >= self.chars.len() {
-            self.chars.last().map(|(b, l, _)| b + l).unwrap_or(0)
+            self.chars.last().map(|(b, l, _, _)| b + l).unwrap_or(0)
         } else {
             self.chars[k].0
         }
@@ -335,7 +395,12 @@ impl CharMetrics {
         self.prefix[hi] - self.prefix[lo]
     }
     fn kind(&self, k: usize) -> BreakKind {
-        self.chars.get(k).map(|(_, _, t)| *t).unwrap_or(BreakKind::No)
+        self.chars.get(k).map(|(_, _, t, _)| *t).unwrap_or(BreakKind::No)
+    }
+
+    /// `(断点类型, 字符)` 视图 —— `pick_break` 只需要这两样。
+    fn chars_kinds(&self) -> Vec<(BreakKind, char)> {
+        self.chars.iter().map(|(_, _, k, c)| (*k, *c)).collect()
     }
 }
 
@@ -384,14 +449,10 @@ fn greedy_break<'a>(
             break;
         }
 
-        // 在本行 [start, end) 内找最后一个可断点
-        let mut brk: Option<usize> = None;
-        for k in (start + 1)..end {
-            if m.kind(k - 1) != BreakKind::No {
-                brk = Some(k);
-            }
-        }
+        // 在本行 [start, end) 内挑断点（含禁则处理）
+        let (brk, has_any) = pick_break(&m.chars_kinds(), start, end);
 
+        debug_assert_eq!(has_any, brk.is_some());
         let Some(cut) = brk else {
             // 本行内**根本没有可断点**（超长不可断片段，如长 URL）。
             //
@@ -426,4 +487,107 @@ fn greedy_break<'a>(
         start = cut;
     }
     out
+}
+
+#[cfg(test)]
+mod kinsoku_tests {
+    use super::*;
+
+    /// 把字符串变成 `pick_break` 需要的 `(断点类型, 字符)` 数组。
+    ///
+    /// 这里**不涉及字体** —— 禁则只与字符有关，所以能在没有 CJK 字体的
+    /// 仓库里被测到。端到端的中文排版验证仍需要一份 CJK 字体，
+    /// 那是 `assets/fonts/` 里目前缺的东西。
+    fn kinds(text: &str) -> Vec<(BreakKind, char)> {
+        let mut out = Vec::new();
+        let mut prev_cjk = false;
+        for c in text.chars() {
+            out.push((break_kind_after(c, prev_cjk), c));
+            prev_cjk = is_cjk(c);
+        }
+        out
+    }
+
+    /// 在 `text` 的 `[0, end)` 范围内挑断点，返回选中的位置。
+    ///
+    /// 断点 `k` 表示"在第 k 个字符**之前**断行"。
+    fn chosen(text: &str, end: usize) -> Option<usize> {
+        let ks = kinds(text);
+        pick_break(&ks, 0, end).0
+    }
+
+    /// 行首禁则：**被禁的断点恰好是"最后一个候选"**，因此开/关禁则会给出不同结果。
+    ///
+    /// `你好。」世` 在 `end = 4`（即只排到 `」`）时有三个候选：
+    /// `k=1`（好之后，合规）、`k=2`（。之后 → 下一行以 `。` 开头，禁）、
+    /// `k=3`（」之后 → 下一行以 `」` 开头，禁）。
+    /// 无禁则时会取最后一个（3）；有禁则时退到最后一个**合规**的（1）。
+    #[test]
+    fn closing_punctuation_never_starts_a_line() {
+        assert_eq!(
+            chosen("你好。」世", 4),
+            Some(1),
+            "`。`/`」` 不得出现在行首：应退到 `好` 之后，而不是 `」` 之后"
+        );
+    }
+
+    /// 行尾禁则：同样让被禁断点成为最后一个候选。
+    ///
+    /// `你好「世` 在 `end = 4` 时候选为 `k=1`、`k=2`、`k=3`；
+    /// `k=3` 是「`「` 之后」→ 本行以 `「` 结尾，禁。有禁则时应取 `k=2`。
+    #[test]
+    fn opening_bracket_never_ends_a_line() {
+        assert_eq!(
+            chosen("你好「世", 4),
+            Some(2),
+            "`「` 不得出现在行尾：应退到 `好` 之后，而不是 `「` 之后"
+        );
+    }
+
+    #[test]
+    fn kinsoku_is_a_preference_not_a_hard_rule() {
+        // 整行都是禁则字符时，不能因为禁则就**拒绝断行** ——
+        // 那会让行溢出画面。此时退回最后一个可断点。
+        let ks = kinds("。。。");
+        let (chosen, any) = pick_break(&ks, 0, ks.len());
+        assert!(any, "应有可断点");
+        assert!(chosen.is_some(), "禁则不是硬约束：找不到合规断点时应退回可断点");
+    }
+
+    #[test]
+    fn no_breakable_position_reports_none() {
+        // 纯拉丁、无空格与连字符：没有任何可断点，调用方应走溢出路径
+        let ks = kinds("abcdef");
+        let (chosen, any) = pick_break(&ks, 0, ks.len());
+        assert!(!any, "不应存在可断点");
+        assert_eq!(chosen, None);
+    }
+
+    #[test]
+    fn kinsoku_predicates_cover_the_common_sets() {
+        for c in ['。', '、', '，', '！', '？', '」', '』', '）', '】', '》'] {
+            assert!(is_no_line_start(c), "`{c}` 应在行首禁则集合里");
+        }
+        for c in ['「', '『', '（', '【', '《', '“'] {
+            assert!(is_no_line_end(c), "`{c}` 应在行尾禁则集合里");
+        }
+        // 普通汉字不受禁则约束
+        assert!(!is_no_line_start('好') && !is_no_line_end('好'));
+        // 两类集合不应相交（同一个字不能既禁行首又禁行尾）
+        for c in ['。', '、', '」', '「', '（'] {
+            assert!(
+                !(is_no_line_start(c) && is_no_line_end(c)),
+                "`{c}` 不应同时属于两个禁则集合"
+            );
+        }
+    }
+
+    #[test]
+    fn mixed_cjk_latin_breaks_between_cjk_chars() {
+        // 「中文abc中文」：CJK 之间逐字可断（这是 Anywhere 的语义）
+        let ks = kinds("中文");
+        let (chosen, any) = pick_break(&ks, 0, ks.len());
+        assert!(any, "CJK 之间应可断");
+        assert_eq!(chosen, Some(1), "应在两字之间断");
+    }
 }

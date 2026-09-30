@@ -1,0 +1,30 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/amiki-math",
+    "crates/amiki-scene",
+    "crates/amiki-raster",
+    "crates/amiki-gpu",
+    "crates/amiki",
+]
+
+[workspace.package]
+version = "0.1.0-alpha"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+bytemuck = { version = "1", features = ["derive"] }
+pollster = "0.4"
+image = { version = "0.25", default-features = false, features = ["png"] }
+wgpu = "25"
+winit = "0.30"
+
+amiki-math = { path = "crates/amiki-math" }
+amiki-scene = { path = "crates/amiki-scene" }
+amiki-raster = { path = "crates/amiki-raster" }
+amiki-gpu = { path = "crates/amiki-gpu" }
+
+[profile.release]
+debug = true
+lto = "thin"

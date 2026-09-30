@@ -1,0 +1,12 @@
+# 统一行尾为 LF。
+#
+# 理由：本项目全部源文件（Rust / WGSL / Markdown）均以 LF 编写；
+# 若 Git 在 checkout 时把 LF 转成 CRLF，会把 `\r` 混进字符串字面量与
+# WGSL 源码，造成难以定位的语法错误（本项目曾因行尾被改而编译失败）。
+# 显式声明可避免 checkout/commit 时的静默转换。
+* text=auto eol=lf
+
+# 二进制产物不做行尾处理
+*.png binary
+*.jpg binary
+*.ico binary

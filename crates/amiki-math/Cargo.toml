@@ -1,0 +1,8 @@
+[package]
+name = "amiki-math"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Amiki2D 零依赖几何核心：向量、仿射变换、贝塞尔曲线、误差自适应压平"
+
+[dependencies]

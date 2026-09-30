@@ -1,0 +1,25 @@
+[package]
+name = "amiki"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Amiki2D 通用 2D 渲染引擎（门面 API）"
+
+[dependencies]
+amiki-math = { workspace = true }
+amiki-scene = { workspace = true }
+amiki-raster = { workspace = true }
+amiki-gpu = { workspace = true }
+pollster = { workspace = true }
+
+[dev-dependencies]
+image = { workspace = true }
+winit = { workspace = true }
+wgpu = { workspace = true }
+pollster = { workspace = true }
+
+[[example]]
+name = "headless_png"
+
+[[example]]
+name = "window_demo"

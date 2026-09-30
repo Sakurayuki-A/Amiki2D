@@ -1,0 +1,22 @@
+[package]
+name = "amiki-gpu"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Amiki2D GPU 引擎：wgpu 计算着色器解析式覆盖率渲染器"
+
+[dependencies]
+amiki-math = { workspace = true }
+amiki-scene = { workspace = true }
+amiki-raster = { workspace = true }
+wgpu = { workspace = true }
+bytemuck = { workspace = true }
+pollster = { workspace = true }
+
+[dev-dependencies]
+# 基准套件（§4.5 指标）；关掉 plotters/rayon 保持依赖轻量
+criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support"] }
+
+[[bench]]
+name = "render"
+harness = false

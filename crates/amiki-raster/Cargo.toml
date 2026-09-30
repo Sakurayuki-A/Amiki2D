@@ -1,0 +1,10 @@
+[package]
+name = "amiki-raster"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Amiki2D CPU 引擎：压平、分箱与解析式覆盖率参考光栅器（GPU 的对拍基准）"
+
+[dependencies]
+amiki-math = { workspace = true }
+amiki-scene = { workspace = true }

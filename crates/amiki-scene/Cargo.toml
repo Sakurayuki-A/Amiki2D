@@ -1,0 +1,9 @@
+[package]
+name = "amiki-scene"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Amiki2D 路径 / 绘制 / 场景模型"
+
+[dependencies]
+amiki-math = { workspace = true }

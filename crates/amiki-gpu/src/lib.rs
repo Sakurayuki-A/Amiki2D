@@ -446,10 +446,10 @@ pub struct FrameProfile {
     pub alloc_ms: f64,
     /// 上传（`create_buffer_init` / `write_buffer`）
     pub upload_ms: f64,
-    /// 第一次编码**与提交**（`enc1a` + `enc1b`：分箱结构 + 稀疏结构，
-    /// 含 10 个 pass 与 **2 次 submit 同步点**）。读回 1 夹在这两者之间，
-    /// 故单独计（`readback1_ms`）。
-    pub encode1_ms: f64,
+    /// `enc1a`（分箱结构，含 6 个 pass）的编码 + 提交
+    pub encode1a_ms: f64,
+    /// `enc1b`（稀疏清零 + emit，含若干 pass）的编码 + 提交
+    pub encode1b_ms: f64,
     /// 第二次提交前的命令编码（含单元 CSR scan）
     pub encode2_ms: f64,
     /// 第二次提交
@@ -474,7 +474,8 @@ impl FrameProfile {
         self.extract_ms
             + self.alloc_ms
             + self.upload_ms
-            + self.encode1_ms
+            + self.encode1a_ms
+            + self.encode1b_ms
             + self.encode2_ms
             + self.submit2_ms
             + self.readback1_ms.unwrap_or(0.0)
@@ -495,7 +496,8 @@ impl FrameProfile {
         s.push_str(&format!(" [提取 {:.2}]", self.extract_ms));
         s.push_str(&format!(" [分配 {:.2}]", self.alloc_ms));
         s.push_str(&format!(" [上传 {:.2}]", self.upload_ms));
-        s.push_str(&format!(" [编码1+提交 {:.2}]", self.encode1_ms));
+        s.push_str(&format!(" [编码1a+提交 {:.2}]", self.encode1a_ms));
+        s.push_str(&format!(" [编码1b+提交 {:.2}]", self.encode1b_ms));
         s.push_str(&format!(" [编码2 {:.2}]", self.encode2_ms));
         s.push_str(&format!(" [提交2 {:.2}]", self.submit2_ms));
         push(&mut s, "读回1", self.readback1_ms);
@@ -2363,6 +2365,7 @@ impl GpuRenderer {
         enc1a.copy_buffer_to_buffer(&tile_count_buf, 0, &tile_start_buf, 0, n_tiles * 4);
         self.run_scan(&mut enc1a, &tile_start_buf, n_tiles as u32, ts_slot(ts.as_deref(), ts_slots, 7));
         self.queue.submit(Some(enc1a.finish()));
+        prof.encode1a_ms = t_enc1.elapsed().as_secs_f64() * 1000.0;
 
         // 〖读回 1〗稀疏规模 → 分配稀疏缓冲
         let t_rb1 = Instant::now();
@@ -2386,6 +2389,7 @@ impl GpuRenderer {
         let params_v2 = params(n_cells, n_buckets, n_tile_entries);
 
         // ———— enc1b：稀疏清零 + emit ————
+        let t_enc1b = Instant::now();
         let b_clear = sparse_bind(&params_v2, &[(6, &cell_aux_buf), (7, &buckets_buf)]);
         let b_emit = sparse_bind(
             &params_v2,
@@ -2416,9 +2420,7 @@ impl GpuRenderer {
             dispatch_1d(&mut pass, total_segments);
         }
         self.queue.submit(Some(enc1b.finish()));
-
-        // enc1a + enc1b 的编码与提交到此结束（读回 1 夹在两者之间）
-        prof.encode1_ms = t_enc1.elapsed().as_secs_f64() * 1000.0;
+        prof.encode1b_ms = t_enc1b.elapsed().as_secs_f64() * 1000.0;
 
         // 〖读回 2〗成员总数 → 分配段列表
         let t_rb2 = Instant::now();

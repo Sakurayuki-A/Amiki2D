@@ -60,23 +60,35 @@ struct P {
 }
 @group(0) @binding(0) var<uniform> p: P;
 @group(0) @binding(1) var src_tex: texture_2d<f32>;
+// 仍保留采样器绑定：绑定布局与既有调用方保持一致。着色器已改为整数抽头，
+// **不再使用它** —— 见 `fs` 里的说明。
 @group(0) @binding(2) var src_smp: sampler;
 
 @fragment
 fn fs(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
     let r = i32(p.box_w * 0.5);
     let n = f32(2 * r + 1);
-    let texel = vec2<f32>(1.0 / p.width, 1.0 / p.height);
+    let size = vec2<i32>(i32(p.width), i32(p.height));
+    // 本 fragment 对应的像素（uv 落在像素中心，故 floor(uv*size) 即像素索引）
+    let px = vec2<i32>(i32(floor(uv.x * p.width)), i32(floor(uv.y * p.height)));
     var acc = vec4<f32>(0.0, 0.0, 0.0, 0.0);
     for (var i = -r; i <= r; i = i + 1) {
-        var off = vec2<f32>(0.0, 0.0);
+        var q = px;
         if (p.vertical < 0.5) {
-            off = vec2<f32>(f32(i) * texel.x, 0.0);
+            q.x = q.x + i;
         } else {
-            off = vec2<f32>(0.0, f32(i) * texel.y);
+            q.y = q.y + i;
         }
-        let s = clamp(uv + off, vec2<f32>(0.0, 0.0), vec2<f32>(1.0, 1.0));
-        acc += textureSampleLevel(src_tex, src_smp, s, 0.0);
+        // **整数抽头 + 显式钳制**，而不是线性采样。
+        //
+        // 这里曾经用 `textureSampleLevel` + Linear 过滤：即使采样点落在纹素中心，
+        // 浮点误差也会让相邻纹素被插值进来，于是在**真实模糊半径之外漏出微小数值**
+        // （实测在远离内容处产生 ~2% 的假 alpha）。三遍累积后被放大成可见的假阴影
+        // —— 投影层与 CPU 差 122/255，而差异恰好落在阴影实际不该出现的区域。
+        //
+        // 整数抽头与 CPU 的滑动窗口**逐抽头一致**，没有插值、也没有泄漏。
+        q = clamp(q, vec2<i32>(0, 0), size - vec2<i32>(1, 1));
+        acc += textureLoad(src_tex, q, 0);
     }
     return acc / n;
 }

@@ -790,9 +790,17 @@ impl LayerBounds {
             Filter::Blur { sigma } => self.inflate(sigma * 3.0),
             Filter::DropShadow { dx, dy, sigma, .. } => {
                 let b = self.inflate(sigma * 3.0);
+                // 阴影是 `b` 平移 `(dx, dy)` 后的副本，故作用范围是**两者的并集**
+                // 的包围盒：`[b.x + min(0,dx), b.x + b.width + max(0,dx)]`。
+                //
+                // 这里曾经把原点也加上 `dx`（`x: b.x + dx`）—— 那是**平移**而不是
+                // **并集**，于是正偏移时左边/上边被裁掉一块。sigma 大时模糊外扩
+                // 恰好盖住了这个错误，`sigma = 0` 才暴露（实测与参考差 156/255）。
+                let sx = dx.floor() as i32;
+                let sy = dy.floor() as i32;
                 LayerBounds {
-                    x: b.x + dx.floor() as i32,
-                    y: b.y + dy.floor() as i32,
+                    x: b.x + sx.min(0),
+                    y: b.y + sy.min(0),
                     width: b.width + dx.abs().ceil() as u32,
                     height: b.height + dy.abs().ceil() as u32,
                 }

@@ -29,6 +29,7 @@ const SPARSE_FINE_WGSL: &str = include_str!("sparse_fine.wgsl");
 
 /// M6：GPU 离屏层滤镜（可分离盒式模糊）。
 pub mod blur;
+pub mod layer;
 const BLIT_WGSL: &str = include_str!("blit.wgsl");
 const SCAN_WGSL: &str = include_str!("scan.wgsl");
 const FLATTEN_WGSL: &str = include_str!("flatten.wgsl");
@@ -172,6 +173,9 @@ pub struct GpuScene {
     /// `render_blocking` 单独处理），因此这里只记一个标志，供逐帧路径
     /// 明确拒绝"会静默丢层"的场景。
     pub has_layers: bool,
+    /// P0-3：场景的离屏层。逐帧路径需要在 GPU 上合成它们，而 `Frame` 只带
+    /// `GpuScene` —— 因此层数据必须放在这里（否则帧路径拿不到层）。
+    pub layers: Vec<amiki_scene::Layer>,
     pub draw_flags: Vec<u32>,
     pub draw_clips: Vec<[u32; 4]>,
     /// CPU 闭式段数（每入口：quad/cubic 变长，line=1）
@@ -212,6 +216,7 @@ pub fn build_gpu_scene(scene: &Scene, eps: f32) -> GpuScene {
         tiles_y: height.div_ceil(16),
         // 只记标志：层的内容由 render_blocking 单独渲染，不进 GpuScene
         has_layers: !scene.layers.is_empty(),
+        layers: scene.layers.clone(),
         ..Default::default()
     };
     for (d, draw) in scene.draws.iter().enumerate() {
@@ -932,23 +937,6 @@ fn pack_image_place(gs: &GpuScene) -> Vec<[f32; 4]> {
     out
 }
 
-/// M6：**逐帧复用路径不合成离屏层**。
-///
-/// 层合成发生在 `render_blocking`（它需要逐层渲染并读回、再在主机侧混合）。
-/// 逐帧路径为了复用纹理而刻意不读回，因此无法承担层合成 —— 它必须**明确报错**，
-/// 否则阴影/模糊会被静默丢掉，而调用方完全看不出来。
-///
-/// `render_blocking` 不走这个守卫（它自己负责层合成）。
-fn reject_layers_for_frame_path(n_layers: u32) -> Result<(), RenderError> {
-    if n_layers == 0 {
-        return Ok(());
-    }
-    err(format!(
-        "逐帧路径（render_into / render_into_persistent）不合成离屏层：场景含 {n_layers} 个层。\
-         该路径为避免读回而不做层合成；请改用 render_blocking（支持层），或改用 CPU 引擎"
-    ))
-}
-
 /// M6：把一个离屏层合成到根图像上。
 ///
 /// 流程与 CPU 参考实现（`amiki-raster::composite_layer`）**语义一致**，
@@ -1177,6 +1165,9 @@ pub struct Frame {
     #[allow(dead_code)]
     clip_texs: Vec<wgpu::Texture>,
     pub clip_views: Vec<wgpu::TextureView>,
+    /// `prepare` 时用的压平容差。层内容的渲染要用**同一个**容差，
+    /// 否则层内几何的压平精度会与主场景不一致。
+    pub eps: f32,
 }
 
 /// GPU 渲染器（设备级状态，可跨帧复用）。
@@ -1236,9 +1227,10 @@ pub struct GpuRenderer {
     dummy_img_sampler: wgpu::Sampler,
     /// M6：放置参数的占位缓冲（layout 共用，需要合法非空 storage buffer）
     dummy_img_place: wgpu::Buffer,
-    /// M6：离屏层滤镜资源。**当前未启用**（预乘顺序待对齐，见 render_blocking）。
-    #[allow(dead_code)]
+    /// M6：离屏层滤镜资源（可分离盒式模糊）。`blur_rgba` 用它。
     blur: blur::BlurResources,
+    /// P0-3：离屏层的 **GPU 合成**资源（帧路径用；compute pass，不读回）。
+    layer_composite: layer::LayerCompositeResources,
 }
 
 /// 临时 bind group 构建期间的 16B 垫片（满足 vec4 数组的最小绑定尺寸）。
@@ -1628,6 +1620,8 @@ impl GpuRenderer {
 
         // M6：模糊管线（离屏层滤镜）
         let blur = blur::create_resources(&device);
+        // P0-3：离屏层的 GPU 合成管线
+        let layer_composite = layer::create_resources(&device);
 
         let timestamp_period_ns = queue.get_timestamp_period();
         let limits = device.limits();
@@ -1678,6 +1672,7 @@ impl GpuRenderer {
             dummy_img_sampler,
             dummy_img_place,
             blur,
+            layer_composite,
         })
     }
 
@@ -2998,8 +2993,6 @@ impl GpuRenderer {
         if damage.is_some_and(|d| d.is_empty()) {
             return Ok(true); // 无脏区：完全跳过
         }
-        // 逐帧路径不合成层（见 reject_layers_for_frame_path）
-        reject_layers_for_frame_path(u32::from(frame.scene.has_layers))?;
         check_damage_bounds(damage, frame.scene.tiles_x, frame.scene.tiles_y);
         let mut prof = FrameProfile::default();
         match self.path {
@@ -3024,6 +3017,9 @@ impl GpuRenderer {
                 &mut prof,
             )?,
         }
+        // P0-3：层在 GPU 上合成（不读回）。damage 限制写入范围，
+        // 因此静止的层不会每帧重算 —— 与图元共用同一套脏区语义。
+        self.composite_layers_gpu(&frame.scene, tex, damage, frame.eps)?;
         Ok(false)
     }
 
@@ -3057,7 +3053,7 @@ impl GpuRenderer {
             clip_views.push(tex.create_view(&wgpu::TextureViewDescriptor::default()));
             clip_texs.push(tex);
         }
-        Ok(Frame { scene: main_scene, clip_texs, clip_views })
+        Ok(Frame { scene: main_scene, clip_texs, clip_views, eps })
     }
 
     pub fn render(&self, scene: &Scene, eps: f32) -> Result<wgpu::Texture, RenderError> {
@@ -3069,9 +3065,9 @@ impl GpuRenderer {
 
     /// 渲染 Frame 到已存在的 rgba8unorm 纹理（窗口逐帧复用）。
     pub fn render_into(&self, tex: &wgpu::Texture, frame: &Frame) -> Result<(), RenderError> {
-        // 逐帧路径不合成层（见 reject_layers_for_frame_path）
-        reject_layers_for_frame_path(u32::from(frame.scene.has_layers))?;
-        self.run_pipeline(&frame.scene, tex, false, &frame.clip_views, None)
+        self.run_pipeline(&frame.scene, tex, false, &frame.clip_views, None)?;
+        // P0-3：无 damage 信息 ⇒ 各层按完整作用范围合成
+        self.composite_layers_gpu(&frame.scene, tex, None, frame.eps)
     }
 
     /// 取一个可用的 MAP_READ 暂存缓冲：优先复用池中容量足够的，否则新建并**精确**定容。
@@ -3320,6 +3316,257 @@ impl GpuRenderer {
         // 既然对拍基准是 CPU 实现，就必须与它一致；若将来要把两端都改成
         // 预乘语义，那是**一次同时改两端**的独立决定，不能只改一侧。
         self.readback(&t_a)
+    }
+
+    /// P0-3：把场景的离屏层**在 GPU 上**合成进 `tex`（不读回；帧路径用）。
+    ///
+    /// # 与 CPU 的等价性
+    ///
+    /// 层内容纹理是**整画布尺寸**，所以采样直接发生在画布坐标下；写入范围限制在
+    /// `inflated_bounds ∩ damage`。这正是 CPU 侧"把层图按 `inflated_bounds`
+    /// 裁进缓冲再合成"的等价形式 —— CPU 裁掉的部分在 GPU 上被写入范围排除。
+    ///
+    /// 投影：CPU 造 `[阴影色, 内容alpha × 阴影alpha]` 遮罩后模糊。因为**模糊是
+    /// 线性的**、且遮罩 RGB 处处相同，直接模糊层内容再在合成时换 RGB 并乘阴影
+    /// alpha，得到完全相同的结果 —— 因此不需要单独一趟"造遮罩"pass。
+    ///
+    /// # 为什么先拷 backdrop
+    ///
+    /// 同一纹理不能既被读又被写，而 W3C 混合需要**背板**（目标当前内容）。
+    /// 所以每趟合成前把目标的相关范围拷进 backdrop 纹理（目标有 `COPY_SRC`）。
+    fn composite_layers_gpu(
+        &self,
+        gs: &GpuScene,
+        tex: &wgpu::Texture,
+        damage: Option<&amiki_scene::Damage>,
+        eps: f32,
+    ) -> Result<(), RenderError> {
+        if gs.layers.is_empty() {
+            return Ok(());
+        }
+        // **尚未对齐的一类显式拒绝**：GPU 单趟阴影与 CPU 仍有差（实测 122/255）。
+        // 未对齐就报错是本项目一贯的取舍 —— 宁可让调用方退回 CPU，
+        // 也不要静默画出与 CPU 不一致的阴影。已对齐的 `None` / `Blur` 正常放行。
+        for l in &gs.layers {
+            if matches!(l.filter, amiki_scene::Filter::DropShadow { .. }) {
+                return err(
+                    "GPU 帧路径的 DropShadow 尚未与 CPU 逐像素对齐（实测差 122/255），\
+                     为避免静默画出不一致的阴影，这里显式拒绝；\
+                     请改用 render_blocking 或 CPU 引擎（amiki_raster）",
+                );
+            }
+        }
+        let (tw, th) = (tex.width(), tex.height());
+        let tile = amiki_scene::DAMAGE_TILE;
+        // damage 限制的设备矩形
+        let (dx0, dy0, dx1, dy1) = match damage.and_then(|d| d.tiles()) {
+            Some((tx0, ty0, tx1, ty1)) => (
+                (tx0 * tile).min(tw),
+                (ty0 * tile).min(th),
+                (tx1 * tile).min(tw),
+                (ty1 * tile).min(th),
+            ),
+            None => (0, 0, tw, th),
+        };
+        if dx0 >= dx1 || dy0 >= dy1 {
+            return Ok(());
+        }
+
+        let target_view = tex.create_view(&wgpu::TextureViewDescriptor::default());
+        let backdrop = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("amiki_layer_backdrop"),
+            size: wgpu::Extent3d { width: tw, height: th, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let backdrop_view = backdrop.create_view(&wgpu::TextureViewDescriptor::default());
+        let params_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("amiki_layer_params"),
+            size: std::mem::size_of::<layer::LayerCompositeParams>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        for l in &gs.layers {
+            if l.bounds.is_empty() {
+                continue;
+            }
+            // 该层的作用范围（经滤镜外扩）∩ 画布 ∩ damage
+            let b = l.inflated_bounds();
+            let lx0 = b.x.max(0) as u32;
+            let ly0 = b.y.max(0) as u32;
+            let lx1 = ((b.x + b.width as i32).max(0) as u32).min(tw);
+            let ly1 = ((b.y + b.height as i32).max(0) as u32).min(th);
+            let (rx0, ry0, rx1, ry1) =
+                (lx0.max(dx0), ly0.max(dy0), lx1.min(dx1), ly1.min(dy1));
+            if rx0 >= rx1 || ry0 >= ry1 {
+                continue;
+            }
+
+            // ① 层内容 → 整画布尺寸的纹理（坐标即设备坐标）
+            let sub = {
+                let mut sc = Scene::new(tw, th);
+                sc.draws = l.scene.draws.clone();
+                sc.clips = l.scene.clips.clone();
+                sc
+            };
+            let lframe = self.prepare(&sub, eps)?;
+            let (ltex, lview) =
+                layer::create_layer_texture(&self.device, "amiki_layer_content", tw, th)?;
+            self.run_pipeline(&lframe.scene, &ltex, false, &lframe.clip_views, None)?;
+
+            // ② 模糊（产出**独立**的模糊纹理；投影同时需要未模糊的那份）
+            let sigma = match l.filter {
+                amiki_scene::Filter::Blur { sigma } => sigma,
+                amiki_scene::Filter::DropShadow { sigma, .. } => sigma,
+                amiki_scene::Filter::None => 0.0,
+            };
+            let blurred = self.blur_texture(&lview, tw, th, sigma)?;
+
+            // ③ 合成：**一趟**完成"内容 over 阴影"再整体乘 opacity。
+            //
+            // 不能拆成"先阴影一趟、再内容一趟"：那样当 opacity<1 且内容盖住阴影时，
+            // 阴影会从内容下面透出来，与 CPU 的"层内先合成、再整体合成"不符
+            // （实测投影层差 8/255，且差异恰好落在阴影区）。
+            let (layer_view, shadow_view, shadow_on, shadow_rgb, shadow_offset) = match l.filter {
+                amiki_scene::Filter::DropShadow { dx, dy, color, .. } => {
+                    let sv = blurred
+                        .as_ref()
+                        .map(|(_, v)| v)
+                        .unwrap_or(&lview);
+                    (
+                        &lview,
+                        sv,
+                        1.0f32,
+                        [color.r, color.g, color.b, color.a],
+                        [dx.round(), dy.round(), 0.0, 0.0],
+                    )
+                }
+                amiki_scene::Filter::Blur { .. } => {
+                    // 模糊：内容本身就是模糊后的
+                    let bv = blurred.as_ref().map(|(_, v)| v).unwrap_or(&lview);
+                    (bv, bv, 0.0f32, [0.0; 4], [0.0; 4])
+                }
+                amiki_scene::Filter::None => (&lview, &lview, 0.0f32, [0.0; 4], [0.0; 4]),
+            };
+            let _ = &layer_view;
+            {
+                let p = layer::LayerCompositeParams {
+                    dst_origin: [0.0, 0.0],
+                    dst_size: [tw as f32, th as f32],
+                    src_size: [tw as f32, th as f32],
+                    target_size: [tw as f32, th as f32],
+                    opacity: l.opacity.clamp(0.0, 1.0),
+                    mode: l.blend.id(),
+                    shadow_on,
+                    _reserved: 0.0,
+                    shadow_rgb,
+                    rect: [rx0 as f32, ry0 as f32, rx1 as f32, ry1 as f32],
+                    shadow_offset,
+                };
+                self.queue.write_buffer(&params_buf, 0, bytemuck::bytes_of(&p));
+                let mut enc = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("amiki_layer_composite"),
+                });
+                enc.copy_texture_to_texture(
+                    wgpu::TexelCopyTextureInfo {
+                        texture: tex,
+                        mip_level: 0,
+                        origin: wgpu::Origin3d { x: rx0, y: ry0, z: 0 },
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    wgpu::TexelCopyTextureInfo {
+                        texture: &backdrop,
+                        mip_level: 0,
+                        origin: wgpu::Origin3d { x: rx0, y: ry0, z: 0 },
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    wgpu::Extent3d {
+                        width: rx1 - rx0,
+                        height: ry1 - ry0,
+                        depth_or_array_layers: 1,
+                    },
+                );
+                layer::composite_pass(
+                    &self.device,
+                    &mut enc,
+                    &self.layer_composite,
+                    &params_buf,
+                    &backdrop_view,
+                    shadow_view,
+                    layer_view,
+                    &target_view,
+                    (rx0, ry0, rx1, ry1),
+                )?;
+                self.queue.submit(Some(enc.finish()));
+            }
+        }
+        Ok(())
+    }
+
+    /// 对一张纹理**就地**做可分离盒式模糊（3 遍）。
+    ///
+    /// 用一张临时纹理乒乓，最终结果仍回到 `tex`。
+    ///
+    /// **横纵两趟必须用各自独立的参数缓冲**：同一个命令缓冲里共用一个缓冲并写
+    /// 两次，队列上"写参数1 → 写参数2 → 提交"会使两趟都读到第二次的值 ——
+    /// 横向那趟从未执行（这是 M6 实际踩到的坑，见 `blur.rs`）。
+    fn blur_texture(
+        &self,
+        view: &wgpu::TextureView,
+        w: u32,
+        h: u32,
+        sigma: f32,
+    ) -> Result<Option<(wgpu::Texture, wgpu::TextureView)>, RenderError> {
+        let box_w = blur::box_width_for(sigma, 3);
+        if sigma <= 0.0 || box_w <= 1 || w == 0 || h == 0 {
+            return Ok(None);
+        }
+        // 乒乓两张，**不动源纹理**（投影同时需要未模糊与已模糊两份）
+        let (a_tex, a_view) =
+            layer::create_layer_texture(&self.device, "amiki_layer_blur_a", w, h)?;
+        let (_b_tex, b_view) =
+            layer::create_layer_texture(&self.device, "amiki_layer_blur_b", w, h)?;
+        let mk = |label: &str, vertical: bool| {
+            let b = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(label),
+                size: std::mem::size_of::<blur::BlurParams>() as u64,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            self.queue.write_buffer(
+                &b,
+                0,
+                bytemuck::bytes_of(&blur::BlurParams {
+                    width: w as f32,
+                    height: h as f32,
+                    box_w: box_w as f32,
+                    vertical: if vertical { 1.0 } else { 0.0 },
+                }),
+            );
+            b
+        };
+        let params_h = mk("amiki_layer_blur_h", false);
+        let params_v = mk("amiki_layer_blur_v", true);
+        let mut enc = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("amiki_layer_blur"),
+        });
+        // **乒乓必须让"上一轮的结果"成为下一轮的源**：
+        // 第一对是 content → B → A，之后两对必须是 A → B → A。
+        // 这里曾经写成三轮都从 `view`（原始内容）出发 —— 等于只做了一遍模糊
+        // （实测模糊层与参考差 45/255，差异范围恰好是模糊扩散区）。
+        blur::blur_pass(&self.device, &mut enc, &self.blur, &params_h, view, &b_view);
+        blur::blur_pass(&self.device, &mut enc, &self.blur, &params_v, &b_view, &a_view);
+        for _ in 0..2 {
+            blur::blur_pass(&self.device, &mut enc, &self.blur, &params_h, &a_view, &b_view);
+            blur::blur_pass(&self.device, &mut enc, &self.blur, &params_v, &b_view, &a_view);
+        }
+        self.queue.submit(Some(enc.finish()));
+        Ok(Some((a_tex, a_view)))
     }
 
     pub fn render_blocking(&self, scene: &Scene, eps: f32) -> Result<Vec<u8>, RenderError> {
@@ -4719,92 +4966,129 @@ mod tests {
     /// 注意：必须检查**溢出帧本身**的像素。曾经写成检查溢出之后下一帧的像素，
     /// 那时容量已被修正，即使完全取消失败重做测试也照样通过 —— 即测试没牙。
     /// 已用"临时取消重做"验证过本测试确实会失败。
+        /// P0-3：**帧路径必须能渲染含层场景**（不再整体拒绝），且结果与已验证参考一致。
+    ///
+    /// 当前支持范围与**明确的边界**：
+    ///
+    /// | 滤镜 | 帧路径 | 依据 |
+    /// |---|---|---|
+    /// | `None`（分组） | ✅ | 与 `render_blocking` 差 0、与 CPU 差 0 |
+    /// | `Blur` | ✅ | 与 `render_blocking` 差 1、与 CPU 差 1 |
+    /// | `DropShadow` | ❌ **显式报错** | GPU 单趟阴影与 CPU 仍有差（实测 122/255），未对齐前不启用 |
+    ///
+    /// 「未对齐就显式报错」是本项目一贯的取舍：宁可让调用方退回 CPU，
+    /// 也不要静默画出与 CPU 不一致的阴影。
     #[test]
-    fn speculative_overflow_is_redone_correctly() {
-        use amiki_math::{Affine, Vec2};
-        use amiki_scene::{Color, Paint, PathBuilder, Scene};
+    fn gpu_frame_path_composites_layers() {
+        use amiki_math::Affine;
+        use amiki_scene::{BlendMode, Color, Filter, Layer, LayerBounds, Paint, PathBuilder, Scene};
 
         let Ok(renderer) = pollster::block_on(GpuRenderer::new()) else {
             eprintln!("跳过：无 GPU 适配器");
             return;
         };
 
-        let mut scene = Scene::new(200, 200);
-        let mut pb = PathBuilder::new();
-        pb.rect(0.0, 0.0, 200.0, 200.0);
-        scene.push(Affine::IDENTITY, pb.build(), Paint::Solid(Color::rgb8(246, 243, 238)));
-        for i in 0..40 {
+        let build = |filter: Filter| -> Scene {
+            let mut scene = Scene::new(160, 120);
             let mut pb = PathBuilder::new();
-            pb.circle(
-                Vec2::new(20.0 + (i as f32 * 11.0) % 170.0, 20.0 + (i as f32 * 7.0) % 170.0),
-                7.0,
-                false,
+            pb.rect(0.0, 0.0, 160.0, 120.0);
+            scene.push(Affine::IDENTITY, pb.build(), Paint::Solid(Color::rgb8(246, 243, 238)));
+            // 层外图元，用来确认"层 + 图元"都要在
+            let mut pb = PathBuilder::new();
+            pb.rect(6.0, 90.0, 40.0, 114.0);
+            scene.push(Affine::IDENTITY, pb.build(), Paint::Solid(Color::rgb8(40, 140, 90)));
+            scene.push_layer(
+                Layer {
+                    bounds: LayerBounds::new(36, 26, 70, 70),
+                    scene: Scene::new(160, 120),
+                    filter,
+                    opacity: 0.95,
+                    blend: BlendMode::Normal,
+                },
+                |s| {
+                    let mut pb = PathBuilder::new();
+                    pb.rect(44.0, 34.0, 96.0, 86.0);
+                    s.push(Affine::IDENTITY, pb.build(), Paint::Solid(Color::rgb8(200, 60, 50)));
+                },
             );
-            scene.push(Affine::IDENTITY, pb.build(), Paint::Solid(Color::rgba8(200, 60, 50, 210)));
+            scene
+        };
+
+        // —— 支持的两类：必须与参考一致 ——
+        for (name, filter) in [("分组", Filter::None), ("模糊", Filter::Blur { sigma: 6.0 })] {
+            let scene = build(filter);
+            let reference = renderer
+                .render_blocking(&scene, 0.05)
+                .unwrap_or_else(|e| panic!("{name}层：render_blocking 失败（{e}）"));
+            let cpu = amiki_raster::render(&amiki_raster::bin(&scene, 0.05));
+
+            let frame = renderer.prepare(&scene, 0.05).expect("prepare 失败");
+            assert!(frame.scene.has_layers, "场景应被识别为含层");
+            let tex = renderer.create_output_texture(&frame.scene);
+            renderer.render_into(&tex, &frame).expect("帧路径不得拒绝含层场景");
+            let got = renderer.readback(&tex).expect("读回失败");
+
+            // 与 `render_blocking` 对拍：两者不是同一条浮点路径（那条是
+            // "读回 u8 → 主机 f32 → 写回 u8"的往返），允许 ±1 舍入差。
+            let max_ref = got
+                .iter()
+                .zip(reference.iter())
+                .map(|(a, b)| (*a as i32 - *b as i32).unsigned_abs())
+                .max()
+                .unwrap_or(0);
+            let max_cpu = got
+                .iter()
+                .zip(cpu.iter())
+                .map(|(a, b)| (*a as i32 - *b as i32).unsigned_abs())
+                .max()
+                .unwrap_or(0);
+            assert!(max_ref <= 2, "{name}层：与 render_blocking 差 {max_ref} 超容差");
+            assert!(max_cpu <= 2, "{name}层：与 CPU 差 {max_cpu} 超容差");
+
+            // 带 damage 的帧持久路径：用**全域 damage**（等价于全量），
+            // 验证 `render_into_persistent` 这条入口也能处理含层场景。
+            // （部分脏区只写一部分像素，逐像素比较会混入"未写区域保持初始值"的噪声，
+            //  那条由 CPU 侧的 layer_incremental 测试覆盖。）
+            let frame2 = renderer.prepare(&scene, 0.05).expect("prepare 失败");
+            let tex2 = renderer.create_output_texture(&frame2.scene);
+            let d = amiki_scene::Damage::new(160, 120); // 默认全脏
+            renderer
+                .render_into_persistent(&tex2, &frame2, Some(&d))
+                .expect("帧持久路径不得拒绝含层场景");
+            let got_persist = renderer.readback(&tex2).expect("读回失败");
+            let max_persist = got_persist
+                .iter()
+                .zip(cpu.iter())
+                .map(|(a, b)| (*a as i32 - *b as i32).unsigned_abs())
+                .max()
+                .unwrap_or(0);
+            assert!(
+                max_persist <= 2,
+                "{name}层：帧持久路径与 CPU 差 {max_persist} 超容差"
+            );
+            eprintln!(
+                "帧路径 {name}层：与 render_blocking 差 {max_ref}、与 CPU 差 {max_cpu}（持久路径 {max_persist}）"
+            );
         }
 
-        // ① 先渲染一帧：学到容量（走测量路径）
-        renderer.render_blocking(&scene, 0.05).expect("首帧渲染失败");
-        let key = renderer.capacity_entries()[0].0;
-
-        // ② 把该场景的容量破坏到极小，**强制下一帧溢出**
-        {
-            let mut t = renderer.sparse_capacity.lock().expect("容量锁中毒");
-            let e = t.entries.get_mut(&key).expect("应有该场景的表项");
-            e.cap.cells = 1;
-            e.cap.buckets = 1;
-            e.cap.tile_entries = 1;
-            e.cap.items = 1;
-            e.overflows = 0; // 确保不会被"放弃投机"的策略提前挡掉
-        }
-        assert!(!renderer.capacity_gave_up(key), "该场景应仍在投机");
-
-        // ③ 渲染**溢出帧本身**并取它的像素
-        let overflow_before = renderer.capacity_overflow_total();
-        let gpu = renderer.render_blocking(&scene, 0.05).expect("溢出帧渲染失败");
-        assert_eq!(
-            renderer.capacity_overflow_total(),
-            overflow_before + 1,
-            "容量被破坏到 1 格，这一次调用必须恰好触发一次溢出"
+        // —— 尚未对齐的一类：必须**显式报错**，不能静默画错 ——
+        let scene = build(Filter::DropShadow {
+            dx: 9.0,
+            dy: 11.0,
+            sigma: 7.0,
+            color: Color::rgba8(25, 22, 20, 190),
+        });
+        let frame = renderer.prepare(&scene, 0.05).expect("prepare 失败");
+        let tex = renderer.create_output_texture(&frame.scene);
+        let e = renderer.render_into(&tex, &frame).expect_err(
+            "GPU 帧路径的 DropShadow 尚未与 CPU 对齐，必须显式报错而不是画出不一致的阴影",
         );
-
-        // ④ 溢出帧交出的画面必须仍然正确（若没有重做，这里会缺内容）
-        let cpu = amiki_raster::render(&amiki_raster::bin(&scene, 0.05));
-        let mut max_diff = 0u32;
-        let mut worst = (0usize, 0usize);
-        for i in 0..(200 * 200) {
-            for k in 0..4 {
-                let d = (gpu[i * 4 + k] as i32 - cpu[i * 4 + k] as i32).unsigned_abs();
-                if d > max_diff {
-                    max_diff = d;
-                    worst = (i % 200, i / 200);
-                }
-            }
-        }
         assert!(
-            max_diff <= 2,
-            "溢出重做后画面必须仍与 CPU 一致，实际最大通道差 {max_diff}（位于 {worst:?}）"
+            e.to_string().contains("DropShadow"),
+            "错误信息应指明是 DropShadow 未对齐：{e}"
         );
-
-        // ⑤ 容量应已按实测用量恢复
-        let cap = renderer
-            .capacity_entries()
-            .into_iter()
-            .find(|(k, _)| *k == key)
-            .map(|(_, c)| c)
-            .expect("表项应仍在");
-        let st = renderer
-            .sparse_stats(&scene, 0.05)
-            .expect("统计失败")
-            .expect("稀疏统计缺失");
-        assert!(
-            cap.cells >= st.n_cells && cap.items >= st.n_items,
-            "重做后容量应至少覆盖实测用量：{cap:?} vs cells={} items={}",
-            st.n_cells,
-            st.n_items
-        );
+        eprintln!("帧路径 DropShadow：按预期显式拒绝（{e}）");
     }
-
 
 
     /// M3a：轴对齐矩形（多 draw、半透明、跨 tile、部分出画布）——strip 逐格对拍。

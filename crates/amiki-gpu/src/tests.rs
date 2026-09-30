@@ -1566,3 +1566,167 @@ fn measure_actual_parallel_speedup() {
     let p_ms = (0..3).map(|_| parallel()).fold(f64::MAX, f64::min);
     eprintln!("[并行度] {nth} 线程：串行 {s_ms:.2} ms，并行 {p_ms:.2} ms，加速 {:.2}×", s_ms / p_ms);
 }
+
+/// P1-1 诊断：`build_gpu_scene` 的 **780 µs 花在哪**。
+///
+/// 上一轮只知道"并行完全没加速"，但不知道各段占比 —— 不知道占比就无法决定
+/// 该优化哪一段。这里把三段分开测：
+///   A. 只走路径（不做任何 push）—— 纯内存延迟
+///   B. 走路径 + push（等比于 `extract_all_prims`）
+///   C. `uniform_segments` 的闭式段数计算（纯算术 + sqrt）
+#[test]
+fn profile_extract_phases() {
+    use amiki_math::Vec2;
+    use amiki_scene::{Color, Paint, PathBuilder, Scene};
+    use std::hint::black_box;
+    use std::time::Instant;
+
+    // 与基准同规模：1080p、10k 条曲线路径
+    let mut scene = Scene::new(1920, 1080);
+    for i in 0..10_000u32 {
+        let x = (i % 100) as f32 * 18.0;
+        let y = (i / 100) as f32 * 10.0;
+        let mut pb = PathBuilder::new();
+        pb.move_to(Vec2::new(x, y));
+        pb.cubic_to(
+            Vec2::new(x + 6.0, y - 5.0),
+            Vec2::new(x + 12.0, y + 5.0),
+            Vec2::new(x + 18.0, y),
+        );
+        scene.push(amiki_math::Affine::IDENTITY, pb.build(), Paint::Solid(Color::rgb8(200, 60, 50)));
+    }
+
+    let rep = |f: &dyn Fn() -> f64| -> f64 {
+        let mut best = f64::MAX;
+        for _ in 0..5 {
+            let t = Instant::now();
+            black_box(f());
+            best = best.min(t.elapsed().as_secs_f64() * 1e3);
+        }
+        best
+    };
+
+    // A. 只走路径：读每个元素的坐标并累加，不写任何输出
+    let a = rep(&|| {
+        let mut acc = 0.0f64;
+        for d in &scene.draws {
+            for el in &d.path.els {
+                let m = d.transform.map_point(match *el {
+                    amiki_scene::PathEl::MoveTo(p)
+                    | amiki_scene::PathEl::LineTo(p) => p,
+                    amiki_scene::PathEl::QuadTo(_, p) => p,
+                    amiki_scene::PathEl::CubicTo(_, _, p) => p,
+                    amiki_scene::PathEl::Close => Vec2::ZERO,
+                });
+                acc += m.x as f64 + m.y as f64;
+            }
+        }
+        acc
+    });
+
+    // B. 完整的提取（走路径 + push 到三个数组）
+    let b = rep(&|| {
+        let t = Instant::now();
+        let gs = crate::build_gpu_scene(&scene, 0.05);
+        let ms = t.elapsed().as_secs_f64() * 1e3;
+        black_box(gs.total_segments);
+        ms
+    });
+
+    // C. 只做闭式段数计算（对 B 里产出的曲线逐条算）
+    let gs = crate::build_gpu_scene(&scene, 0.05);
+    let cubics = gs.cubics.clone();
+    let c = rep(&|| {
+        let mut acc = 0u64;
+        for q in &cubics {
+            let cb = amiki_math::CubicBez::new(
+                Vec2::new(q[0][0], q[0][1]),
+                Vec2::new(q[0][2], q[0][3]),
+                Vec2::new(q[1][0], q[1][1]),
+                Vec2::new(q[1][2], q[1][3]),
+            );
+            acc += cb.uniform_segments(0.05) as u64;
+        }
+        acc as f64
+    });
+
+    eprintln!("[分段] A 只走路径     = {a:.3} ms");
+    eprintln!("[分段] B 完整提取     = {b:.3} ms（含 A + push + 段数计算）");
+    eprintln!("[分段] C 仅段数计算   = {c:.3} ms");
+    eprintln!("[分段] → push 与装配 ≈ {:.3} ms", b - a - c);
+    assert!(b > 0.0);
+}
+
+/// P1-1 诊断：**帧路径**（`prepare` + `render_into` + poll）的耗时分解。
+///
+/// 之前引用的是 `profile()` 的分段，而 `profile()` 走的是**阻塞路径**（含读回），
+/// 未必描述 `render_into`。这里直接测帧路径的三段。
+#[test]
+fn profile_frame_path_phases() {
+    use std::hint::black_box;
+    use std::time::Instant;
+    let Ok(renderer) = pollster::block_on(crate::GpuRenderer::new()) else {
+        eprintln!("跳过：无 GPU 适配器");
+        return;
+    };
+    // 与基准同规模、同形状的场景（圆：每条 4 条三次曲线）
+    let scene = {
+        use amiki_math::{Affine, Vec2};
+        use amiki_scene::{Color, Paint, PathBuilder, Scene};
+        let (w, h, n, r) = (1920.0f32, 1080.0f32, 10_000usize, 5.0f32);
+        let mut sc = Scene::new(1920, 1080);
+        let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = || {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            ((seed >> 33) as f32) / (u32::MAX >> 1) as f32
+        };
+        for i in 0..n {
+            let c = Vec2::new(r + next() * (w - 2.0 * r), r + next() * (h - 2.0 * r));
+            let mut pb = PathBuilder::new();
+            pb.circle(c, r * (0.6 + 0.8 * next()), false);
+            let t = if i % 3 == 0 { Affine::rotate(next() * 1.5) } else { Affine::IDENTITY };
+            let col = Color::rgba8(
+                (next() * 255.0) as u8,
+                (next() * 255.0) as u8,
+                (next() * 255.0) as u8,
+                200,
+            );
+            sc.push(t, pb.build(), Paint::Solid(col));
+        }
+        sc
+    };
+    let tex = renderer
+        .device
+        .create_texture(&wgpu::TextureDescriptor {
+            label: Some("phase_out"),
+            size: wgpu::Extent3d { width: 1920, height: 1080, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::STORAGE_BINDING
+                | wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+
+    let mut t_prep = f64::MAX;
+    let mut t_draw = f64::MAX;
+    let mut t_poll = f64::MAX;
+    let mut t_all = f64::MAX;
+    for _ in 0..8 {
+        let a = Instant::now();
+        let frame = renderer.prepare(black_box(&scene), 0.05).expect("prepare");
+        let b = Instant::now();
+        renderer.render_into(&tex, &frame).expect("render");
+        let c = Instant::now();
+        renderer.device.poll(wgpu::PollType::Wait).expect("poll");
+        let d = Instant::now();
+        t_prep = t_prep.min((b - a).as_secs_f64() * 1e3);
+        t_draw = t_draw.min((c - b).as_secs_f64() * 1e3);
+        t_poll = t_poll.min((d - c).as_secs_f64() * 1e3);
+        t_all = t_all.min((d - a).as_secs_f64() * 1e3);
+    }
+    eprintln!("[帧路径] prepare {t_prep:.2} ms + render_into {t_draw:.2} ms + poll {t_poll:.2} ms = {t_all:.2} ms");
+    assert!(t_all > 0.0);
+}

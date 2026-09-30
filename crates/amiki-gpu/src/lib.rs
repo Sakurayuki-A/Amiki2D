@@ -705,8 +705,24 @@ fn pack_image_place(gs: &GpuScene) -> Vec<[f32; 4]> {
     out
 }
 
-/// 校验脏区与画布 tile 尺寸一致。
+/// M6：**GPU 侧尚未实现离屏层（滤镜）**。
 ///
+/// 这必须显式拒绝，而不是当作"场景里没这两笔"继续渲染 ——
+/// 那样画面会**静默少掉阴影/模糊**，而调用方完全看不出来。
+/// 返回错误后由上层决定（例如回落到 CPU 引擎）。
+fn reject_layers(scene: &Scene) -> Result<(), RenderError> {
+    if scene.layers.is_empty() {
+        return Ok(());
+    }
+    // 层内也可能嵌套层，深度检查一次即可（层内的层同样是未实现）
+    err(format!(
+        "GPU 路径尚未实现离屏层（滤镜）：场景含 {} 个层。\
+         请改用 CPU 引擎（amiki_raster::render）或在 GPU 路径移除层",
+        scene.layers.len()
+    ))
+}
+
+/// 校验脏区与画布 tile 尺寸一致。///
 /// `Damage` 用的是它自己的画布 tile 数，而派发范围按当前场景的 tile 数钳制。
 /// 若两者不一致（例如调用方复用了为不同尺寸画布建的 `Damage`），
 /// "全脏"会被误判成"只脏左上角"，从而**静默留下陈旧像素**。
@@ -2464,6 +2480,7 @@ impl GpuRenderer {
     /// 准备逐帧资源：GpuScene 提取 + clip 覆盖率纹理。
     pub fn prepare(&self, scene: &Scene, eps: f32) -> Result<Frame, RenderError> {
         use amiki_scene::{Color, Paint};
+        reject_layers(scene)?;
         let main_scene = build_gpu_scene(scene, eps);
         let mut clip_texs = Vec::new();
         let mut clip_views = Vec::new();
@@ -2632,6 +2649,7 @@ impl GpuRenderer {
 
     /// 阻塞式渲染 + 读回（示例/测试便利入口）。
     pub fn render_blocking(&self, scene: &Scene, eps: f32) -> Result<Vec<u8>, RenderError> {
+        reject_layers(scene)?;
         let tex = self.render(scene, eps)?;
         self.readback(&tex)
     }

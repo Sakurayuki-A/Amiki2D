@@ -146,6 +146,54 @@ impl Canvas {
         )
     }
 
+    /// 推入一个**离屏层**：闭包里的所有绘制会先渲到独立缓冲，
+    /// 整层套上 `filter`，再按 `opacity` 与 `blend` 合成回画布（M6）。
+    ///
+    /// 这是模糊/阴影的唯一实现途径 —— 它们要读取"周围像素"，
+    /// 而周围像素只有整层画完之后才存在，无法逐图元计算。
+    ///
+    /// `bounds` 是**设备空间**的层范围，须由调用方给出：被模糊的层影响范围会
+    /// 超出内容包围盒，引擎自行推导必须算准每个滤镜的外扩量，任何保守不足都会
+    /// 让边缘被切掉且很难察觉。语义清楚比"少写一个参数"重要。
+    ///
+    /// ```ignore
+    /// canvas.push_layer_filtered(
+    ///     LayerBounds::new(40, 40, 200, 120),
+    ///     Filter::Blur { sigma: 8.0 },
+    ///     1.0,
+    ///     BlendMode::Normal,
+    ///     |c| { c.rect(40.0, 40.0, 240.0, 160.0, Paint::Solid(RED)); },
+    /// );
+    /// ```
+    pub fn push_layer_filtered<F>(
+        &mut self,
+        bounds: amiki_scene::LayerBounds,
+        filter: amiki_scene::Filter,
+        opacity: f32,
+        blend: amiki_scene::BlendMode,
+        build: F,
+    ) -> &mut Self
+    where
+        F: FnOnce(&mut Canvas),
+    {
+        // 层内的画布从"单位变换"开始：层的 bounds 已是设备空间，
+        // 层内绘制用设备坐标即可（与父场景同一套坐标，减少一类坐标错误）。
+        let mut sub = Canvas::new(self.scene.width, self.scene.height);
+        sub.blend = blend;
+        build(&mut sub);
+        self.scene.push_layer(
+            amiki_scene::Layer {
+                bounds,
+                scene: sub.scene,
+                filter,
+                opacity,
+                blend,
+            },
+            |_| {},
+        );
+        self
+    }
+
     pub fn rect(&mut self, x0: f32, y0: f32, x1: f32, y1: f32, paint: Paint) -> &mut Self {
         let mut pb = PathBuilder::new();
         pb.rect(x0, y0, x1, y1);

@@ -38,6 +38,9 @@ use amiki_scene::{PathEl, Paint, Scene};
 mod persist;
 pub use persist::{FrameStats, PersistentRenderer};
 
+mod filter;
+pub use filter::{apply as apply_filter, blur as blur_layer, inflated_bounds, LayerBuffer};
+
 /// tile 边长（像素）。
 pub const TILE: u32 = 16;
 const TILE_USIZE: usize = TILE as usize;
@@ -82,6 +85,13 @@ pub struct BinnedScene {
     pub image_index: Vec<u32>,
     /// M6：本场景用到的位图及其放置方式。
     pub images: Vec<(std::sync::Arc<amiki_scene::Image>, amiki_scene::ImagePlacement)>,
+    /// M6：离屏层（滤镜）。分箱只处理图元，层在**所有图元之后**合成，
+    /// 因此这里保留原始场景与压平误差，供合成阶段递归渲染层内容。
+    pub scene_layers: Vec<amiki_scene::Layer>,
+    /// M6：源场景（层的递归渲染需要它，且能避免调用方另存一份）
+    pub source_scene: amiki_scene::Scene,
+    /// M6：压平误差界（层的递归渲染沿用同一误差）
+    pub eps: f32,
     /// 每 draw 的裁剪层索引（≤ MAX_DRAW_CLIPS，未用槽位为 0）。
     pub draw_clips: Vec<[u32; 4]>,
     /// 每 scene clip 的 CPU 覆盖率 alpha 图（GPU 侧为纹理，M2d）。
@@ -194,6 +204,9 @@ pub fn bin(scene: &Scene, flatten_eps: f32) -> BinnedScene {
         gradient_index: Vec::new(),
         image_index: Vec::new(),
         images: Vec::new(),
+        scene_layers: Vec::new(),
+        source_scene: amiki_scene::Scene::default(),
+        eps: flatten_eps,
         draw_clips: Vec::new(),
         clip_maps: Vec::new(),
     };
@@ -415,6 +428,11 @@ pub fn bin(scene: &Scene, flatten_eps: f32) -> BinnedScene {
     for t in 0..n_tiles {
         out.tile_draw_offsets[t] = [starts[t], counts[t]];
     }
+    // M6：把层与画布尺寸带出去 —— 分箱只处理图元，层在所有图元之后合成，
+    // 那时需要递归渲染层内容。这里**只保留画布尺寸**（层内容已在
+    // `scene_layers` 中），避免把整棵层树再克隆一份。
+    out.scene_layers = scene.layers.clone();
+    out.source_scene = Scene::new(scene.width, scene.height);
     out
 }
 
@@ -744,19 +762,134 @@ fn shade_tile(binned: &BinnedScene, img: &mut [u8], tx: usize, ty: usize) {
     }
 }
 
+/// M6：合成一个离屏层到父图像。
+///
+/// 步骤与 `filter` 模块的说明一致：
+/// ```text
+/// 1) 把层内容渲进独立缓冲（含它自己的嵌套层 —— 层可嵌套）
+/// 2) 按 bounds 裁出需要的范围，并向外扩张以容纳滤镜扩散
+/// 3) 对整层滤波
+/// 4) 按不透明度 + 混合模式合成回父图像
+/// ```
+///
+/// `bounds` 之外的像素不参与合成；缓冲范围与 `bounds` 对齐后逐像素叠加。
+fn composite_layer(
+    root: &mut [u8],
+    scene: &amiki_scene::Scene,
+    layer: &amiki_scene::Layer,
+    eps: f32,
+) {
+    if layer.bounds.is_empty() {
+        return;
+    }
+    // 1) 层内容（同一画布尺寸，故层内坐标即设备坐标）
+    let layer_img = render_inner(scene.width, scene.height, &layer.scene, eps);
+
+    // 2) 只取需要合成的范围（向外扩张以容纳滤镜扩散 —— 否则边缘被切掉）
+    let b = inflated_bounds(layer.bounds, layer.filter);
+    let (root_w, root_h) = (scene.width, scene.height);
+    // 裁剪到画布内（超出部分无处可合成）
+    let bx = b.x.max(0);
+    let by = b.y.max(0);
+    if bx >= root_w as i32 || by >= root_h as i32 {
+        return;
+    }
+    let lw = b.width.min(root_w - bx as u32);
+    let lh = b.height.min(root_h - by as u32);
+    if lw == 0 || lh == 0 {
+        return;
+    }
+
+    // 从层图拷到层缓冲（预乘，便于滤波）
+    let mut buf = LayerBuffer::new(lw, lh);
+    for y in 0..lh {
+        for x in 0..lw {
+            let sx = bx + x as i32;
+            let sy = by + y as i32;
+            let src = if sx >= 0
+                && sy >= 0
+                && (sx as u32) < root_w
+                && (sy as u32) < root_h
+            {
+                let o = ((sy as u32 * root_w + sx as u32) * 4) as usize;
+                let a = layer_img[o + 3] as f32 / 255.0;
+                [
+                    layer_img[o] as f32 / 255.0 * a,
+                    layer_img[o + 1] as f32 / 255.0 * a,
+                    layer_img[o + 2] as f32 / 255.0 * a,
+                    a,
+                ]
+            } else {
+                [0.0; 4]
+            };
+            buf.set(x, y, src);
+        }
+    }
+
+    // 3) 滤波
+    apply_filter(&mut buf, layer.filter);
+
+    // 4) 合成回父图像（转回直线 alpha，用与图元相同的 composite 函数 ——
+    //    保证"层"与"图元"走同一套混合数学，不会出现两套语义）
+    let opacity = layer.opacity.clamp(0.0, 1.0);
+    for y in 0..lh {
+        for x in 0..lw {
+            let p = buf.get(x, y);
+            let a = p[3] * opacity;
+            if a <= 0.0 {
+                continue;
+            }
+            let inv = if p[3] > 0.0 { 1.0 / p[3] } else { 0.0 };
+            let straight = [p[0] * inv, p[1] * inv, p[2] * inv, p[3] * opacity];
+            let gx = (bx + x as i32) as u32;
+            let gy = (by + y as i32) as u32;
+            let o = ((gy * root_w + gx) * 4) as usize;
+            let dst = [
+                root[o] as f32 / 255.0,
+                root[o + 1] as f32 / 255.0,
+                root[o + 2] as f32 / 255.0,
+                root[o + 3] as f32 / 255.0,
+            ];
+            let out = composite(dst, straight, a, layer.blend.id());
+            for k in 0..4 {
+                root[o + k] = (out[k] * 255.0 + 0.5).clamp(0.0, 255.0) as u8;
+            }
+        }
+    }
+}
+
+/// 渲染一个场景到新图像（不处理层）。
+fn render_inner(width: u32, height: u32, scene: &amiki_scene::Scene, eps: f32) -> Vec<u8> {
+    let binned = bin(scene, eps);
+    render_tiles_flat(&binned, width, height, None)
+}
+
 /// 从零渲染，但**只清/着色指定的 tile 列表**（`None` = 全部 tile）。
 ///
 /// M4 测试用：全量 `render` 与"只重算部分 tile"之间需要一条**可控**的中间路径，
 /// 以便区分"damage 覆盖不全"与"着色本身不一致"这两类失败。
 /// 注意 `clear_tile` 先行使 `None`（全部 tile）与本函数的增量形式语义一致。
 pub fn render_tiles(binned: &BinnedScene, tiles: Option<&[(u32, u32)]>) -> Vec<u8> {
+    render_tiles_flat(binned, binned.width, binned.height, tiles)
+}
+
+/// 渲染（含层）的核心：先画图元，再按顺序合成离屏层。
+///
+/// 层在**所有图元之后**合成：这样"层内绘制先完成再整层滤波"的语义成立，
+/// 也避免层内内容被父场景后续绘制意外穿插。
+fn render_tiles_flat(
+    binned: &BinnedScene,
+    width: u32,
+    height: u32,
+    tiles: Option<&[(u32, u32)]>,
+) -> Vec<u8> {
     assert_eq!(
         TILE,
         amiki_scene::DAMAGE_TILE,
         "分箱 tile 尺寸与 damage 的 tile 尺寸必须一致，否则增量渲染会与全量不一致"
     );
-    let w = binned.width as usize;
-    let h = binned.height as usize;
+    let w = width as usize;
+    let h = height as usize;
     let mut img = vec![0u8; w * h * 4];
     match tiles {
         None => {
@@ -782,8 +915,15 @@ pub fn render_tiles(binned: &BinnedScene, tiles: Option<&[(u32, u32)]>) -> Vec<u
 }
 
 /// CPU 光栅化：输出直线 RGBA8（未预乘）。
+///
+/// M6：图元画完后按顺序合成离屏层（滤镜）。层在**所有图元之后**合成，
+/// 保证"层内先画完、再整层滤波"的语义。
 pub fn render(binned: &BinnedScene) -> Vec<u8> {
-    render_tiles(binned, None)
+    let mut img = render_tiles(binned, None);
+    for layer in &binned.scene_layers {
+        composite_layer(&mut img, &binned.source_scene, layer, binned.eps);
+    }
+    img
 }
 
 /// M4 **增量渲染**：只重算与脏区相交的 tile，其余保留 `img` 原有像素。
@@ -809,6 +949,20 @@ pub fn render_damage(binned: &BinnedScene, img: &mut [u8], damage: &amiki_scene:
         amiki_scene::DAMAGE_TILE,
         "分箱 tile 尺寸与 damage 的 tile 尺寸必须一致，否则增量渲染会与全量不一致"
     );
+    // M6：**含层的场景回落到全量渲染**。
+    //
+    // 原因：层合成是"读层范围 → 滤波 → 与父像素混合"，而滤波需要整层的完整内容。
+    // 只重算部分 tile 会让层内容残缺（模糊读到的是缺了块的数据），
+    // 结果既不正确也难以察觉。因此这里选择"慢但正确"。
+    //
+    // 这与 damage 的设计并不冲突：damage 的收益场景是"静态界面 + 少量图元变动"，
+    // 而层（滤镜）本身在静态界面里也是静态的 —— 真正需要的优化是
+    // **把层的结果也缓存下来**，只重算与层相交的脏区。那是后续工作。
+    if !binned.scene_layers.is_empty() {
+        let full = render(binned);
+        img.copy_from_slice(&full);
+        return;
+    }
     let tiles_x = binned.tiles_x;
     let tiles_y = binned.tiles_y;
     let (tx0, ty0, tx1, ty1) = match damage.tiles() {

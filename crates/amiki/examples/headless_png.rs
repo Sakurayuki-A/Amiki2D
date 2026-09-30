@@ -294,16 +294,32 @@ fn main() {
         let mut c = amiki::Canvas::new(cw, ch);
         c.rect(0.0, 0.0, cw as f32, ch as f32, Paint::Solid(Color::rgb8(246, 243, 238)));
 
-        // 位图：等比缩放 + 圆角外框（用裁剪展示图像与图形协作）
+        // 位图：等比缩放 + 裁剪，并套一层**投影**（M6 层树）
         let (ix, iy, iw) = (64.0f32, 96.0f32, 420.0f32);
         let ih = iw * (img.height as f32) / (img.width as f32);
-        {
-            let mut clip = PathBuilder::new();
-            clip.rect(ix - 6.0, iy - 6.0, ix + iw + 6.0, iy + ih + 6.0);
-            c.push_clip(&clip.build());
-            c.image(img.clone(), ix, iy, ix + iw, iy + ih);
-            c.pop_clip();
-        }
+        c.push_layer_filtered(
+            amiki::scene::LayerBounds::new(
+                (ix - 10.0) as i32,
+                (iy - 10.0) as i32,
+                (iw + 20.0) as u32,
+                (ih + 20.0) as u32,
+            ),
+            amiki::scene::Filter::DropShadow {
+                dx: 10.0,
+                dy: 12.0,
+                sigma: 9.0,
+                color: Color::rgba8(30, 26, 22, 190),
+            },
+            1.0,
+            amiki::scene::BlendMode::Normal,
+            |lc| {
+                let mut clip = PathBuilder::new();
+                clip.rect(ix, iy, ix + iw, iy + ih);
+                lc.push_clip(&clip.build());
+                lc.image(img.clone(), ix, iy, ix + iw, iy + ih);
+                lc.pop_clip();
+            },
+        );
 
         // 渐变横幅（线性 + 径向各一条，展示两种几何）
         let linear = std::sync::Arc::new(
@@ -332,6 +348,19 @@ fn main() {
         );
         c.rect(600.0, 260.0, 920.0, 580.0, Paint::Gradient(radial));
 
+        // 模糊（M6 层树）：把一组几何整体模糊，展示"逐图元无法实现"的效果
+        c.push_layer_filtered(
+            amiki::scene::LayerBounds::new(950, 260, 250, 250),
+            amiki::scene::Filter::Blur { sigma: 14.0 },
+            1.0,
+            amiki::scene::BlendMode::Normal,
+            |lc| {
+                lc.circle(Vec2::new(1030.0, 350.0), 52.0, Paint::Solid(Color::rgb8(52, 120, 196)));
+                lc.circle(Vec2::new(1130.0, 400.0), 62.0, Paint::Solid(Color::rgb8(196, 92, 52)));
+                lc.circle(Vec2::new(1075.0, 460.0), 44.0, Paint::Solid(Color::rgb8(96, 170, 96)));
+            },
+        );
+
         // 文字：用渐变着色，并叠在位图与渐变之上
         if let Some(font) = load_inter() {
             if let Ok(run) = amiki_text::shape(&font, "Amiki2D", 96.0) {
@@ -358,7 +387,9 @@ fn main() {
         image::save_buffer("out/amiki_showcase.png", &img_rgba, cw, ch, image::ColorType::Rgba8)
             .expect("保存综合演示 PNG 失败");
         println!(
-            "M6 综合演示：位图（{}×{}）+ 线性/径向渐变 + 渐变文字 → out/amiki_showcase.png（{ms:.0} ms 含设备创建）",
+            "M6 综合演示：位图（{}×{}，投影）+ 线性/径向渐变 + 渐变文字 + 模糊层\n\
+             \x20           注意：滤镜走 CPU 参考实现（GPU 侧尚未实现离屏层，已显式拒绝而非静默丢效果）\n\
+             \x20           → out/amiki_showcase.png（{ms:.0} ms 含设备创建）",
             img.width, img.height
         );
     } else {

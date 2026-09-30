@@ -717,21 +717,120 @@ pub struct Draw {
     pub clips: Vec<u32>,
 }
 
-/// 场景：画布尺寸 + 有序绘制列表（画家算法，后绘制在上）+ 裁剪层。
+/// 一层离屏内容：先渲到独立缓冲，套滤镜，再按变换/混合合成回父场景。
 ///
-/// 派生 `PartialEq` 供 M4 判定"本帧场景与上一帧是否相同"——相同则**一次着色都不做**。
-/// 浮点字段按位比较：只要有一个比特变了就视为"变了"，宁可多算不可漏算。
+/// # 为什么需要它
+///
+/// 模糊、阴影这类效果**不能逐图元计算** —— 它们要读取"周围像素"，
+/// 而周围像素只有在整层画完之后才存在。因此必须把一批绘制放到独立缓冲里
+/// 先合成完，再对整层做一次滤波。这就是"层树"存在的原因。
+///
+/// # 边界由调用方显式给出
+///
+/// 一个被模糊的层，其影响范围会**超出内容本身的包围盒**（模糊半径向外扩散）。
+/// 若引擎自行按内容推导边界，就必须把每个滤镜的外扩量算准，任何一处保守不足
+/// 都会导致边缘被切掉（且很难察觉）。因此这里要求调用方显式给出 `bounds`：
+/// 语义清楚，且"图层多大"本来就是调用方最清楚的事。
+#[derive(Clone, Debug, PartialEq)]
+pub struct Layer {
+    /// 离屏缓冲在**设备空间**的范围（像素），空则跳过该层
+    pub bounds: LayerBounds,
+    /// 层内绘制（设备空间语义，与父场景一致）
+    pub scene: Scene,
+    /// 合成前应用的滤镜
+    pub filter: Filter,
+    /// 层整体不透明度（0..1），乘到每个像素的 alpha 上
+    pub opacity: f32,
+    /// 合回父场景时的混合模式
+    pub blend: BlendMode,
+}
+
+/// 离屏层范围（设备像素，整数以避免半像素采样歧义）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LayerBounds {
+    pub x: i32,
+    pub y: i32,
+    pub width: u32,
+    pub height: u32,
+}
+
+impl LayerBounds {
+    pub fn new(x: i32, y: i32, width: u32, height: u32) -> LayerBounds {
+        LayerBounds { x, y, width, height }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.width == 0 || self.height == 0
+    }
+
+    /// 按半径向外扩张（用于模糊/阴影需要的外扩）。
+    pub fn inflate(&self, r: f32) -> LayerBounds {
+        let d = r.ceil().max(0.0) as i32;
+        LayerBounds {
+            x: self.x - d,
+            y: self.y - d,
+            width: self.width + (d as u32) * 2,
+            height: self.height + (d as u32) * 2,
+        }
+    }
+}
+
+/// 层的滤镜。
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Filter {
+    /// 不做滤波（仅用于离屏合成 / 分组不透明度）
+    None,
+    /// 高斯模糊（`sigma` 为标准差，单位设备像素）
+    Blur { sigma: f32 },
+    /// 投影：先把层内容按 `dx,dy` 偏移并模糊后着色，再与本源叠加
+    DropShadow {
+        dx: f32,
+        dy: f32,
+        sigma: f32,
+        color: Color,
+    },
+}
+
+/// 场景：画布尺寸 + 有序绘制列表（画家算法，后绘制在上）+ 裁剪层 + 离屏层。
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Scene {
     pub width: u32,
     pub height: u32,
     pub draws: Vec<Draw>,
     pub clips: Vec<Clip>,
+    /// M6：离屏层（滤镜）。在 `draws` **之后**按顺序合成 ——
+    /// 保证"层内绘制先完成，再整层滤波"的语义，也避免层内绘制被父场景
+    /// 后续绘制意外穿插。
+    pub layers: Vec<Layer>,
 }
 
 impl Scene {
     pub fn new(width: u32, height: u32) -> Scene {
-        Scene { width, height, draws: Vec::new(), clips: Vec::new() }
+        Scene { width, height, draws: Vec::new(), clips: Vec::new(), layers: Vec::new() }
+    }
+
+    /// 推入一个离屏层，并把子场景交给闭包填充。
+    ///
+    /// 子场景尺寸与父场景相同（层内坐标即设备坐标，`bounds` 只决定
+    /// 实际分配的离屏范围与合成位置）——这样层内绘制可以用与父场景
+    /// 完全相同的坐标思考，不必做原点平移，减少一类坐标错误。
+    pub fn push_layer<F>(&mut self, mut layer: Layer, build: F) -> &mut Self
+    where
+        F: FnOnce(&mut Scene),
+    {
+        layer.scene.width = self.width;
+        layer.scene.height = self.height;
+        let mut sub = std::mem::take(&mut layer.scene);
+        build(&mut sub);
+        layer.scene = sub;
+        self.layers.push(layer);
+        self
+    }
+
+    /// 场景是否**没有任何可绘制内容**（含层内内容）。
+    pub fn is_empty_content(&self) -> bool {
+        self.draws.is_empty()
+            && self.layers.iter().all(|l| l.scene.is_empty_content() || l.bounds.is_empty())
     }
 
     pub fn push(&mut self, transform: Affine, path: Path, paint: Paint) -> &mut Self {

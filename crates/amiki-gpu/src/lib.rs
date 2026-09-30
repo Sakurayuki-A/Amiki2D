@@ -509,6 +509,42 @@ impl FrameProfile {
     }
 }
 
+/// M3.6：稀疏结构规模的**跨帧容量**（投机分配的起点）。
+///
+/// # 为什么需要它
+///
+/// 稀疏结构的规模只有 GPU 测量之后才知道，于是原实现只能
+/// "提交 → 读回规模 → 分配 → 再提交"：两次规模读回各是一次**同步停顿**
+/// （实测读回1 ≈ 2.35 ms，其中约 1.4 ms 是纯 fence/map 延迟）。
+///
+/// 投机分配改成：把**上一帧实测到的用量**当成本帧容量，直接分配、不停顿；
+/// 帧尾只读一次实际用量来更新容量。容量不足时超出的写入会被丢弃
+/// （naga 对 storage buffer 有边界检查），而用量计数仍如实超过容量 —— 据此
+/// 检测溢出、把该帧作废并用实测值重做，**绝不把残缺的画面交出去**。
+///
+/// 容量只是**元素个数**上限（与画布尺寸、场景内容无关）：它描述"要留多少格"，
+/// 因此换场景、换分辨率时它仍然是一个合法（可能偏大或偏小）的上限。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SparseCapacity {
+    /// 稀疏单元数（`cell_aux` / `cell_meta` / `cell_csr` 的规模）
+    pub cells: u32,
+    /// carry 定点桶数
+    pub buckets: u32,
+    /// 逐 tile 桶表条目数（`tile_list` 的规模）
+    pub tile_entries: u32,
+    /// 成员段数（`cell_segs` 的规模）
+    pub items: u32,
+    /// 连续溢出次数：>0 表示上一帧曾因容量不足被作废重做
+    pub overflows: u32,
+}
+
+impl SparseCapacity {
+    /// 容量是否可用（首帧全 0：此时必须走一次测量路径来建立容量）。
+    pub fn is_valid(&self) -> bool {
+        self.cells > 0 && self.items > 0
+    }
+}
+
 impl TimestampRecorder {
     fn new(device: &wgpu::Device) -> TimestampRecorder {
         let count = 2 * MAX_PROFILE_PASSES;
@@ -986,6 +1022,9 @@ pub struct GpuRenderer {
     /// M3.6：MAP_READ 暂存缓冲池（读回复用，避免每次读回都新建 + 冷映射）。
     /// 用 `Mutex` 而非 `RefCell`：`&self` 方法需要内部可变性，且便于将来多线程提交。
     readback_pool: Mutex<Vec<wgpu::Buffer>>,
+    /// M3.6：上一帧实测的稀疏容量（投机分配）。锁中毒时按"无容量"处理
+    /// ——退回精确路径，只会更慢，不会更错。
+    sparse_capacity: Mutex<SparseCapacity>,
     fine_pipeline: wgpu::ComputePipeline,
     coverage_pipeline: wgpu::ComputePipeline,
     fine_bgl: wgpu::BindGroupLayout,
@@ -1426,6 +1465,7 @@ impl GpuRenderer {
             timestamp_period_ns,
             limits,
             readback_pool: Mutex::new(Vec::new()),
+            sparse_capacity: Mutex::new(SparseCapacity::default()),
             device,
             queue,
             fine_pipeline,
@@ -1569,6 +1609,23 @@ impl GpuRenderer {
             n_items: s[3],
             n_strips: s[4],
         }))
+    }
+
+    /// M3.6：当前生效的稀疏容量（投机分配的跨帧状态）。
+    ///
+    /// **运行时报告**：首帧为 [`SparseCapacity::default`]（不可用，因而必走
+    /// 精确测量路径），其后是上一帧实测到的用量。测试与诊断据此断言
+    /// "这一帧究竟走没走投机路径"，而不是靠注释描述。
+    pub fn sparse_capacity(&self) -> SparseCapacity {
+        self.sparse_capacity.lock().map(|c| *c).unwrap_or_default()
+    }
+
+    /// M3.6：更新投机分配的容量。锁中毒时静默放弃——容量只是加速手段，
+    /// 丢了只会让下一帧退回精确测量路径（更慢，但结果不变）。
+    fn store_sparse_capacity(&self, cap: SparseCapacity) {
+        if let Ok(mut slot) = self.sparse_capacity.lock() {
+            *slot = cap;
+        }
     }
 
     /// **完整分析**：渲染一帧并同时返回 ①主机侧分阶段耗时（[`FrameProfile`]）
@@ -2090,6 +2147,11 @@ impl GpuRenderer {
         if n_draws == 0 || total_entries == 0 || gs.total_segments == 0 {
             return Ok(()); // 空场景：纹理保持零初始化（透明）
         }
+        // M3.6：投机分配的容量缓存只由**主色逐帧路径**维护。
+        // - clip 覆盖率（`coverage`）是辅助 pass，规模与主场景无关：若它也读/写
+        //   这份缓存，两帧之间容量会被反复改写，主场景每帧都要重做；
+        // - 诊断转储（`dump`）要的正是**精确**规模，测量本身就是它的目的。
+        let learns_capacity = !coverage && dump.is_none();
         let (tiles_x, tiles_y) = (gs.tiles_x, gs.tiles_y);
         let n_tiles = (tiles_x as u64) * (tiles_y as u64);
         let n_strips = (n_draws as u64) * (tiles_y as u64);
@@ -2544,6 +2606,18 @@ impl GpuRenderer {
         let t_sub2 = Instant::now();
         self.queue.submit(Some(enc2.finish()));
         prof.submit2_ms = t_sub2.elapsed().as_secs_f64() * 1000.0;
+
+        // M3.6：本帧 GPU 工作已全部提交，把**实测用量**记为下一帧的容量。
+        // （本步只是记录：据此分配要等容量查表接上；见 `learns_capacity` 的取用处。）
+        if learns_capacity {
+            self.store_sparse_capacity(SparseCapacity {
+                cells: n_cells,
+                buckets: n_buckets,
+                tile_entries: n_tile_entries,
+                items: n_items,
+                overflows: 0,
+            });
+        }
 
         // —— 诊断转储（M3.5：全字段无条件转储，供 check_sparse_consistency 使用）——
         let t_dump = Instant::now();
@@ -4202,6 +4276,48 @@ mod tests {
         assert!(
             sparse_bytes * 50 < dense_bytes,
             "稀疏占用应显著小于稠密（稀疏 {sparse_bytes} vs 稠密 {dense_bytes}）"
+        );
+    }
+
+    /// M3.6：投机分配的**容量缓存**必须来自实测用量，而不是写死的猜测。
+    ///
+    /// 本测试只回答"学到了什么"：首帧之前没有可用容量（因此必走精确测量路径），
+    /// 渲染一帧后容量恰好等于该帧实测的规模（与 `sparse_stats` 读到的逐项一致）。
+    /// 容量**够不够用**、不够时能否被检出并重做，由后续的投机测试负责。
+    #[test]
+    fn sparse_capacity_is_learned_from_measured_usage() {
+        use amiki_math::Vec2;
+        use amiki_scene::{Color, Paint, PathBuilder, Scene};
+
+        let Ok(renderer) = pollster::block_on(GpuRenderer::new()) else {
+            eprintln!("跳过：无 GPU 适配器");
+            return;
+        };
+        assert!(
+            !renderer.sparse_capacity().is_valid(),
+            "首帧之前不应存在可用容量（否则会跳过必要的规模测量）"
+        );
+
+        let mut scene = Scene::new(160, 160);
+        for i in 0..12 {
+            let mut pb = PathBuilder::new();
+            pb.circle(Vec2::new(24.0 + 9.0 * i as f32, 60.0 + 5.0 * i as f32), 9.0, false);
+            scene.push(
+                amiki_math::Affine::IDENTITY,
+                pb.build(),
+                Paint::Solid(Color::rgba8(60, 140, 220, 200)),
+            );
+        }
+
+        renderer.render_blocking(&scene, 0.05).expect("渲染失败");
+        let cap = renderer.sparse_capacity();
+        assert!(cap.is_valid(), "渲染一帧后应学到容量：{cap:?}");
+
+        let st = renderer.sparse_stats(&scene, 0.05).expect("统计失败").expect("稀疏统计缺失");
+        assert_eq!(
+            (cap.cells, cap.buckets, cap.tile_entries, cap.items),
+            (st.n_cells, st.n_buckets, st.n_tile_entries, st.n_items),
+            "容量必须等于实测用量（单元/桶/条目/成员）"
         );
     }
 

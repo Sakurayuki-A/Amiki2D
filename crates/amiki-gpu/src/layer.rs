@@ -311,7 +311,6 @@ impl crate::GpuRenderer {
     /// CPU 的 `amiki_raster::filter::blur` 对 4 个通道直接做盒式平均
     /// （直线色语义）。GPU 必须完全相同，否则跨端对拍必然不一致。
     /// 因此这里**不做**预乘/反预乘 —— 详见函数末尾的说明。
-    #[allow(dead_code)]
     pub(crate) fn blur_rgba(
         &self,
         src: &[u8],

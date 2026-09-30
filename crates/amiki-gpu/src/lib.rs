@@ -553,6 +553,8 @@ fn ts_slot<'a, const N: usize>(
 /// M3a：逐帧资源。主场景 + clip 覆盖率纹理视图。
 pub struct Frame {
     scene: GpuScene,
+    /// 只用于**持有** clip 纹理的生命周期 —— `clip_views` 借用它们，
+    /// 纹理一旦 drop，视图即失效。字段本身从不被读，所以需要 allow。
     #[allow(dead_code)]
     clip_texs: Vec<wgpu::Texture>,
     pub clip_views: Vec<wgpu::TextureView>,

@@ -6,6 +6,7 @@ members = [
     "crates/amiki-raster",
     "crates/amiki-gpu",
     "crates/amiki",
+    "crates/amiki-text",
 ]
 
 [workspace.package]

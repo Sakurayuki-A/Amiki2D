@@ -2,3 +2,9 @@
 /out
 *.png.tmp
 Cargo.lock.orig
+
+# 字体发布包（约 33 MB）：不随仓库分发。
+# 只需从其中取出的 assets/fonts/Inter-Regular.ttf（411 KB）随仓库走，
+# 以便示例与测试在干净检出后即可运行。
+/Inter-*.zip
+/assets/fonts/*.zip

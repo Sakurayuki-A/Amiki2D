@@ -1,0 +1,15 @@
+[package]
+name = "amiki-text"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Amiki2D 文本层：字体解析（ttf-parser）与 shaping（rustybuzz）"
+
+# 说明：这是本项目中**唯一**引入第三方依赖的功能 crate。
+# amiki-math / amiki-scene / amiki-raster / amiki-gpu / amiki 保持零新增依赖，
+# 字形轮廓以普通的 PathEl 交给引擎 —— 字体栈因此可替换、可隔离。
+[dependencies]
+amiki-math = { workspace = true }
+amiki-scene = { workspace = true }
+ttf-parser = "0.25"
+rustybuzz = "0.20"

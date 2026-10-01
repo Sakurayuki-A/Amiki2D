@@ -288,6 +288,48 @@ GPU pass 2.1–3.4、提取 ~0.95、上传+编码 ~1.2、
 **已做的两轮优化是真实有效的**（帧内 2.03 → 1.02 就是证据），
 只是**还不够**。剩余缺口需要改数据布局（见下）。
 
+#### 下一步的实施方案（已设计，**未实施**）
+
+目标：帧内提取 **1.023 → < 0.8 ms**（差 0.22 ms）。
+
+**根因**：提取几乎全是内存写；其中**同一批字节写了两遍** ——
+先 push 进 `quads`/`cubics`/`lines` 三个中间数组，再由 `sparse.rs` 拼成
+上传用的 `data`。圆场景 4 万条三次曲线 = **1.28 MB × 2**。
+
+**方案：两遍法，直接产出最终布局**
+
+```text
+data:        [ quad0.p0, quad0.p1, ..., cubic0.p0, cubic0.p1, ..., line0, ... ]
+counts:      [ 每 quad 的段数, ..., 每 cubic 的段数, ..., 1, 1, ... ]
+entry_draws: [ quad 的 draw, ..., cubic 的 draw, ..., line 的 draw, ... ]
+```
+
+1. **计数遍**：只走路径数出每 draw 的 q/c/l 条数（不写内存）
+2. 按总数**预留定长** `data`/`counts`/`entry_draws`，算出三段各自的起点
+   （quads 在前、cubics 次之、lines 最后 —— 与 flatten 的约定一致）
+3. **写入遍**：再走一遍路径，把图元**直接写进最终布局的槽位**；
+   `counts` 与 `entry_draws` 同时写入 —— **顺带省掉这两趟后续遍历**
+
+走两遍路径是划算的：**路径遍历本身只占 6%**（实测 0.036 / 0.6 ms）。
+
+**为什么它值得做**：省掉的不只是那一遍拷贝，还有
+`counts`（4 万项）与 `entry_draws`（4 万项）各自的独立遍历。
+
+**改动范围**（跨 CPU/GPU 两侧，所以风险高于前几轮）：
+
+| 文件 | 改什么 |
+|---|---|
+| `extract.rs` | `GpuScene` 用 `data`/`counts`/`entry_draws`/`n_quads`/`n_cubics`/`n_lines` 取代 `quads`/`cubics`/`lines` 与 `*_draws`；两遍法提取 |
+| `sparse.rs` | 去掉 `data`/`entry_draws` 的装配（直接用 `gs.data`/`gs.entry_draws`） |
+| `dense.rs` | 同样改读 `gs.data`；flags/clips 仍从 `draw_meta` 派生 |
+| `lib.rs` | `nq_len`/`nc_len`/`nl_len` 改用新计数 |
+
+**执行方式（重要）**：新增字段与旧字段**并存**，先把消费者切过去，
+最后再删旧字段 —— **保证每一步都能编译**，任何一步停下都不留坏状态。
+
+**验收**：帧内提取 < 0.8 ms（`profile().extract_ms`，3 次最小）+
+149 测试全绿（GPU/CPU 逐像素对拍是底线，布局改动必须逐字节等价）。
+
 #### 修正后的判据评估
 
 | 判据 | 现状 | 结论 |

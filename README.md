@@ -105,6 +105,7 @@ cargo bench -p amiki-gpu                              # 基准（含显存与逐
 | [`docs/RENDERING_STRATEGY.md`](docs/RENDERING_STRATEGY.md) | 算法推导与实测数据 |
 | [`docs/RELEASE_PLAN.md`](docs/RELEASE_PLAN.md) | 发布计划、验收标准与当前状态 |
 | [`docs/VERIFY.md`](docs/VERIFY.md) | 多适配器验证清单（换机器时照着跑） |
+| [`docs/DECISIONS.md`](docs/DECISIONS.md) | **待你决策的三件事**（实测数据 + 选项 + 建议） |
 | [`CHANGELOG.md`](CHANGELOG.md) | 逐项变更与踩过的坑 |
 
 ## 已验证的后端与已知限制

@@ -150,7 +150,7 @@ impl PathBuilder {
     }
 }
 
-/// 填充规则。M1 仅 nonzero；even-odd 在路线图 M2。
+/// 填充规则。**当前只有 nonzero**；even-odd 未实现（见 `docs/KNOWN_ISSUES.md`）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FillRule {
     NonZero,

@@ -128,6 +128,7 @@ loop {
 ## 文档地图
 
 - `docs/OVERVIEW.md` —— 现状总览（**先读这个**）
+- `docs/KNOWN_ISSUES.md` —— **已知问题登记表**（A 未验证 / B 已知限制 / C 明确不做 / D 技术债，有编号）
 - `docs/RELEASE_0.3.0-alpha.md` —— 门禁/能力/性能/已知问题/未验证项
 - `docs/RELEASE_PLAN.md` —— 各项验收标准、根源调查、**已知未验证项**
 - `docs/DECISIONS.md` —— 三个产品决策及其结论

@@ -1820,3 +1820,223 @@ fn profile_frame_path_phases() {
         "帧路径总墙钟 {t_all:.2} ms —— 病态回归兜底（单跑正常 7.5–8.1 ms）"
     );
 }
+
+/// P1-1 **根源调查**：用**与判据基准完全相同**的场景（`pb.circle`，
+/// 每条 draw 4 条三次曲线），把提取拆到每一个可测的动作上。
+///
+/// 为什么重做：既有的 `profile_extract_phases` 用的是"每条 draw 一条曲线"
+/// 的场景（10k cubics），而判据基准是圆（**40k cubics**）—— 两者规模差 4 倍，
+/// 那份分段描述的根本不是判据场景。
+#[test]
+fn profile_extract_root_cause() {
+    use amiki_math::{Affine, Vec2};
+    use amiki_scene::{Color, Paint, PathBuilder, Scene};
+    use std::hint::black_box;
+    use std::time::Instant;
+
+    // === 与基准 `curves_scene(1920,1080,10_000,5.0)` 同构造 ===
+    let (w, h, n, r) = (1920.0f32, 1080.0f32, 10_000usize, 5.0f32);
+    let mut scene = Scene::new(1920, 1080);
+    let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+    let mut next = || {
+        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        ((seed >> 33) as f32) / (u32::MAX >> 1) as f32
+    };
+    for i in 0..n {
+        let c = Vec2::new(r + next() * (w - 2.0 * r), r + next() * (h - 2.0 * r));
+        let mut pb = PathBuilder::new();
+        pb.circle(c, r * (0.6 + 0.8 * next()), false);
+        let t = if i % 3 == 0 { Affine::rotate(next() * 1.5) } else { Affine::IDENTITY };
+        scene.push(t, pb.build(), Paint::Solid(Color::rgba8(1, 2, 3, 200)));
+    }
+
+    let rep = |f: &dyn Fn() -> f64| -> f64 {
+        let mut best = f64::MAX;
+        for _ in 0..7 {
+            let t = Instant::now();
+            black_box(f());
+            best = best.min(t.elapsed().as_secs_f64() * 1e3);
+        }
+        best
+    };
+
+    let gs = crate::build_gpu_scene(&scene, 0.05);
+    let (nq, nc, nl) = (gs.quads.len(), gs.cubics.len(), gs.lines.len());
+    let nvec = (nq + nc) * 2 + nl;
+    eprintln!(
+        "[规模] draws={} quads={nq} cubics={nc} lines={nl} → data {nvec} 个 vec4（{} KB）",
+        scene.draws.len(),
+        nvec * 16 / 1024
+    );
+
+    // A. 只走路径（读 + 变换，不写）
+    let a = rep(&|| {
+        let mut acc = 0.0f64;
+        for d in &scene.draws {
+            for el in &d.path.els {
+                let m = d.transform.map_point(match *el {
+                    amiki_scene::PathEl::MoveTo(p) | amiki_scene::PathEl::LineTo(p) => p,
+                    amiki_scene::PathEl::QuadTo(_, p) => p,
+                    amiki_scene::PathEl::CubicTo(_, _, p) => p,
+                    amiki_scene::PathEl::Close => Vec2::ZERO,
+                });
+                acc += m.x as f64 + m.y as f64;
+            }
+        }
+        acc
+    });
+
+    // A2. 走路径 + **计数**（两遍法的第一遍：多一次每 draw 的计数器写）
+    let a2 = rep(&|| {
+        let mut total = 0u64;
+        let mut per = vec![(0u32, 0u32, 0u32); scene.draws.len()];
+        for (i, d) in scene.draws.iter().enumerate() {
+            let mut c = (0u32, 0u32, 0u32);
+            for el in &d.path.els {
+                match *el {
+                    amiki_scene::PathEl::QuadTo(..) => c.0 += 1,
+                    amiki_scene::PathEl::CubicTo(..) => c.1 += 1,
+                    amiki_scene::PathEl::LineTo(..) | amiki_scene::PathEl::Close => c.2 += 1,
+                    amiki_scene::PathEl::MoveTo(..) => {}
+                }
+            }
+            per[i] = c;
+            total += (c.0 + c.1 + c.2) as u64;
+        }
+        black_box(&per);
+        total as f64
+    });
+
+    // B. 完整提取
+    let b = rep(&|| {
+        let t = Instant::now();
+        let g = crate::build_gpu_scene(&scene, 0.05);
+        let ms = t.elapsed().as_secs_f64() * 1e3;
+        black_box(g.total_segments);
+        ms
+    });
+
+    // C. 只算段数（遍历 cubics，40k 次）
+    let cubics = gs.cubics.clone();
+    let c = rep(&|| {
+        let mut acc = 0u64;
+        for q in &cubics {
+            let cb = amiki_math::CubicBez::new(
+                Vec2::new(q[0][0], q[0][1]),
+                Vec2::new(q[0][2], q[0][3]),
+                Vec2::new(q[1][0], q[1][1]),
+                Vec2::new(q[1][2], q[1][3]),
+            );
+            acc += cb.uniform_segments(0.05) as u64;
+        }
+        acc as f64
+    });
+
+    // D. `data` 装配（`sparse.rs` 里那一段：三段 memcpy 到连续缓冲）
+    let d = rep(&|| {
+        let mut data: Vec<[f32; 4]> = Vec::with_capacity((nq + nc) * 2 + nl);
+        data.extend_from_slice(bytemuck::cast_slice::<[[f32; 4]; 2], [f32; 4]>(&gs.quads));
+        data.extend_from_slice(bytemuck::cast_slice::<[[f32; 4]; 2], [f32; 4]>(&gs.cubics));
+        data.extend_from_slice(&gs.lines);
+        black_box(data.len()) as f64
+    });
+
+    // D2. 同样的字节，但**逐元素 push**（改造前的写法，用于量化"写两遍"的代价）
+    let d2 = rep(&|| {
+        let mut data: Vec<[f32; 4]> = Vec::with_capacity((nq + nc) * 2 + nl);
+        for q in &gs.quads {
+            data.push(q[0]);
+            data.push(q[1]);
+        }
+        for cc in &gs.cubics {
+            data.push(cc[0]);
+            data.push(cc[1]);
+        }
+        for l in &gs.lines {
+            data.push(*l);
+        }
+        black_box(data.len()) as f64
+    });
+
+    // E. `entry_draws` 装配
+    let e = rep(&|| {
+        let mut ed: Vec<u32> = Vec::with_capacity(nq + nc + nl);
+        ed.extend_from_slice(&gs.quad_draws);
+        ed.extend_from_slice(&gs.cubic_draws);
+        ed.extend_from_slice(&gs.line_draws);
+        black_box(ed.len()) as f64
+    });
+
+    // C2. **无 sqrt 的阈值版**（正确的**三次**公式）：
+    //     n ≤ k ⟺ 1.3·G/eps ≤ k² ⟺ G ≤ eps·k²/1.3，其中 G = max(|g0|,|g1|)
+    //     ⟺ |g0|² ≤ T 且 |g1|² ≤ T，T = (eps·k²/1.3)²
+    let eps = 0.05f32;
+    let thr: [f32; 33] = {
+        let mut t = [0.0f32; 33];
+        for (k, v) in t.iter_mut().enumerate().skip(1) {
+            let k = k as f32;
+            let lim = eps * k * k / 1.3;
+            *v = lim * lim;
+        }
+        t
+    };
+    let fast = |q: &[[f32; 4]; 2]| -> u32 {
+        let (p0x, p0y, c1x, c1y) = (q[0][0], q[0][1], q[0][2], q[0][3]);
+        let (c2x, c2y, p3x, p3y) = (q[1][0], q[1][1], q[1][2], q[1][3]);
+        let g0x = c1x * 3.0 - p0x * 2.0 - p3x;
+        let g0y = c1y * 3.0 - p0y * 2.0 - p3y;
+        let g1x = c2x * 3.0 - p3x * 2.0 - p0x;
+        let g1y = c2y * 3.0 - p3y * 2.0 - p0y;
+        let s0 = g0x * g0x + g0y * g0y;
+        let s1 = g1x * g1x + g1y * g1y;
+        let s = s0.max(s1);
+        let mut n = 1u32;
+        while n < 32 && s > thr[n as usize] {
+            n += 1;
+        }
+        n
+    };
+    let c2 = rep(&|| {
+        let mut acc = 0u64;
+        for q in &cubics {
+            acc += fast(q) as u64;
+        }
+        acc as f64
+    });
+    // C3. 校验：与 sqrt 版在**本场景全部 4 万条**上是否一致
+    let mut mismatch = 0usize;
+    let mut first: Option<(u32, u32)> = None;
+    for q in &cubics {
+        let cb = amiki_math::CubicBez::new(
+            Vec2::new(q[0][0], q[0][1]),
+            Vec2::new(q[0][2], q[0][3]),
+            Vec2::new(q[1][0], q[1][1]),
+            Vec2::new(q[1][2], q[1][3]),
+        );
+        let exact = cb.uniform_segments(eps);
+        let f = fast(q);
+        if f != exact {
+            mismatch += 1;
+            if first.is_none() {
+                first = Some((f, exact));
+            }
+        }
+    }
+    eprintln!(
+        "[根源] C2 段数(无 sqrt 阈值版) = {c2:.3} ms；与 sqrt 版不一致 {mismatch} / {}；首个差异(快,准)={first:?}",
+        cubics.len()
+    );
+
+    eprintln!("[根源] A  只走路径            = {a:.3} ms");
+    eprintln!("[根源] A2 走路径+计数         = {a2:.3} ms");
+    eprintln!("[根源] B  完整提取            = {b:.3} ms");
+    eprintln!("[根源] C  仅段数计算(40k)     = {c:.3} ms");
+    eprintln!("[根源] D  data 装配(memcpy)   = {d:.3} ms");
+    eprintln!("[根源] D2 data 装配(逐元素)   = {d2:.3} ms");
+    eprintln!("[根源] E  entry_draws 装配    = {e:.3} ms");
+    eprintln!(
+        "[根源] → B 减去 A/C 后剩下的「push 与装配」≈ {:.3} ms",
+        b - a - c
+    );
+    assert!(b > 0.0);
+}

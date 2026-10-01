@@ -1,0 +1,19 @@
+# C ABI 示例的构建产物
+*.exe
+*.obj
+*.pdb
+*.ilk
+*.exp
+amiki2d.dll
+amiki2d.dll.lib
+amiki2d.lib
+*.bmp
+*.png
+
+# Node
+node_modules/
+package-lock.json
+
+# .NET
+bin/
+obj/

@@ -1,0 +1,38 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <AllowUnsafeBlocks>false</AllowUnsafeBlocks>
+    <AssemblyName>AmikiDemo</AssemblyName>
+    <RootNamespace>AmikiDemo</RootNamespace>
+    <!-- 结构体里有指针宽度的字段；明确按 64 位布局 -->
+    <PlatformTarget>x64</PlatformTarget>
+    <InvariantGlobalization>true</InvariantGlobalization>
+  </PropertyGroup>
+
+  <!--
+    把原生库复制到输出目录旁边。
+    `DllImport("amiki2d")` 在 Windows 上会找 amiki2d.dll，Linux 上找
+    libamiki2d.so —— 所以这里按平台挑文件名。
+
+    `AmikiNativeDir` 可以由 build.cmd 覆盖（它指向 target/release）。
+  -->
+  <PropertyGroup>
+    <AmikiNativeDir Condition="'$(AmikiNativeDir)' == ''">$(MSBuildThisFileDirectory)../../../../target/release</AmikiNativeDir>
+  </PropertyGroup>
+
+  <Target Name="CopyNativeLibrary" AfterTargets="Build">
+    <ItemGroup>
+      <AmikiNativeWin Include="$(AmikiNativeDir)/amiki2d.dll" />
+      <AmikiNativeSo Include="$(AmikiNativeDir)/libamiki2d.so" />
+      <AmikiNativeDylib Include="$(AmikiNativeDir)/libamiki2d.dylib" />
+    </ItemGroup>
+    <Copy SourceFiles="@(AmikiNativeWin)" DestinationFolder="$(OutDir)" Condition="Exists('%(AmikiNativeWin.FullPath)')" ContinueOnError="true" />
+    <Copy SourceFiles="@(AmikiNativeSo)" DestinationFolder="$(OutDir)" Condition="Exists('%(AmikiNativeSo.FullPath)')" ContinueOnError="true" />
+    <Copy SourceFiles="@(AmikiNativeDylib)" DestinationFolder="$(OutDir)" Condition="Exists('%(AmikiNativeDylib.FullPath)')" ContinueOnError="true" />
+  </Target>
+
+</Project>

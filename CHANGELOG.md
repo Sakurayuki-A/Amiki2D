@@ -5,6 +5,86 @@
 
 ---
 
+## [0.4.0-alpha] —— C ABI
+
+**第四个 Alpha：让 Amiki2D 能被 Rust 之外的任何语言调用。**
+
+0.3.0 的能力清单放到任何一个 2D 渲染器面前都不丢人，真正卡住它的是**没人能用它** ——
+Rust 2D 生态本身很小，而 C# / Java / Node / Python 用户因为没有 C ABI 全都进不来。
+本版兑现"通用"这个词的入口。
+
+> **边界说明（诚实清单）**
+> - 三个绑定示例（C / C# / Node）做**完全相同的绘制**，输出**逐像素一致** —— 这是
+>   "ABI 封送正确"的证据，详见 `crates/amiki-capi/examples/README.md`
+> - **跨厂商硬件仍未验证**（A1）：三个后端都在同一块 GPU 上验证过
+> - C ABI 不隐藏引擎的边界，而是照实暴露（GL 不支持位图 → `AMIKI_ERROR_NOT_SUPPORTED`）；
+>   见 `docs/KNOWN_ISSUES.md`
+
+### 新增：`amiki-capi` + 手写 `amiki.h`
+
+**契约是手写的 `crates/amiki-capi/include/amiki.h`，Rust 侧去适配它。**
+之所以不用 `cbindgen` 之类的工具生成：那样 header 会随 Rust 类型变动而**漂移**，
+绑定作者拿不到稳定界面。Skia / Blend2D / wgpu-native 都是手写 header。
+
+导出 **68 个符号**，与 header 的声明数**逐一核对无缺失**。
+
+**三条硬保证**（写进了 header，是设计约束不是实现细节）：
+
+1. **绝不 panic 跨 FFI 边界** —— 每个导出函数都在 `catch_unwind` 之内。
+   跨 FFI 的 panic 是未定义行为，不能让 C 调用方承担。
+2. **panic 之后对象中毒** —— 出事的对象后续调用一律返回 `AMIKI_ERROR_PANIC`。
+   因为 panic 可能打断在一次修改的中途，继续用它**可能静默画出错误结果**。
+3. **失败时不写出参** —— 每个 `_create` 在失败时都不碰 `*out`。
+
+**错误模型**：所有可能失败的函数返回 `amiki_result`，指针走 out 参数。
+
+**内存所有权**写进 header 注释并逐条编号。其中一条值得单独说：
+位图与渐变**是引用计数的**，引擎内部持有一份，所以调用方**可以在绘制后立刻销毁**
+自己的句柄 —— 这不是猜测，`crates/amiki-capi/src/tests.rs` 里有实测。
+
+**版本策略**：编译期 `AMIKI_VERSION_*` + 运行期 `amiki_version()` 都要查
+（头文件与二进制可能不是同一版编出来的）。数值宏便于比较，`amiki_version_string()`
+带预发布标签便于展示。
+
+### 三个绑定示例（都真实编译运行）
+
+| 示例 | 语言 | 绑定方式 |
+|---|---|---|
+| `examples/c/` | C99 | 直接 `#include "amiki.h"`，`cl /utf-8 /W4 /WX` 零警告 |
+| `examples/csharp/` | C# / .NET 10 | 手写 P/Invoke（**不用** `StringMarshalling`，它在 .NET 10 上不可用） |
+| `examples/node/` | Node.js 24 | koffi FFI |
+
+三者做同样的绘制，输出**逐像素完全一致**（三对比较的最大通道差都是 **0**）。
+
+**Node 为什么选 koffi 而不是 napi-rs / WASM**：napi-rs 需要**构建期下载 Node 头文件**
+（本项目此前上过 `static-dxc` 构建期下载挂住的当，不想再引入同类风险）；
+WASM **到不了 GPU 后端**（引擎主力是 wgpu）。koffi 不改 Rust 一行、`npm install` 即用，
+而第三个示例的目的正是"证明这个 ABI 能被非 C / 非 .NET 的运行时调进来"。
+
+### 性能上的关键设计：context 持有后端
+
+`amiki_context` 持有渲染后端，**创建一次跨帧复用**。这不是可选优化 ——
+创建 GPU 后端要初始化驱动（实测冷启动 **61 ms**），逐帧新建会让它成为主要开销。
+`amiki_canvas_clear` 同理（复用内部缓冲），逐帧渲染不该 `destroy` + `create`。
+
+### 测试
+
+`cargo test -p amiki-capi` → **29 项 ABI 层自测**，从 C 侧的角度验证契约：
+每个接收指针的入口都拒绝 NULL 且不崩、失败时不写出参、越界枚举/NaN/Inf 被拒绝、
+中毒真的挡住后续调用、位图与渐变可在绘制后立刻销毁、
+**层没配平就渲染被显式拒绝**（否则会静默丢内容）、端到端 CPU 渲染真的画出东西。
+
+`src/types.rs` 还有**布局断言**（`size_of` / `offset_of`）—— C 侧的 `sizeof`
+只要对不上，绑定就会静默踩内存。
+
+### 顺带
+
+- workspace 版本 → `0.4.0-alpha`
+- 修掉 `amiki.h` 里一条**不准确的所有权说明**（原写"位图要活到渲染时"，
+  实际引擎用 `Arc` 持有，调用方可以立刻销毁）
+
+---
+
 ## [0.3.0-alpha] —— 能力门槛全部完成（P0/P1/P2/P3）
 
 第三个 Alpha：补齐**描边**、**含层场景的增量渲染**、**帧路径的层合成**，做完

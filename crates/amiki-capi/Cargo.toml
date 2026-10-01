@@ -1,0 +1,24 @@
+[package]
+name = "amiki-capi"
+description = "Amiki2D 的 C ABI（手写 header 契约见 include/amiki.h）"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+# `staticlib` 给 C 直接链接；`cdylib` 给需要动态库的场景；
+# `rlib` 让本仓库的 Rust 测试能直接用这些函数（ABI 层自测）。
+name = "amiki2d"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[dependencies]
+amiki = { path = "../amiki" }
+amiki-math = { workspace = true }
+amiki-scene = { workspace = true }
+amiki-text = { path = "../amiki-text" }
+amiki-gpu = { workspace = true }
+amiki-raster = { workspace = true }
+amiki-layout = { path = "../amiki-layout" }
+bytemuck = { workspace = true }
+pollster = { workspace = true }

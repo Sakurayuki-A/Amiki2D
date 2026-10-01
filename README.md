@@ -1,6 +1,8 @@
 # Amiki2D
 
-**版本 `0.3.0-alpha`** —— 第三个 Alpha：**发布判据 6 条全部满足**。
+**版本 `0.4.0-alpha`** —— 第四个 Alpha：**新增 C ABI**，让引擎能被 Rust 之外的
+语言调用（C / C# / Node 三个示例的输出**逐像素一致**）。
+`0.3.0-alpha` 的发布判据 6 条**全部满足**。
 核心渲染管线（M1–M3）、工程硬化（M3.5）、增量渲染（M4）、文本（M5）、
 渐变/位图/滤镜（M6），加上 P0 能力门槛（描边、含层增量、帧路径层合成）、
 P1-1 性能（提取 **2.03 → 0.59 ms**）与 P3 工程成熟度六项。
@@ -67,6 +69,9 @@ P1-1 性能（提取 **2.03 → 0.59 ms**）与 P3 工程成熟度六项。
 - **CJK 断行 + 禁则（P2-1）**：收尾标点不在行首、起始括号不在行尾；
   **OFL 中文字体随仓库分发**（Noto Sans SC）
 - Canvas 立即模式 API（变换栈/混合/裁剪栈）+ headless PNG + winit 动画示例
+- **C ABI（0.4.0）**：手写 `amiki.h` 契约（68 个导出符号）+ 三个绑定示例。
+  引擎**绝不 panic 跨 FFI 边界**；panic 后对象中毒并显式拒绝后续调用。
+  详见 [`crates/amiki-capi/README.md`](crates/amiki-capi/README.md)
 
 **尚未实现**（明确的边界）：even-odd 填充；双向文本（阿拉伯/希伯来）；
 Knuth-Plass 全局最优断行；HDR / 宽色域；C ABI / WASM；
@@ -97,6 +102,7 @@ cargo bench -p amiki-gpu                              # 基准（含显存与逐
 
 - [**现状总览**](docs/OVERVIEW.md) —— 一页看清"这是什么、现在到哪了、接下来做什么"
 - [发布报告 0.3.0-alpha](docs/RELEASE_0.3.0-alpha.md) —— 门禁状态、能力清单、性能数据、已知问题
+- [**C ABI**](crates/amiki-capi/README.md) —— 手写 header 契约 + 三个绑定示例（C / C# / Node）
 - [**已知问题登记表**](docs/KNOWN_ISSUES.md) —— 未验证项 / 已知限制 / 明确不做 / 技术债（**有稳定编号**）
 - [发布计划](docs/RELEASE_PLAN.md) —— 各项验收标准与**已知未验证项**
 - [多后端验证清单](docs/VERIFY.md) —— 换机器时照着跑

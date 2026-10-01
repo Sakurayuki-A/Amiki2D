@@ -1,0 +1,163 @@
+# amiki-capi —— Amiki2D 的 C ABI
+
+**契约是手写的 [`include/amiki.h`](include/amiki.h)**，本 crate 去适配它。
+不由 `cbindgen` 之类工具生成：那样 header 会随 Rust 类型变动而漂移，
+绑定作者拿不到稳定界面。Skia / Blend2D / wgpu-native 都是手写 header。
+
+**完整的使用契约（所有权、错误模型、线程模型、版本承诺）都在 header 顶部的注释里** ——
+那是唯一权威来源。本文件只讲"怎么用起来"。
+
+---
+
+## 30 秒上手
+
+```bash
+cargo build -p amiki-capi --release
+```
+
+产物（`target/release/`）：
+
+| 文件 | 用途 |
+|---|---|
+| `amiki2d.dll` / `libamiki2d.so` / `libamiki2d.dylib` | 动态库（**推荐**，运行期只需要它） |
+| `amiki2d.dll.lib` / `libamiki2d.so` | 对应的导入库 |
+| `amiki2d.lib` / `libamiki2d.a` | 静态库（从 C 链接需要 Rust 的全部系统依赖，较麻烦） |
+| `libamiki2d.rlib` | 给本仓库的 Rust 测试用 |
+
+```c
+#include "amiki.h"
+
+amiki_context *ctx = NULL;
+amiki_context_create(AMIKI_BACKEND_AUTO, &ctx);
+
+amiki_canvas *cv = NULL;
+amiki_canvas_create(ctx, 800, 600, &cv);
+amiki_canvas_draw_rect(cv, 40, 40, 400, 300,
+                       amiki_paint_solid(amiki_color_rgb8(231, 76, 60)));
+
+size_t n = 800 * 600 * 4;
+uint8_t *px = malloc(n);
+amiki_canvas_render_rgba8(cv, px, n);      /* RGBA8、非预乘、行序自上而下 */
+
+free(px);
+amiki_canvas_destroy(cv);
+amiki_context_destroy(ctx);
+```
+
+编译（Windows）：
+```
+cl /utf-8 /W4 your_app.c /link amiki2d.dll.lib
+```
+编译（Linux / macOS）：
+```
+cc your_app.c -I<repo>/crates/amiki-capi/include -L<repo>/target/release -lamiki2d
+```
+
+> ⚠️ **MSVC 用户**：`amiki.h` 是 UTF-8 无 BOM，在非 UTF-8 代码页的系统上必须加
+> `/utf-8`，否则报 `warning C4819`（开了 `/WX` 就是错误）。
+
+---
+
+## 三条硬保证
+
+写在这里是因为它们是**设计约束**，不是实现细节：
+
+1. **绝不 panic 跨 FFI 边界。** 每个导出函数都在 `catch_unwind` 之内；
+   跨 FFI 的 panic 是未定义行为，不能让 C 调用方承担。
+
+2. **panic 之后对象中毒。** 出事的对象后续调用一律返回 `AMIKI_ERROR_PANIC`。
+   因为 panic 可能打断在一次修改的中途，继续用它**可能静默画出错误结果** ——
+   而"不静默出错"是本项目最硬的一条取舍。
+
+3. **失败时不写出参。** 每个 `_create` 在失败时都不碰 `*out`。
+
+---
+
+## 性能上的一个关键点：**复用 context**
+
+`amiki_context` **持有一个渲染后端**，创建一次即可跨帧复用。
+
+这不是可选的优化：创建 GPU 后端要初始化驱动（实测冷启动 **61 ms**），
+逐帧新建会让它成为主要开销。同理 `amiki_canvas_clear` 复用内部缓冲，
+**不要**为了清屏而 `destroy` + `create`。
+
+逐帧渲染的正确形态：
+
+```c
+amiki_context *ctx = NULL;
+amiki_context_create(AMIKI_BACKEND_AUTO, &ctx);   /* 一次 */
+amiki_canvas *cv = NULL;
+amiki_canvas_create(ctx, W, H, &cv);              /* 一次 */
+
+for (;;) {
+    amiki_canvas_clear(cv);                        /* 复用缓冲，不是重建 */
+    /* ... 绘制本帧 ... */
+    amiki_canvas_render_rgba8(cv, pixels, n);
+}
+```
+
+---
+
+## 三个绑定示例
+
+[`examples/`](examples/) 下有 **C / C# / Node** 三个能跑的示例，
+它们做**完全相同的绘制**，因此输出**逐像素一致** —— 那是"ABI 封送正确"的最强证据。
+
+```
+C     vs C#    最大通道差 =   0  不同像素 = 0
+C     vs Node  最大通道差 =   0  不同像素 = 0
+C#    vs Node  最大通道差 =   0  不同像素 = 0
+```
+
+选型与手工构建见 [`examples/README.md`](examples/README.md)。
+
+---
+
+## 测试
+
+```bash
+cargo test -p amiki-capi
+```
+
+`src/tests.rs` 是 **ABI 层自测**（29 项），**从 C 侧的角度**验证契约：
+
+- 版本号两处一致（编译期宏 ↔ 运行期函数）
+- **每个**接收指针的入口都拒绝 NULL，且不崩（空指针解引用会段错误，所以这项的价值在"跑完不崩"）
+- 失败时 out 参数**不被写入**
+- 越界枚举 / NaN / Inf 都被拒绝
+- 中毒机制真的挡住后续调用
+- **位图与渐变可以在绘制后立刻销毁**（header 所有权第 4 条的实测）
+- 层没配平就渲染 → 显式拒绝（否则会静默丢掉那些绘制）
+- 端到端 CPU 渲染真的画出东西
+
+`src/types.rs` 还有**布局断言**：每个 `#[repr(C)]` 结构体的 `size_of` / `offset_of`
+必须与 header 一致。C 侧的 `sizeof` 只要对不上，绑定就会静默踩内存。
+
+---
+
+## 符号完整性
+
+导出的符号数与 header 的声明数**必须一致**。检查方法：
+
+```bash
+# Windows
+dumpbin /exports target/release/amiki2d.dll | findstr amiki_
+# Linux / macOS
+nm -D --defined-only target/release/libamiki2d.so | grep amiki_
+```
+
+当前：**header 声明 68 个，导出 68 个，无缺失**。
+
+---
+
+## 已知边界（引用 `docs/KNOWN_ISSUES.md`）
+
+C ABI **不隐藏**引擎的边界，而是把它们照实暴露：
+
+| 编号 | 表现 |
+|---|---|
+| B1 | GL 后端遇到位图 → 渲染返回 `AMIKI_ERROR_NOT_SUPPORTED`，**不会静默画错** |
+| B2 | 字体不支持 `.ttc` / `.woff` / `.woff2` → `AMIKI_ERROR_INVALID_ARGUMENT` |
+| B5 | 只有 nonzero 填充规则（even-odd 未实现） |
+| C1 | 不支持双向文本 |
+| — | 引擎不做内部同步：一个 context 必须在**同一线程**上使用 |

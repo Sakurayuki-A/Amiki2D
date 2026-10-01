@@ -158,6 +158,36 @@ pub struct FrameProfile {
 
 impl FrameProfile {
     /// 主机侧可归因阶段合计（ms）。
+    /// **主机侧渲染工作**：提取 + 分配 + 上传 + 编码（**不含任何读回**）。
+    ///
+    /// # 为什么要单列，而不是用 `host_total_ms()`
+    ///
+    /// `host_total_ms()` 把**读回**也算进去了，于是"帧路径的主机开销"里
+    /// 混进了一笔**正确性开销** —— 那会让人误以为"主机侧还有很大优化空间"。
+    /// 这一项才是 P1-1 能优化的对象，也是判据的对象。
+    pub fn host_render_ms(&self) -> f64 {
+        self.extract_ms
+            + self.alloc_ms
+            + self.upload_ms
+            + self.encode1a_ms
+            + self.encode1b_ms
+            + self.encode2_ms
+    }
+
+    /// **保护性同步读回**：为确认"本帧没有溢出 / 容量足够"而必须做的 GPU 同步。
+    ///
+    /// 单列的理由：它买的是 **"绝不静默画出残缺帧"**（发布判据第 3 条），
+    /// 属于**正确性开销**，不该被当成"没优化好的主机工作"。
+    ///
+    /// 两种形态：
+    /// - `readback1/2`：**首帧**容量未知时测量规模（之后由容量表缓存，不再发生）
+    /// - `usage_readback`：**每帧**确认实际用量未超投机分配
+    pub fn safety_readback_ms(&self) -> f64 {
+        self.readback1_ms.unwrap_or(0.0)
+            + self.readback2_ms.unwrap_or(0.0)
+            + self.usage_readback_ms.unwrap_or(0.0)
+    }
+
     pub fn host_total_ms(&self) -> f64 {
         self.extract_ms
             + self.alloc_ms

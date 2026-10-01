@@ -247,13 +247,18 @@ fn cjk_font() -> Option<Font> {
         .and_then(|p| p.parent())
         .expect("仓库根");
     for n in [
+        // 仓库里现在真的有这一份了（OFL 1.1，随仓库分发）
+        "NotoSansSC-Regular.ttf",
         "NotoSansSC-Regular.otf",
         "NotoSansCJKsc-Regular.otf",
         "SourceHanSansSC-Regular.otf",
     ] {
         let p = root.join("assets/fonts").join(n);
         if p.exists() {
-            return Font::from_file(&p).ok();
+            if let Ok(f) = Font::from_file(&p) {
+                eprintln!("（P2-1 使用**仓库内**字体做验证：{}）", p.display());
+                return Some(f);
+            }
         }
     }
     for p in [

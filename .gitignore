@@ -14,3 +14,7 @@ Cargo.lock.orig
 # 不随仓库分发，避免带上来源与授权不明的图片。
 /img.jpg
 /img.png
+
+# Noto Sans SC 发布包（约 107 MB）：不随仓库分发。
+# 只需从其中取出的 assets/fonts/NotoSansSC-Regular.ttf（约 10 MB）随仓库走。
+/Noto_*.zip

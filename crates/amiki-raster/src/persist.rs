@@ -52,8 +52,7 @@ use amiki_scene::{edit_damage, BlendMode, Damage, Filter, Layer, LayerBounds, Sc
 
 use crate::filter::LayerBuffer;
 use crate::{
-    bin, blend_layer_rect, clear_tile, layer_buffer_from_content, render_inner, render_tiles,
-    shade_tile, BinnedScene,
+    bin, blend_layer_rect, clear_tile, layer_buffer_from_content_f32, render_inner_f32, render_tiles, shade_tile, BinnedScene,
 };
 
 /// tile 边长（与分箱、damage 一致；三处必须相同）。
@@ -331,8 +330,13 @@ impl PersistentRenderer {
                 }
                 None => {
                     // 重建该层
-                    let layer_img = render_inner(self.width, self.height, &layer.scene, self.flatten_eps);
-                    let new = layer_buffer_from_content(&layer_img, self.width, self.height, layer)
+                    // **必须与全量路径（composite_layer）用同一条 f32 路径**：
+                    // 增量若还用 8 位，两条路会在 HDR 值上漂移 ——
+                    // layer_incremental_matches_full_random_sequences 立刻就会红
+                    // （改这一行之前它确实红了）。
+                    let layer_img =
+                        render_inner_f32(self.width, self.height, &layer.scene, self.flatten_eps);
+                    let new = layer_buffer_from_content_f32(&layer_img, self.width, self.height, layer)
                         .map(|(x, y, buf)| CachedLayer {
                             bounds: layer.bounds,
                             scene: layer.scene.clone(),

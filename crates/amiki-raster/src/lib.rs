@@ -729,31 +729,7 @@ fn shade_tile(binned: &BinnedScene, img: &mut [u8], tx: usize, ty: usize) {
     for py in y0..y1 {
         let row = py % TILE_USIZE;
         for px in x0..x1 {
-            let cx = px as f32 + 0.5;
-            let cy = py as f32 + 0.5;
-            let mut col = [0.0f32; 4];
-            for mi in off[0]..off[0] + off[1] {
-                let m = binned.tile_draw_meta[mi as usize];
-                let rl = binned.row_lists[m[1] as usize + row];
-                let mut area = binned.carries[m[2] as usize + row];
-                for k in 0..rl[1] {
-                    let seg = binned.segments[binned.seg_refs[(rl[0] + k) as usize] as usize];
-                    area += seg_area(seg[0], seg[1], seg[2], seg[3], cx, cy);
-                }
-                let mut a = area.abs().min(1.0);
-                let nclip = ((m[3] >> 8) & 0xF) as usize;
-                if nclip > 0 && a > 0.0 {
-                    let pix = py * w + px;
-                    let clips = &binned.draw_clips[m[0] as usize];
-                    for &clip_idx in &clips[..nclip] {
-                        a *= binned.clip_maps[clip_idx as usize][pix] as f32 / 255.0;
-                    }
-                }
-                if a > 0.0 {
-                    let c = resolve_color(binned, m[0] as usize, cx, cy);
-                    col = composite(col, c, c[3] * a, m[3] & 0xFF);
-                }
-            }
+            let col = shade_pixel(binned, w, off, row, px, py);
             let o = (py * w + px) * 4;
             for k in 0..4 {
                 img[o + k] = (col[k] * 255.0 + 0.5).clamp(0.0, 255.0) as u8;
@@ -762,69 +738,72 @@ fn shade_tile(binned: &BinnedScene, img: &mut [u8], tx: usize, ty: usize) {
     }
 }
 
-/// M6：合成一个离屏层到父图像。
+/// 单个像素的着色结果，**不量化**（直线 RGBA，f32，可超过 1.0）。
 ///
-/// 步骤与 `filter` 模块的说明一致：
-/// ```text
-/// 1) 把层内容渲进独立缓冲（含它自己的嵌套层 —— 层可嵌套）
-/// 2) 按 bounds 裁出需要的范围，并向外扩张以容纳滤镜扩散
-/// 3) 对整层滤波
-/// 4) 按不透明度 + 混合模式合成回父图像
-/// ```
+/// 从 [`shade_tile`] 里抽出来是为了让 f32 路径（[`shade_tile_f32`]）复用同一份
+/// 几何与合成数学 —— 两条路径若各写一份，迟早会在某个边界上漂移。
 ///
-/// `bounds` 之外的像素不参与合成；缓冲范围与 `bounds` 对齐后逐像素叠加。
-/// 把一层渲染成**已滤波的层缓冲**，并给出它在设备空间的位置。
-///
-/// 这是层处理里最贵的一步（渲染层内容 + 滤波），也是**跨帧缓存的单位**。
-/// 与 [`blend_layer_rect`] 的分工是刻意的：本函数只依赖"层内容"，
-/// 与合成参数（`opacity`/`blend`）无关，所以改不透明度不必重新滤波。
-///
-/// 返回 `None` 表示该层不与画布相交（无需处理）。
-pub fn layer_buffer_from_content(
-    layer_img: &[u8],
-    root_w: u32,
-    root_h: u32,
-    layer: &amiki_scene::Layer,
-) -> Option<(i32, i32, LayerBuffer)> {
-    if layer.bounds.is_empty() {
-        return None;
-    }
-    // 只取需要合成的范围（向外扩张以容纳滤镜扩散 —— 否则边缘被切掉）
-    let b = inflated_bounds(layer.bounds, layer.filter);
-    let bx = b.x.max(0);
-    let by = b.y.max(0);
-    if bx >= root_w as i32 || by >= root_h as i32 {
-        return None;
-    }
-    let lw = b.width.min(root_w - bx as u32);
-    let lh = b.height.min(root_h - by as u32);
-    if lw == 0 || lh == 0 {
-        return None;
-    }
-
-    // 从层图拷到层缓冲（**直线色**：滤波必须在颜色上做，见 filter 模块说明）
-    let mut buf = LayerBuffer::new(lw, lh);
-    for y in 0..lh {
-        for x in 0..lw {
-            let sx = bx + x as i32;
-            let sy = by + y as i32;
-            let src = if sx >= 0 && sy >= 0 && (sx as u32) < root_w && (sy as u32) < root_h {
-                let o = ((sy as u32 * root_w + sx as u32) * 4) as usize;
-                [
-                    layer_img[o] as f32 / 255.0,
-                    layer_img[o + 1] as f32 / 255.0,
-                    layer_img[o + 2] as f32 / 255.0,
-                    layer_img[o + 3] as f32 / 255.0,
-                ]
-            } else {
-                [0.0; 4]
-            };
-            buf.set(x, y, src);
+/// 返回值**不裁剪**：这是 HDR 的前提。量化到 8 位发生在调用方，也就是
+/// 最终输出那一步；层内容走 f32 路径，因此 >1.0 的高光源能穿过层边界。
+fn shade_pixel(
+    binned: &BinnedScene,
+    w: usize,
+    off: [u32; 2],
+    row: usize,
+    px: usize,
+    py: usize,
+) -> [f32; 4] {
+    let cx = px as f32 + 0.5;
+    let cy = py as f32 + 0.5;
+    let mut col = [0.0f32; 4];
+    for mi in off[0]..off[0] + off[1] {
+        let m = binned.tile_draw_meta[mi as usize];
+        let rl = binned.row_lists[m[1] as usize + row];
+        let mut area = binned.carries[m[2] as usize + row];
+        for k in 0..rl[1] {
+            let seg = binned.segments[binned.seg_refs[(rl[0] + k) as usize] as usize];
+            area += seg_area(seg[0], seg[1], seg[2], seg[3], cx, cy);
+        }
+        let mut a = area.abs().min(1.0);
+        let nclip = ((m[3] >> 8) & 0xF) as usize;
+        if nclip > 0 && a > 0.0 {
+            let pix = py * w + px;
+            let clips = &binned.draw_clips[m[0] as usize];
+            for &clip_idx in &clips[..nclip] {
+                a *= binned.clip_maps[clip_idx as usize][pix] as f32 / 255.0;
+            }
+        }
+        if a > 0.0 {
+            let c = resolve_color(binned, m[0] as usize, cx, cy);
+            col = composite(col, c, c[3] * a, m[3] & 0xFF);
         }
     }
-    apply_filter(&mut buf, layer.filter);
-    Some((bx, by, buf))
+    col
 }
+
+/// 与 [`shade_tile`] 同数学，但写进 **f32** 缓冲，**不量化、不裁剪**。
+///
+/// 这是 HDR 的关键一步：层内容必须先以 f32 存在，滤镜（模糊）才能在
+/// **未裁剪**的数据上工作。此前层内容先渲染成 8 位再拷进 f32 的
+/// `LayerBuffer` —— 裁剪在那一步就已经发生了，>1.0 的高光源直接消失。
+fn shade_tile_f32(binned: &BinnedScene, img: &mut [[f32; 4]], w: usize, h: usize, tx: usize, ty: usize) {
+    let tiles_x = binned.tiles_x as usize;
+    let off = binned.tile_draw_offsets[ty * tiles_x + tx];
+    if off[1] == 0 {
+        return;
+    }
+    let x0 = tx * TILE_USIZE;
+    let x1 = (x0 + TILE_USIZE).min(w);
+    let y0 = ty * TILE_USIZE;
+    let y1 = (y0 + TILE_USIZE).min(h);
+    for py in y0..y1 {
+        let row = py % TILE_USIZE;
+        for px in x0..x1 {
+            img[py * w + px] = shade_pixel(binned, w, off, row, px, py);
+        }
+    }
+}
+
 
 /// 把**已滤波**的层缓冲按不透明度/混合合成到根图像上，**只处理指定设备矩形**。
 ///
@@ -839,6 +818,52 @@ pub fn layer_buffer_from_content(
 /// 合成在**预乘空间**进行：层缓冲是直线色，直接交给要求直线输入的 `composite`
 /// 会在小 alpha 处放大模糊量化噪声（实测边缘色偏 86/255）。故把目标也转成预乘，
 /// 算完再转回直线存储。
+/// 与 [`layer_buffer_from_content`] 同逻辑，但源是**未裁剪的 f32**。
+///
+/// 为什么另开一个而不是让原函数泛型化：原函数做的是 `u8 / 255.0` 的转换，
+/// 那一步正是 HDR 信息的丢失点。f32 版本**完全不做转换**，直接搬
+/// `[f32; 4]` —— 语义差别值得一个独立的函数名。
+///
+/// 边界计算与原函数逐字一致（含 `inflated_bounds` 的滤镜扩散余量），
+/// 否则两条路径会在边界上给出不同结果。
+fn layer_buffer_from_content_f32(
+    content: &[[f32; 4]],
+    root_w: u32,
+    root_h: u32,
+    layer: &amiki_scene::Layer,
+) -> Option<(i32, i32, LayerBuffer)> {
+    if layer.bounds.is_empty() {
+        return None;
+    }
+    let b = inflated_bounds(layer.bounds, layer.filter);
+    let bx = b.x.max(0);
+    let by = b.y.max(0);
+    if bx >= root_w as i32 || by >= root_h as i32 {
+        return None;
+    }
+    let lw = b.width.min(root_w - bx as u32);
+    let lh = b.height.min(root_h - by as u32);
+    if lw == 0 || lh == 0 {
+        return None;
+    }
+
+    let mut buf = LayerBuffer::new(lw, lh);
+    for y in 0..lh {
+        for x in 0..lw {
+            let sx = bx + x as i32;
+            let sy = by + y as i32;
+            let src = if sx >= 0 && sy >= 0 && (sx as u32) < root_w && (sy as u32) < root_h {
+                content[(sy as u32 * root_w + sx as u32) as usize]
+            } else {
+                [0.0; 4]
+            };
+            buf.set(x, y, src);
+        }
+    }
+    apply_filter(&mut buf, layer.filter);
+    Some((bx, by, buf))
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn blend_layer_rect(
     root: &mut [u8],
@@ -920,8 +945,13 @@ fn composite_layer(
         return;
     }
     // 1) 层内容（同一画布尺寸，故层内坐标即设备坐标）
-    let layer_img = render_inner(scene.width, scene.height, &layer.scene, eps);
-    let Some((bx, by, buf)) = layer_buffer_from_content(&layer_img, scene.width, scene.height, layer)
+    //
+    // **走 f32 路径**：层内容必须先以未裁剪的 f32 存在，滤镜才能在 HDR 数据上
+    // 工作。此前这里用的是 8 位的 `render_inner`，>1.0 的高光源在模糊**之前**
+    // 就被裁到 1.0 —— 发光效果直接消失（`hdr_values_survive_a_blurred_layer`
+    // 测到的两个 level 能量完全相同，就是这个原因）。
+    let layer_img = render_inner_f32(scene.width, scene.height, &layer.scene, eps);
+    let Some((bx, by, buf)) = layer_buffer_from_content_f32(&layer_img, scene.width, scene.height, layer)
     else {
         return;
     };
@@ -965,10 +995,24 @@ pub fn composite_premul(dst: [f32; 4], src: [f32; 4], mode: u32) -> [f32; 4] {
     out
 }
 
-/// 渲染一个场景到新图像（不处理层）。
-fn render_inner(width: u32, height: u32, scene: &amiki_scene::Scene, eps: f32) -> Vec<u8> {
+
+/// 与 [`render_inner`] 同数学，但输出 **f32 且不裁剪** —— 供层内容使用。
+///
+/// 只用于层：主画布仍走 8 位（见 [`render`]），因为主画布的最终输出本来
+/// 就要落到 8 位显示范围。层不一样 —— 它的内容要先经过滤镜，
+/// 那一步之前必须保持 HDR。
+fn render_inner_f32(width: u32, height: u32, scene: &amiki_scene::Scene, eps: f32) -> Vec<[f32; 4]> {
     let binned = bin(scene, eps);
-    render_tiles_flat(&binned, width, height, None)
+    let w = width as usize;
+    let h = height as usize;
+    // 新建即全零，等价于逐 tile clear（这里没有增量复用，不需要 clear_tile）。
+    let mut img = vec![[0.0f32; 4]; w * h];
+    for ty in 0..binned.tiles_y as usize {
+        for tx in 0..binned.tiles_x as usize {
+            shade_tile_f32(&binned, &mut img, w, h, tx, ty);
+        }
+    }
+    img
 }
 
 /// 从零渲染，但**只清/着色指定的 tile 列表**（`None` = 全部 tile）。

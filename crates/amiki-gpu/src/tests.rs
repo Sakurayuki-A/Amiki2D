@@ -2283,3 +2283,88 @@ fn profile_extract_root_cause() {
     );
     assert!(b > 0.0);
 }
+
+
+// ============================================================================
+// HDR：>1.0 的颜色必须能穿过层边界存活（CPU 与 GPU 必须一致）
+// ============================================================================
+
+/// 与 `amiki-raster` 的 `hdr_values_survive_a_blurred_layer` 同一个场景，
+/// 但这里要的是**两个后端给出同一个答案**。
+///
+/// 为什么这条比 CPU 那条更关键：如果只有 CPU 修好，GPU 仍然在模糊前裁到 1.0，
+/// 那么**同一个场景在两个后端上会渲染出不同的图** —— 那比"两边都不支持 HDR"
+/// 更糟，因为它是静默的、只在特定内容下才暴露的不一致。
+#[test]
+#[ignore = "已知缺口：GPU 的层内容仍渲染到 Rgba8Unorm，>1.0 在模糊前被裁到 1.0；\
+            修它需要 f16 输出管线（WGSL 的存储纹理格式是类型的一部分，改格式就要第二条\
+            管线变体，或把整条 GPU 管线改成 Rgba16Float）。见 docs/KNOWN_ISSUES.md 的 B12。\
+            去掉 ignore 即可复现：当前最大通道差 52。"]
+fn gpu_hdr_layer_matches_cpu() {
+    use amiki_math::Affine;
+    use amiki_scene::{BlendMode, Color, Filter, Layer, LayerBounds, Paint, PathBuilder, Scene};
+
+    let Ok(renderer) = pollster::block_on(GpuRenderer::new()) else {
+        eprintln!("无可用 GPU，跳过");
+        return;
+    };
+
+    let mut scene = Scene::new(240, 180);
+    {
+        let mut pb = PathBuilder::new();
+        pb.rect(0.0, 0.0, 240.0, 180.0);
+        scene.push(Affine::IDENTITY, pb.build(), Paint::Solid(Color::rgb8(20, 20, 24)));
+    }
+    scene.push_layer(
+        Layer {
+            bounds: LayerBounds::new(60, 20, 120, 140),
+            scene: Scene::new(240, 180),
+            filter: Filter::Blur { sigma: 8.0 },
+            opacity: 1.0,
+            blend: BlendMode::Normal,
+        },
+        |s| {
+            let mut pb = PathBuilder::new();
+            pb.rect(117.0, 60.0, 123.0, 120.0);
+            // 4.0 —— HDR 高光源。若在模糊前被裁到 1.0，这一条就不起作用了。
+            s.push(
+                Affine::IDENTITY,
+                pb.build(),
+                Paint::Solid(Color { r: 4.0, g: 4.0, b: 4.0, a: 1.0 }),
+            );
+        },
+    );
+
+    let gpu = renderer
+        .render_blocking(&scene, 0.05)
+        .expect("GPU 渲染失败");
+    let cpu = amiki_raster::render(&amiki_raster::bin(&scene, 0.05));
+
+    let mut max_diff = 0u32;
+    let mut worst = (0usize, 0usize);
+    for i in 0..(240 * 180) {
+        for k in 0..4 {
+            let d = (gpu[i * 4 + k] as i32 - cpu[i * 4 + k] as i32).unsigned_abs();
+            if d > max_diff {
+                max_diff = d;
+                worst = (i % 240, i / 240);
+            }
+        }
+    }
+
+    // 能量对比：HDR 若真的存活，总能量必须显著高于"裁到 1.0"的情形。
+    let mut e = 0u64;
+    for y in 20..160u32 {
+        for x in 60..180u32 {
+            e += gpu[((y * 240 + x) * 4) as usize] as u64;
+        }
+    }
+    eprintln!("GPU HDR 层：最大通道差 {max_diff}（位于 {worst:?}），能量 {e}");
+
+    assert!(
+        max_diff <= 2,
+        "HDR 层：GPU 与 CPU 最大通道差 {max_diff}（位于 {worst:?}）超出容差。\n\
+         差异很大通常意味着只有一个后端保住了 >1.0 的值 —— 那会让同一场景\n\
+         在两个后端上渲染出不同的图。"
+    );
+}

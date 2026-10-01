@@ -405,3 +405,68 @@ fn persistent_renderer_keeps_layers_on_incremental_frames() {
         stats.shaded_tiles, stats.total_tiles
     );
 }
+
+
+// ============================================================================
+// HDR（高动态范围）：>1.0 的颜色必须能穿过层边界存活
+// ============================================================================
+
+/// 把一个细条的**亮度**放进带模糊的层里，返回渲染结果。
+///
+/// 用细条而不是方块：方块要是比模糊半径宽得多，中心在模糊后仍然饱和，
+/// "更亮"就看不出来（`blur_actually_spreads_energy_outward` 里踩过同一个坑）。
+fn blurred_bar_energy(level: f32) -> u64 {
+    let (cx, cy) = (120.0f32, 90.0f32);
+    let (hw, hh) = (3.0f32, 30.0f32);
+    // 直接构造：`Color` 的字段是公开的 f32，`rgba()` 也不裁剪 ——
+    // 也就是说**引擎在类型上允许 HDR 值**，问题只在于管线会不会把它丢掉。
+    let color = Color { r: level, g: level, b: level, a: 1.0 };
+
+    let mut s = Scene::new(240, 180);
+    s.push_layer(
+        amiki_scene::Layer {
+            bounds: LayerBounds::new(60, 20, 120, 140),
+            scene: Scene::new(240, 180),
+            filter: Filter::Blur { sigma: 8.0 },
+            opacity: 1.0,
+            blend: BlendMode::Normal,
+        },
+        |s| {
+            let mut pb = PathBuilder::new();
+            pb.rect(cx - hw, cy - hh, cx + hw, cy + hh);
+            s.push(Affine::IDENTITY, pb.build(), Paint::Solid(color));
+        },
+    );
+
+    let img = render(&bin(&s, 0.05));
+    // 只统计层作用的区域，把 R 通道求和当"总能量"。
+    // 峰值在两个 level 下都会饱和到 255，所以看的是**扩散出去的那部分**。
+    let mut energy = 0u64;
+    for y in 20..160u32 {
+        for x in 60..180u32 {
+            energy += img[((y * 240 + x) * 4) as usize] as u64;
+        }
+    }
+    energy
+}
+
+#[test]
+fn hdr_values_survive_a_blurred_layer() {
+    // 这一条是 HDR 的核心可观测判据。
+    //
+    // level = 1.0 与 level = 4.0 的**几何完全相同**，只有亮度不同。
+    // 若管线在模糊**之前**就把值裁到 1.0（当前行为：层内容先渲染成 8 位
+    // `Vec<u8>`，再拷进 f32 的 LayerBuffer —— 裁切在那一步已经发生），
+    // 那么两次的能量会**完全一样**，4.0 那个高光源凭空消失。
+    //
+    // 若 HDR 值真的存活，4.0 的条在模糊后会向外扩散**多得多的能量**。
+    let e1 = blurred_bar_energy(1.0);
+    let e4 = blurred_bar_energy(4.0);
+
+    assert!(
+        e4 > e1 * 2,
+        "HDR 值没有穿过层边界：level=1.0 能量 {e1}，level=4.0 能量 {e4}。\n\
+         两者几乎相同说明 >1.0 的部分在模糊前就被裁掉了 —— 高光源会消失。"
+    );
+    eprintln!("HDR 存活：level=1.0 能量 {e1}，level=4.0 能量 {e4}（比值 {:.2}）", e4 as f64 / e1 as f64);
+}

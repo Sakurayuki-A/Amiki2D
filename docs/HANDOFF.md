@@ -135,7 +135,6 @@ loop {
 - `docs/API.md` —— API 稳定性三级清单 + 逐帧/一次性调用的区别
 - `CHANGELOG.md` —— 版本演进与全部已修缺陷
 - `docs/ARCHITECTURE.md`、`docs/RENDERING_STRATEGY.md` —— 分层与算法推导
-- `docs/PLAN_EXTRACT_GPU_COUNTS.md` —— **结论已作废**的旧方案，保留作推导记录
 ```
 
 ---

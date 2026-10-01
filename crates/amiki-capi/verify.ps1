@@ -92,6 +92,35 @@ if (-not $vcvars) {
     }
 }
 
+# --- 3b. the header version matches Cargo.toml -------------------------------
+Step '3b' 'the version in amiki.h matches Cargo.toml'
+# NOTE: keep this file ASCII-only. PowerShell 5.1 reads a BOM-less UTF-8 file as
+# ANSI, and a mangled multi-byte comment can swallow the following newline --
+# which silently turns the next statement into part of the comment. That is
+# exactly how this check first shipped broken: it reported a mismatch even when
+# the versions agreed, because $cargoVer ended up inside a comment.
+$cargoVer = $null
+$cargoLine = Select-String -Path (Join-Path $root 'Cargo.toml') -Pattern '^version\s*=\s*"([^"]+)"' |
+             Select-Object -First 1
+if ($cargoLine) { $cargoVer = $cargoLine.Matches[0].Groups[1].Value }
+$core = if ($cargoVer) { ($cargoVer -split '-')[0] } else { '' }
+
+$hdr = Get-Content (Join-Path $inc 'amiki.h') -Raw
+$maj = [regex]::Match($hdr, '#define AMIKI_VERSION_MAJOR (\d+)').Groups[1].Value
+$min = [regex]::Match($hdr, '#define AMIKI_VERSION_MINOR (\d+)').Groups[1].Value
+$pat = [regex]::Match($hdr, '#define AMIKI_VERSION_PATCH (\d+)').Groups[1].Value
+$hdrVer = if ($maj -and $min -and $pat) { "$maj.$min.$pat" } else { '' }
+
+# A parse failure must never masquerade as a version mismatch: an empty value
+# means "could not read it", which is a different (and worse) problem.
+if (-not $core -or -not $hdrVer) {
+    Bad "could not parse versions (Cargo.toml='$cargoVer' header='$hdrVer') -- the check itself is broken"
+} elseif ($hdrVer -ne $core) {
+    Bad "header says $hdrVer but Cargo.toml says $core"
+} else {
+    Ok "$hdrVer (matches Cargo.toml; package version is $cargoVer)"
+}
+
 # --- 4. the three examples build and run -------------------------------------
 Step 4 'three binding examples (C / C# / Node) build and run'
 $bmp = @{

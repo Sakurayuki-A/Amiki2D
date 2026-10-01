@@ -134,8 +134,12 @@ const ALLOC_ALIGN: usize = 16;
 /// 与 header 的 `AMIKI_VERSION` 对照；不一致说明头文件与二进制不是同一版。
 #[no_mangle]
 pub extern "C" fn amiki_version() -> u32 {
+    // 数值版本必须与 `Cargo.toml` 一致，但 const 上下文里没法解析字符串，
+    // 所以只能各写一份。**一致性由测试保证**：
+    // `tests::numeric_version_matches_package_version` 会解析
+    // `CARGO_PKG_VERSION` 逐段比对 —— 不同步就红。
     const MAJOR: u32 = 0;
-    const MINOR: u32 = 4;
+    const MINOR: u32 = 5;
     const PATCH: u32 = 0;
     (MAJOR << 16) | (MINOR << 8) | PATCH
 }
@@ -146,9 +150,13 @@ pub extern "C" fn amiki_version() -> u32 {
 /// 本字符串额外带预发布标签（便于展示与上报）。
 #[no_mangle]
 pub extern "C" fn amiki_version_string() -> *const std::ffi::c_char {
-    // 编译期字面量 → `&'static CStr`：本身就是静态的，不需要分配，
-    // 也就没有"谁来释放"的问题（header 承诺不可释放）。
-    c"0.4.0-alpha".as_ptr()
+    // **编译期**从 `Cargo.toml` 取，`concat!` 补上结尾的 NUL ——
+    // 于是它不可能与包版本漂移。
+    //
+    // 这一条是踩出来的：我先前把版本串**硬编码**成 "0.4.0-alpha"，
+    // 后来把 workspace 版本升到 0.5.0-alpha 时就漏改了，于是 Node 示例
+    // 打印出旧版本。两处各写一份必然漂移，干脆只留一处。
+    concat!(env!("CARGO_PKG_VERSION"), "\0").as_ptr().cast()
 }
 
 /// 人类可读的错误说明（静态字符串，**不可释放**）。

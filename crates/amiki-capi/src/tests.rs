@@ -31,17 +31,27 @@ fn cpu_context() -> (*mut AmikiContext, i32) {
 // ============================================================================
 
 #[test]
-fn version_is_encoded_and_printed_consistently() {
-    // 两处版本必须一致：编译期宏（header）与运行期函数。
-    let v = amiki_version();
-    assert_eq!(v >> 16, 0, "major");
-    assert_eq!((v >> 8) & 0xFF, 4, "minor");
-    assert_eq!(v & 0xFF, 0, "patch");
-
+fn version_string_is_taken_from_cargo_toml() {
     // SAFETY: `amiki_version_string` 返回静态 C 字符串
     let s = unsafe { std::ffi::CStr::from_ptr(amiki_version_string()) };
-    // `version_string` 带预发布标签（展示用），数值宏不带（比较用）。
-    assert_eq!(s.to_str().unwrap(), "0.4.0-alpha");
+    // 直接与包版本比 —— 这条断言**不可能因为"忘了改某处"而漂移**，
+    // 因为实现就是编译期从 Cargo.toml 取的。
+    assert_eq!(s.to_str().unwrap(), env!("CARGO_PKG_VERSION"));
+}
+
+#[test]
+fn numeric_version_matches_package_version() {
+    // 数值版本没法在 const 上下文里从字符串解析，所以只能各写一份 ——
+    // 这条测试就是保证两份同步的东西。
+    let pkg = env!("CARGO_PKG_VERSION");
+    let core = pkg.split('-').next().unwrap(); // 去掉 -alpha 之类
+    let parts: Vec<u32> = core.split('.').map(|x| x.parse().expect("版本段不是数字")).collect();
+    assert_eq!(parts.len(), 3, "包版本应为 major.minor.patch：{pkg}");
+
+    let v = amiki_version();
+    assert_eq!(v >> 16, parts[0], "major 与 Cargo.toml 不一致（包版本 {pkg}）");
+    assert_eq!((v >> 8) & 0xFF, parts[1], "minor 与 Cargo.toml 不一致（包版本 {pkg}）");
+    assert_eq!(v & 0xFF, parts[2], "patch 与 Cargo.toml 不一致（包版本 {pkg}）");
 }
 
 #[test]

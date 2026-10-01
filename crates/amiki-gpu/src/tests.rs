@@ -1747,5 +1747,16 @@ fn profile_frame_path_phases() {
         t_all = t_all.min((d - a).as_secs_f64() * 1e3);
     }
     eprintln!("[帧路径] prepare {t_prep:.2} ms + render_into {t_draw:.2} ms + poll {t_poll:.2} ms = {t_all:.2} ms");
+
+    // 主机侧与 GPU 侧的拆分：`profile()` 给主机分段与 GPU 时间戳。
+    // 注意 `profile()` 走的是**阻塞路径**（含读回），所以它的"主机侧合计"
+    // 不能直接当作帧路径的主机开销 —— 这里只取 **GPU 时间**。
+    let prof = renderer.profile(&scene, 0.05).expect("profile");
+    let gpu_ms = prof.timestamps.total_ns() / 1e6;
+    eprintln!(
+        "[帧路径] GPU 合计 {gpu_ms:.2} ms（支持时间戳 = {}）；profile 主机侧合计 {:.2} ms（含读回与时间戳解析）",
+        prof.timestamps.supported,
+        prof.host_total_ms()
+    );
     assert!(t_all > 0.0);
 }

@@ -227,9 +227,7 @@ impl GpuRenderer {
         // 创建占位资源（绑定布局需要合法的非空绑定），那种情况与位图能力无关。
         if self.backend == Some(wgpu::Backend::Gl) && !images.is_empty() {
             return err(
-                "GL 后端无法正确读取位图（`texture_2d_array` 在该后端上读回为空，\
-                 实测采样恒为不透明黑）。请改用 Vulkan/DX12 后端，\
-                 或使用 CPU 引擎（amiki_raster）；可用 AMIKI_BACKENDS 指定后端",
+                "GL 后端无法正确读取位图（`texture_2d_array` 在该后端上读回为空，实测采样恒为不透明黑）。请改用 Vulkan/DX12 后端，或使用 CPU 引擎（amiki_raster）；可用 AMIKI_BACKENDS 指定后端",
             );
         }
         let max_dim = self.limits.max_texture_dimension_2d;
@@ -484,8 +482,7 @@ fn check_damage_bounds(damage: Option<&amiki_scene::Damage>, tiles_x: u32, tiles
         assert_eq!(
             (d.total_tiles()),
             tiles_x.max(1) * tiles_y.max(1),
-            "damage 的 tile 数与当前画布不一致（damage 可能是为别的画布尺寸创建的）\
-             —— 否则「全脏」会被误当作局部脏区，导致陈旧像素残留"
+            "damage 的 tile 数与当前画布不一致（damage 可能是为别的画布尺寸创建的）—— 否则「全脏」会被误当作局部脏区，导致陈旧像素残留"
         );
     }
 }
@@ -681,11 +678,7 @@ pub fn dense_capacity(
     ] {
         if bytes > binding_cap {
             return err(format!(
-                "稠密网格超限（RenderPath::Dense）：{name} 需 {:.1} MB，\
-                 单缓冲上限 {:.1} MB（max_storage_buffer_binding_size / max_buffer_size 取小）\
-                 —— 本场景 tiles={tiles_x}x{tiles_y} draws={n_draws}。\
-                 请改用 RenderPath::Sparse（显存 ∝ 画面内容，无此上限）；\
-                 稠密路径仅适用于小场景对拍与诊断。",
+                "稠密网格超限（RenderPath::Dense）：{name} 需 {:.1} MB，单缓冲上限 {:.1} MB（max_storage_buffer_binding_size / max_buffer_size 取小）—— 本场景 tiles={tiles_x}x{tiles_y} draws={n_draws}。请改用 RenderPath::Sparse（显存 ∝ 画面内容，无此上限）；稠密路径仅适用于小场景对拍与诊断。",
                 bytes as f64 / 1e6,
                 binding_cap as f64 / 1e6,
             ));
@@ -696,8 +689,7 @@ pub fn dense_capacity(
     let clear_wg = n_grid.max(n_bucket).div_ceil(64);
     if clear_wg > 65_535 * 65_535 {
         return err(format!(
-            "稠密网格 clear dispatch 超限：需 {clear_wg} 个工作组，\
-             线性 2D 上限 {}（65535²）——请改用 RenderPath::Sparse。",
+            "稠密网格 clear dispatch 超限：需 {clear_wg} 个工作组，线性 2D 上限 {}（65535²）——请改用 RenderPath::Sparse。",
             65_535u64 * 65_535
         ));
     }
@@ -774,38 +766,85 @@ impl GpuRenderer {
         // 1. `AMIKI_BACKENDS=vulkan|dx12|gl|all` 显式指定；
         // 2. `GpuRenderer::new` 本来就是 `async`，把它与窗口初始化**重叠**，
         //    而不是阻塞首帧。
+        // 分两次尝试：**先平台首选（快），拿不到适配器再全量回退（慢但一定能起来）**。
+        //
+        // 为什么不是"直接用全部后端"：枚举每个后端都要加载一次它的驱动。
+        // 实测（RTX 3050 / Windows / 冷启动）：
+        //
+        // | 后端集合 | 冷 |
+        // |---|---|
+        // | `all()`（含 DX12 + GL + Vulkan） | 337 ms |
+        // | 仅 Vulkan | **154 ms** |
+        //
+        // 差在 **DX12 的探测本身约 170 ms**（`all()` 里 86% 的时间花在后端枚举，
+        // 而全部 21 条管线只占 12.7 ms）。
+        //
+        // 这不是"把引擎绑到某个后端上"：**拿不到适配器就回退到全部后端**，
+        // 所以"哪台机器都能起来"这条保证没有变。引擎本身仍然与图形 API 无关
+        // （同一份 WGSL 在 Vulkan / DX12 / GL 上都跑通）。
+        //
+        // 平台首选取"该平台最常见且启动最快的那一个"：
+        // - Windows / Linux：Vulkan（Windows 上 DX12 的探测反而更贵）
+        // - macOS：Metal（Vulkan 不存在）
+        // `AMIKI_BACKENDS` 可显式覆盖。
         let forced = std::env::var("AMIKI_BACKENDS").ok();
-        let backends = match forced.as_deref() {
+        let override_set = match forced.as_deref() {
             Some("vulkan") => Some(wgpu::Backends::VULKAN),
             Some("dx12") => Some(wgpu::Backends::DX12),
             Some("gl") => Some(wgpu::Backends::GL),
             Some("all") => Some(wgpu::Backends::all()),
             Some(other) => {
                 return err(format!(
-                    "AMIKI_BACKENDS 取值无法识别：{other}\
-                     （可用：vulkan / dx12 / gl / all）"
+                    "AMIKI_BACKENDS 取值无法识别：{other}（可用：vulkan / dx12 / gl / all）"
                 ));
             }
             None => None,
         };
-        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
-            backends: backends.unwrap_or_else(wgpu::Backends::all),
-            ..Default::default()
-        });
-        let adapter = instance
-            .request_adapter(&wgpu::RequestAdapterOptions {
-                power_preference: wgpu::PowerPreference::HighPerformance,
-                compatible_surface: None,
-                force_fallback_adapter: false,
-            })
-            .await
-            .map_err(|e| {
-                RenderError(format!(
-                    "没有可用的 GPU 适配器（后端 {:?}）：{e}\
-                     —— 可用 AMIKI_BACKENDS 指定后端",
-                    backends.unwrap_or_else(wgpu::Backends::all)
-                ))
-            })?;
+        let preferred = if cfg!(target_os = "macos") {
+            wgpu::Backends::METAL
+        } else {
+            wgpu::Backends::VULKAN
+        };
+        let attempts: Vec<wgpu::Backends> = match override_set {
+            Some(b) => vec![b],
+            // 首选与 all() 相同时不重复试一遍
+            None if preferred == wgpu::Backends::all() => vec![wgpu::Backends::all()],
+            None => vec![preferred, wgpu::Backends::all()],
+        };
+        let mut adapter = None;
+        for (i, backends) in attempts.iter().enumerate() {
+            let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+                backends: *backends,
+                ..Default::default()
+            });
+            match instance
+                .request_adapter(&wgpu::RequestAdapterOptions {
+                    power_preference: wgpu::PowerPreference::HighPerformance,
+                    compatible_surface: None,
+                    force_fallback_adapter: false,
+                })
+                .await
+            {
+                Ok(a) => {
+                    if i > 0 {
+                        eprintln!(
+                            "amiki-gpu：首选后端 {preferred:?} 未找到适配器，已回退到 {backends:?} （启动会慢一些；可用 AMIKI_BACKENDS 指定后端）");
+
+                    }
+                    adapter = Some(a);
+                    break;
+                }
+                Err(e) => {
+                    if i + 1 == attempts.len() {
+                        return err(format!(
+                            "没有可用的 GPU 适配器（已尝试 {attempts:?}）：{e} —— 可用 AMIKI_BACKENDS 指定后端"));
+
+                    }
+                }
+            }
+        }
+        let adapter =
+            adapter.ok_or_else(|| RenderError("没有可用的 GPU 适配器".into()))?;
         let info = adapter.get_info();
         // M6：图像放置参数是第 9 个 storage buffer，而 wgpu 的
         // `Limits::default()` 只保证 8 个（WebGPU 基线）。
@@ -815,8 +854,7 @@ impl GpuRenderer {
         let want_sb = REQUIRED_STORAGE_BUFFERS;
         if adapter_limits.max_storage_buffers_per_shader_stage < want_sb {
             return err(format!(
-                "适配器仅支持 {} 个 storage buffer/阶段，图像绘制需要 {want_sb} 个；\
-                 请改用 CPU 引擎或不使用图像",
+                "适配器仅支持 {} 个 storage buffer/阶段，图像绘制需要 {want_sb} 个；请改用 CPU 引擎或不使用图像",
                 adapter_limits.max_storage_buffers_per_shader_stage
             ));
         }
@@ -848,10 +886,7 @@ impl GpuRenderer {
         let d_limits = device.limits();
         if d_limits.max_storage_buffers_per_shader_stage < REQUIRED_STORAGE_BUFFERS {
             return err(format!(
-                "传入的设备只支持 {} 个 storage buffer/阶段，引擎需要 {} 个。\
-                 请用 `amiki_gpu::required_limits()` 构造 `DeviceDescriptor::required_limits` \
-                 （或用 `GpuRenderer::new()` 让它自己请求）；\
-                 也可改用 CPU 引擎（amiki_raster）",
+                "传入的设备只支持 {} 个 storage buffer/阶段，引擎需要 {} 个。请用 `amiki_gpu::required_limits()` 构造 `DeviceDescriptor::required_limits` （或用 `GpuRenderer::new()` 让它自己请求）；也可改用 CPU 引擎（amiki_raster）",
                 d_limits.max_storage_buffers_per_shader_stage, REQUIRED_STORAGE_BUFFERS
             ));
         }

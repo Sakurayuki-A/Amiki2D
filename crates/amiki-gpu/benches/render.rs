@@ -184,6 +184,18 @@ fn bench_extract(c: &mut Criterion) {
         let scene = curves_scene(1920, 1080, 10_000, 5.0);
         b.iter(|| black_box(build_gpu_scene(black_box(&scene), EPS)));
     });
+    // **判据看的是这一条**：引擎逐帧走的是 `prepare_into` → `build_gpu_scene_into`，
+    // 缓冲跨帧复用，于是没有每帧全新分配（大块分配走 mmap + 缺页，实测差 5.3 倍）。
+    // 上面那条 `1080p_10k_curves` 保留作对比：它是**一次性调用**的成本。
+    group.bench_function("1080p_10k_curves_reused", |b| {
+        let scene = curves_scene(1920, 1080, 10_000, 5.0);
+        let mut gs = amiki_gpu::GpuScene::default();
+        amiki_gpu::build_gpu_scene_into(black_box(&scene), EPS, &mut gs); // 热身，容量长到位
+        b.iter(|| {
+            amiki_gpu::build_gpu_scene_into(black_box(&scene), EPS, &mut gs);
+            black_box(gs.total_segments)
+        });
+    });
     group.bench_function("1080p_1000_curves", |b| {
         let scene = curves_scene(1920, 1080, 1000, 6.0);
         b.iter(|| black_box(build_gpu_scene(black_box(&scene), EPS)));

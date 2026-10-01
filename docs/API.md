@@ -102,3 +102,26 @@
 | `AMIKI_BACKENDS` | 指定 wgpu 后端（`vulkan` / `dx12` / `gl` / `all`）；默认全部，以保证"哪台机器都能起来" |
 
 未来若增加环境变量，会先补进这张表。
+
+## 逐帧调用请用「复用缓冲」的 API
+
+`build_gpu_scene` / `prepare` / `profile` 每次都会**新建约 7 MB 缓冲**。
+大块分配走 `mmap` + 缺页，实测同一批数据**慢 5.3 倍**。
+
+逐帧路径应当持有并复用一份缓冲：
+
+| 一次性调用 | 逐帧应当用 |
+|---|---|
+| `build_gpu_scene(scene, eps)` | `build_gpu_scene_into(scene, eps, &mut gs)` |
+| `GpuRenderer::prepare(scene, eps)` | `GpuRenderer::prepare_into(scene, eps, &mut frame)` |
+| `GpuRenderer::profile(scene, eps)` | `GpuRenderer::profile_into(scene, eps, &mut frame)` |
+
+```rust
+let mut frame = amiki_gpu::Frame::default();
+loop {
+    renderer.prepare_into(&scene, eps, &mut frame)?;
+    renderer.render_into(&tex, &frame)?;
+}
+```
+
+`prepare` / `profile` 保留为兼容包装 —— 一次性调用或测试里用它们没问题。

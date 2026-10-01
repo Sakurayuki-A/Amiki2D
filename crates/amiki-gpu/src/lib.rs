@@ -43,7 +43,7 @@ pub mod readback;
 pub mod sparse;
 pub use blit::Blitter;
 pub use consistency::check_sparse_consistency;
-pub use extract::{build_gpu_scene, GpuScene};
+pub use extract::{build_gpu_scene, build_gpu_scene_into, GpuScene};
 pub(crate) use extract::{BinsParams, FineParams, FlattenParams, ScanParams};
 pub(crate) use profile::TimestampRecorder;
 pub use profile::{
@@ -548,8 +548,13 @@ fn ts_slot<'a, const N: usize>(
 }
 
 /// M3a：逐帧资源。主场景 + clip 覆盖率纹理视图。
+#[derive(Default)]
 pub struct Frame {
     scene: GpuScene,
+    /// **clip 覆盖率纹理用的复用缓冲**。每个 clip 都要提取一次场景，
+    /// 若每帧每个 clip 都新建缓冲，大块分配 + 缺页的代价会照常付
+    /// （见 `GpuScene::reset_for_reuse` 的实测）。
+    clip_scratch: GpuScene,
     /// 只用于**持有** clip 纹理的生命周期 —— `clip_views` 借用它们，
     /// 纹理一旦 drop，视图即失效。字段本身从不被读，所以需要 allow。
     #[allow(dead_code)]
@@ -1377,6 +1382,23 @@ impl GpuRenderer {
     /// 注意：本方法会为时间戳额外提交一次 resolve + 读回，故其结果**略高于**
     /// 常规渲染路径的真实耗时；做墙钟基准请用 `render_into` + `poll`。
     pub fn profile(&self, scene: &Scene, eps: f32) -> Result<FrameProfile, RenderError> {
+        // 每次新建 `Frame` —— 于是 `extract_ms` 里含**每帧全新分配**的代价。
+        // 逐帧复用场景的真实提取成本请用 [`Self::profile_into`]。
+        let mut frame = Frame::default();
+        self.profile_into(scene, eps, &mut frame)
+    }
+
+    /// 同 [`Self::profile`]，但**复用调用方持有的 `Frame`**。
+    ///
+    /// 两者的 `extract_ms` 会明显不同：全新分配约 1.0 ms，复用约 0.56 ms
+    /// （实测，见 `GpuScene::reset_for_reuse`）。逐帧路径用的是复用那一档，
+    /// 所以**评估提取成本应当看这个方法**。
+    pub fn profile_into(
+        &self,
+        scene: &Scene,
+        eps: f32,
+        frame: &mut Frame,
+    ) -> Result<FrameProfile, RenderError> {
         let mut prof = FrameProfile {
             timestamps: PassTimings {
                 supported: false,
@@ -1386,7 +1408,7 @@ impl GpuRenderer {
             ..Default::default()
         };
         let t_extract = Instant::now();
-        let frame = self.prepare(scene, eps)?;
+        self.prepare_into(scene, eps, frame)?;
         prof.extract_ms = t_extract.elapsed().as_secs_f64() * 1000.0;
         let tex = self.create_output_texture(&frame.scene);
         if !self.has_timestamps {
@@ -1578,22 +1600,54 @@ impl GpuRenderer {
     }
 
     /// 准备逐帧资源：GpuScene 提取 + clip 覆盖率纹理。
+    ///
+    /// **逐帧调用请改用 [`Self::prepare_into`]** —— 本函数每次返回新的 `Frame`，
+    /// 而 `Frame` 里的缓冲每次都是新分配的（约 7 MB，实测差 5.3 倍，
+    /// 见 `GpuScene::reset_for_reuse`）。保留它是为了一次性调用与兼容。
     pub fn prepare(&self, scene: &Scene, eps: f32) -> Result<Frame, RenderError> {
+        let mut frame = Frame::default();
+        self.prepare_into(scene, eps, &mut frame)?;
+        Ok(frame)
+    }
+
+    /// 准备逐帧资源，**复用调用方持有的 `Frame` 的缓冲**。
+    ///
+    /// ```no_run
+    /// # use amiki_gpu::{GpuRenderer, Frame};
+    /// # fn f(r: &GpuRenderer, scene: &amiki_scene::Scene) -> Result<(), amiki_gpu::RenderError> {
+    /// let mut frame = Frame::default();
+    /// loop {
+    ///     r.prepare_into(scene, 0.05, &mut frame)?;   // 缓冲跨帧复用
+    ///     // … render_into(&tex, &frame)?
+    /// }
+    /// # }
+    /// ```
+    pub fn prepare_into(
+        &self,
+        scene: &Scene,
+        eps: f32,
+        frame: &mut Frame,
+    ) -> Result<(), RenderError> {
         use amiki_scene::{Color, Paint};
         // 注意：`prepare` 本身不拒绝层 —— `render` 会经它进来，而
         // `render_blocking` 才负责层合成。拒绝放在逐帧路径的两个入口
         // （`render_into` / `render_into_persistent`），它们才是真正会
         // 静默丢掉层的地方。
-        let main_scene = build_gpu_scene(scene, eps);
+        build_gpu_scene_into(scene, eps, &mut frame.scene);
         let mut clip_texs = Vec::new();
         let mut clip_views = Vec::new();
         for clip in &scene.clips {
             let mut cs = Scene::new(scene.width, scene.height);
             cs.push(clip.transform, clip.path.clone(), Paint::Solid(Color::rgb8(255, 255, 255)));
-            let gs = build_gpu_scene(&cs, eps);
+            // 复用同一份 scratch：clip 覆盖纹理是**即刻渲染**的，用完即可覆盖
+            build_gpu_scene_into(&cs, eps, &mut frame.clip_scratch);
             let tex = self.device.create_texture(&wgpu::TextureDescriptor {
                 label: Some("amiki_clip_cov"),
-                size: wgpu::Extent3d { width: gs.width, height: gs.height, depth_or_array_layers: 1 },
+                size: wgpu::Extent3d {
+                    width: frame.clip_scratch.width,
+                    height: frame.clip_scratch.height,
+                    depth_or_array_layers: 1,
+                },
                 mip_level_count: 1,
                 sample_count: 1,
                 dimension: wgpu::TextureDimension::D2,
@@ -1603,11 +1657,14 @@ impl GpuRenderer {
                     | wgpu::TextureUsages::COPY_SRC,
                 view_formats: &[],
             });
-            self.run_pipeline(&gs, &tex, true, &[], None)?;
+            self.run_pipeline(&frame.clip_scratch, &tex, true, &[], None)?;
             clip_views.push(tex.create_view(&wgpu::TextureViewDescriptor::default()));
             clip_texs.push(tex);
         }
-        Ok(Frame { scene: main_scene, clip_texs, clip_views, eps })
+        frame.clip_texs = clip_texs;
+        frame.clip_views = clip_views;
+        frame.eps = eps;
+        Ok(())
     }
 
     pub fn render(&self, scene: &Scene, eps: f32) -> Result<wgpu::Texture, RenderError> {

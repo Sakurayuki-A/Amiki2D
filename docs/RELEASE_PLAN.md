@@ -421,7 +421,7 @@ CJK 断行：12 行，禁则检查通过
 |---|---|---|
 | **多后端验证**（原「多适配器验证」） | ✅ **已达成（范围经决策收缩）** | 同一块 GPU 上**三个 wgpu 后端**跑通全部测试：默认（→Vulkan）、DX12、GL。**换厂商硬件未验证** —— 见下方「范围收缩记录」 |
 | **启动开销** | ✅ **已达标** | 默认（快速路径 + 全量回退）**61–67 ms**（曾为 337 ms）。`AMIKI_BACKENDS` 仍可覆盖 |
-| **文件规模** | ✅ **已完成** | `amiki-gpu/src/lib.rs` **5719 → 1439 行**（−75%），拆出 tests / sparse / layer / dense / profile / extract / consistency / readback / blit |
+| **文件规模** | ✅ **已完成** | `amiki-gpu/src/lib.rs` **5719 → 1453 行**（−75%），拆出 tests / sparse / layer / dense / profile / extract / consistency / readback / blit |
 | **API 稳定性** | ✅ **已完成** | 新增 [`docs/API.md`](API.md)：稳定面 / 实验面 / 内部面三级清单与承诺；`cargo doc` 零警告；已在各 crate 的 crate 文档里写明 |
 | **dogfooding** | ✅ **已完成** | 窗口示例做成真应用（滚动 + 点击选中 + 文字 + 只画可见行）；**第一次真去跑就抓到「示例一直跑不起来」** |
 | **文档同步** | ✅ **已完成** | 五份文档与代码一致；新增 `docs/API.md` 含「已知使用限制」清单；`cargo doc` 零警告 |

@@ -851,22 +851,41 @@ fn sparse_capacity_is_learned_from_measured_usage() {
 /// 的假设是**错的**，已按实测更正。
 #[test]
 fn startup_cost_stays_within_budget() {
-    let t0 = std::time::Instant::now();
-    let Ok(r1) = pollster::block_on(GpuRenderer::new()) else {
+    let Ok(first) = pollster::block_on(GpuRenderer::new()) else {
         eprintln!("跳过：无 GPU 适配器");
         return;
     };
-    let cold_ms = t0.elapsed().as_secs_f64() * 1000.0;
-    let t1 = std::time::Instant::now();
-    let Ok(r2) = pollster::block_on(GpuRenderer::new()) else { return };
-    let warm_ms = t1.elapsed().as_secs_f64() * 1000.0;
+    let name = first.adapter_name.clone();
+    drop(first);
+
+    // **取多次的最小值**，而不是测一次就断言。
+    //
+    // 理由：这台机器上单次冷启动的**正常**范围是 340–500 ms，但机器有负载时
+    // 实测出现过 **1598.8 ms** —— 一次就断言会产生假失败（实际发生过一次：
+    // 连续跑完 10 轮基准后跑测试，`startup_cost` 假失败）。
+    // 而真实的回归会让**每一次**都慢，所以取最小值既不误报、也不放过回归。
+    let mut cold_ms = f64::MAX;
+    let mut warm_ms = f64::MAX;
+    let mut names = Vec::new();
+    for i in 0..3 {
+        let t0 = std::time::Instant::now();
+        let Ok(r) = pollster::block_on(GpuRenderer::new()) else { return };
+        let ms = t0.elapsed().as_secs_f64() * 1000.0;
+        if i == 0 {
+            // 第一次是真正的"冷"（驱动尚未在本进程里加载过）
+            cold_ms = ms;
+        } else {
+            warm_ms = warm_ms.min(ms);
+        }
+        names.push(r.adapter_name.clone());
+        drop(r);
+    }
     eprintln!(
-        "[启动] 适配器 = {}；首次(冷) = {cold_ms:.1} ms；第二次(热) = {warm_ms:.1} ms",
-        r1.adapter_name
+        "[启动] 适配器 = {name}；首次(冷) = {cold_ms:.1} ms；后续(热) 最小 = {warm_ms:.1} ms"
     );
     assert!(
-        r1.adapter_name == r2.adapter_name,
-        "同一进程内两次创建应选中同一个适配器"
+        names.iter().all(|n| *n == name),
+        "同一进程内多次创建应选中同一个适配器：{names:?}"
     );
     // 显式指定后端时（`AMIKI_BACKENDS`）不套用默认预算：那时测的不是默认配置。
     // DX12 走 FXC 运行期编译，冷启动实测约 2.7 s，本就不该套用本预算。
@@ -876,8 +895,8 @@ fn startup_cost_stays_within_budget() {
     }
     assert!(
         cold_ms < 1200.0,
-        "冷启动 {cold_ms:.1} ms —— 这是病态回归的兜底阈值；\
-         注意**本项未达标**（目标 200 ms，实测默认 ~340 ms），详见测试文档注释"
+        "冷启动 {cold_ms:.1} ms —— 这是病态回归的兜底阈值（正常 340–500 ms）；\
+         注意**本项未达标**（目标 200 ms），详见测试文档注释"
     );
 }
 

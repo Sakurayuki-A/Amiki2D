@@ -70,6 +70,62 @@ pub(crate) unsafe fn write_out<T>(out: *mut T, v: T) {
 }
 
 // ============================================================================
+// 堆分配（WASM 必需；原生下也有用）
+// ============================================================================
+
+/// 分配对齐的缓冲，供调用方写入数据后再传给其它函数。
+///
+/// # 为什么 C ABI 需要这个
+///
+/// 在 **WASM** 上，调用方（JS）无法自己分配引擎线性内存里的空间 ——
+/// 它只能通过导出的分配器。没有这个函数，就无法把像素、字体字节、
+/// 渐变色标这类数组传进来。
+///
+/// 原生场景下它也有用：调用方可以用**同一个分配器**分配与释放，
+/// 避免跨 CRT / 跨 `malloc` 实现释放造成的未定义行为。
+///
+/// # 契约
+///
+/// - 返回的指针对齐到 **16 字节**（够放下任何标量类型与 SIMD 对齐需求）
+/// - `size == 0` 返回空指针
+/// - 必须用 [`amiki_free`] 释放，**且传入与分配时相同的 `size`** ——
+///   释放时需要它来重建 layout
+/// - 分配失败返回空指针（WASM 上通常意味着内存耗尽）
+#[no_mangle]
+pub extern "C" fn amiki_alloc(size: usize) -> *mut u8 {
+    if size == 0 {
+        return std::ptr::null_mut();
+    }
+    // `from_size_align` 会检查对齐是不是 2 的幂、以及 size 会不会溢出 isize。
+    // 对齐是常量 16，所以只会因 size 过大而失败 —— 那时返回 NULL 是正确行为。
+    let Ok(layout) = std::alloc::Layout::from_size_align(size, ALLOC_ALIGN) else {
+        return std::ptr::null_mut();
+    };
+    // SAFETY: layout 非零大小（size > 0 已判）
+    unsafe { std::alloc::alloc(layout) }
+}
+
+/// 释放 [`amiki_alloc`] 返回的缓冲。传空指针是空操作。
+///
+/// `size` 必须是**分配时的同一个值** —— 重建 layout 需要它。
+#[no_mangle]
+pub extern "C" fn amiki_free(ptr: *mut u8, size: usize) {
+    if ptr.is_null() || size == 0 {
+        return;
+    }
+    // 用**安全检查版**重建 layout：契约要求 size 与分配时一致，所以这里不会
+    // 失败；万一调用方传错，我们也只是提前返回而不是进入未定义行为。
+    let Ok(layout) = std::alloc::Layout::from_size_align(size, ALLOC_ALIGN) else {
+        return;
+    };
+    // SAFETY: 契约要求 `ptr` 来自 `amiki_alloc`，且 layout 与分配时相同
+    unsafe { std::alloc::dealloc(ptr, layout) };
+}
+
+/// [`amiki_alloc`] 使用的对齐。header 里写明了这个值。
+const ALLOC_ALIGN: usize = 16;
+
+// ============================================================================
 // 版本
 // ============================================================================
 

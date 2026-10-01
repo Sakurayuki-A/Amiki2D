@@ -14,6 +14,7 @@
 
 #![forbid(unsafe_code)]
 
+#[cfg(feature = "gpu")]
 pub use amiki_gpu as gpu;
 pub use amiki_math as math;
 pub use amiki_raster as raster;
@@ -305,15 +306,25 @@ impl Canvas {
 }
 
 /// 便捷入口：GPU 渲染为 RGBA8，GPU 不可用时自动落到 CPU 引擎。
+#[cfg(feature = "gpu")]
 pub fn render_to_rgba(canvas: &Canvas, flatten_eps: f32) -> Result<Vec<u8>, gpu::RenderError> {
     match pollster::block_on(gpu::GpuRenderer::new()) {
         Ok(r) => r.render_blocking(&canvas.scene, flatten_eps),
         Err(e) => {
             eprintln!("GPU 不可用（{e}），使用 CPU 引擎");
-            let binned = raster::bin(&canvas.scene, flatten_eps);
-            Ok(raster::render(&binned))
+            Ok(render_cpu(canvas, flatten_eps))
         }
     }
+}
+
+/// 纯 CPU 渲染为 RGBA8：`gpu` feature 关掉时的唯一出口，也是
+/// `render_to_rgba` 的 GPU 不可用回退路径。
+///
+/// 这条路径**在 WASM 上同样可用**，而且是一个好的验证基准 ——
+/// 与 GPU 无关，所以原生与 wasm 的产物应当**逐字节一致**。
+pub fn render_cpu(canvas: &Canvas, flatten_eps: f32) -> Vec<u8> {
+    let binned = raster::bin(&canvas.scene, flatten_eps);
+    raster::render(&binned)
 }
 
 /// 颜色快捷方式。

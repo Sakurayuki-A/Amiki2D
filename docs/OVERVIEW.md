@@ -82,8 +82,8 @@ Amiki2D 让资源占用只随**画面实际内容**增长：
 
 ```
 1. C ABI          ✅ 已完成（0.4.0）
-2. WASM           ← 下一项
-3. mipmap（B4）   ← 有用户提再说
+2. WASM           ✅ 已完成（0.5.0，纯 CPU；WebGPU 构建未验证）
+3. mipmap（B4）   ← 下一项（有用户提再说）
 4. HDR            ← 最后
 ```
 
@@ -91,11 +91,12 @@ Amiki2D 让资源占用只随**画面实际内容**增长：
 
 - **C ABI 已落地**。它是"通用"这个词的兑现入口 —— 没有它，引擎再强也只是
   一个 Rust 项目；有了它，C# / Java / Node / Python 才进得来。
-- **WASM 第二**。Web 是 2D 渲染器最大的分发渠道，而 C ABI 做完后 WASM 是自然延伸
-  （Rust→WASM 直接编译）。不急在 C ABI 之前做，因为 **C ABI 的设计会直接影响
-  WASM 的边界设计**。
-  > 注意：现有的 `examples/node/` 用的是 **koffi FFI**，它证明的是"C ABI 能被
-  > 非 C / 非 .NET 的运行时调进来"，**不是 WASM**。WASM 仍未开始。
+- **WASM 第二，已完成**。Web 是 2D 渲染器最大的分发渠道。
+  模块 **950.7 KB**（纯 CPU 构建），用**原生 WebAssembly API** 直接调 C ABI，
+  不依赖 wasm-bindgen。**强验证**：wasm 模块与原生 CPU 后端的输出**字节完全相同**。
+  > ⚠️ **WebGPU 构建未验证**：本机 Node 24 无 `navigator.gpu`，也没有浏览器环境。
+  > 所以"浏览器里用 GPU"这条**不写成已支持**。
+  > 注意 `examples/node/` 用的是 **koffi FFI**，与 WASM 是两件不同的事。
 - **mipmap 第三，但有用户提再说**。它需要动渲染管线（工程量不小），
   但决定能否进入地图、图像查看器、缩略图 UI 这些场景。
 - **HDR 最后**。锦上添花，没有用户会因为它选你。

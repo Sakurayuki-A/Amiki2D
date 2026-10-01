@@ -1,0 +1,10 @@
+﻿{
+  "name": "amiki-capi-wasm-example",
+  "version": "0.4.0",
+  "private": true,
+  "description": "Amiki2D WASM 示例（原生 WebAssembly API，不依赖 wasm-bindgen）",
+  "main": "minimal.js",
+  "scripts": {
+    "start": "node minimal.js amiki2d.wasm"
+  }
+}

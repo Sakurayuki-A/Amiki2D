@@ -1,3 +1,7 @@
+// 这个测试用 GPU 后端做对拍，所以纯 CPU 构建（`--no-default-features`）下
+// 整个文件编译为空 —— 没有 `gpu` feature 时 `amiki::gpu` 根本不存在。
+#![cfg(feature = "gpu")]
+
 //! 门面描边 API 测试（P0-1）。
 //!
 //! 这里验证的是**整条链路**：`Canvas::stroke_path` → 用户空间轮廓 →

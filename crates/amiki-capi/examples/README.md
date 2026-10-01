@@ -21,8 +21,13 @@ ALL CHECKS PASSED
 | [`c/`](c/) | C99 | `build.cmd`（MSVC） | 直接 `#include "amiki.h"` |
 | [`csharp/`](csharp/) | C# / .NET 10 | `build.cmd`（dotnet） | 手写 P/Invoke |
 | [`node/`](node/) | Node.js 24 | `build.cmd`（npm） | [koffi](https://koffi.dev/) FFI |
+| [`wasm/`](wasm/) | WASM + Node | `build.cmd` | **原生 WebAssembly API**（不用 wasm-bindgen） |
 
-**前置条件**：三者都先 `cargo build -p amiki-capi --release`（脚本会自己做）。
+**前置条件**：前三个都先 `cargo build -p amiki-capi --release`（脚本会自己做）。
+
+> `wasm/` 与其它三个**不是一个维度**：前三个是"别的语言能不能调进来"（同一份
+> 原生库），`wasm/` 是"Web/JS 运行时能不能跑"（纯 CPU 的 wasm 模块）。
+> 两者都建立在同一份 C ABI 上。
 
 ---
 

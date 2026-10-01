@@ -54,7 +54,11 @@ impl Poison {
 /// 这一点是 C ABI 相对 `amiki::render_to_rgba` 的关键改进：后者每次都
 /// `GpuRenderer::new()`（实测冷启动约 61 ms），逐帧调用会让它成为主要开销。
 pub(crate) enum Backend {
+    /// wgpu 后端。`gpu` feature 关掉时**这个变体不存在** ——
+    /// 于是"误用 GPU"会变成**编译错误**而不是运行时错误。
+    #[cfg(feature = "gpu")]
     Gpu(Box<amiki_gpu::GpuRenderer>),
+    /// CPU 引擎（`amiki-raster`）。**零第三方依赖**，因此 wasm32 上也能跑。
     Cpu,
 }
 

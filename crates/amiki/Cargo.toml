@@ -5,12 +5,25 @@ edition.workspace = true
 license.workspace = true
 description = "Amiki2D 通用 2D 渲染引擎（门面 API）"
 
+[features]
+default = ["gpu"]
+
+# GPU 路径（wgpu）。**WASM 构建请关掉它** —— 纯 CPU 构建：
+#
+#     cargo build -p amiki --target wasm32-unknown-unknown --release --no-default-features
+#
+# 为什么需要这个开关：wgpu 会把 wasm 模块推到 **23 MB**，而 WASM 的主要
+# 使用场景是浏览器/边缘运行时，体积是第一约束。纯 CPU 构建只有它的零头。
+#
+# native 用户**不需要关心它** —— 默认开着，行为与以前完全一致。
+gpu = ["dep:amiki-gpu", "dep:pollster"]
+
 [dependencies]
 amiki-math = { workspace = true }
 amiki-scene = { workspace = true }
 amiki-raster = { workspace = true }
-amiki-gpu = { workspace = true }
-pollster = { workspace = true }
+amiki-gpu = { workspace = true, optional = true }
+pollster = { workspace = true, optional = true }
 
 [dev-dependencies]
 image = { workspace = true }
@@ -22,8 +35,13 @@ pollster = { workspace = true }
 amiki-text = { path = "../amiki-text" }
 amiki-layout = { path = "../amiki-layout" }
 
+# 两个示例都直接用了 GPU 后端，所以纯 CPU 构建（`--no-default-features`）下
+# 不该被编译。用 `required-features` 声明依赖，cargo 会自动跳过它们 ——
+# 比在示例里堆 `#[cfg]` 清楚得多。
 [[example]]
 name = "headless_png"
+required-features = ["gpu"]
 
 [[example]]
 name = "window_demo"
+required-features = ["gpu"]

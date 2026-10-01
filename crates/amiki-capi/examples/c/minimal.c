@@ -107,8 +107,24 @@ int main(void) {
     }
 
     /* ---- context：一次，跨帧复用 ---- */
+    /*
+     * 后端可以用环境变量覆盖。存在的理由：WASM 构建是**纯 CPU** 的，
+     * 要和它做字节级对比，就得能让原生也走 CPU。
+     *   AMIKI_BACKEND=cpu   → 强制 CPU
+     *   AMIKI_BACKEND=gpu   → 强制 GPU（拿不到就失败）
+     *   未设置 / auto       → 先试 GPU，失败落 CPU
+     */
+    amiki_backend want = AMIKI_BACKEND_AUTO;
+    {
+        const char *env = getenv("AMIKI_BACKEND");
+        if (env && strcmp(env, "cpu") == 0) {
+            want = AMIKI_BACKEND_CPU;
+        } else if (env && strcmp(env, "gpu") == 0) {
+            want = AMIKI_BACKEND_GPU;
+        }
+    }
     amiki_context *ctx = NULL;
-    CHECK(amiki_context_create(AMIKI_BACKEND_AUTO, &ctx));
+    CHECK(amiki_context_create(want, &ctx));
     const char *adapter = amiki_context_adapter_name(ctx);
     printf("后端：%s（%s）\n",
            amiki_context_backend(ctx) == AMIKI_BACKEND_GPU ? "GPU" : "CPU",

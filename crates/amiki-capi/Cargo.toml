@@ -12,13 +12,24 @@ publish = false
 name = "amiki2d"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
+[features]
+default = ["gpu"]
+
+# GPU 路径。**WASM 构建请关掉它**：
+#
+#     cargo build -p amiki-capi --target wasm32-unknown-unknown --release --no-default-features
+#
+# 实测差别很大：带 wgpu 的 wasm 模块 **23 MB**，纯 CPU 只有它的零头。
+# 关掉之后 `AMIKI_BACKEND_AUTO` 会落到 CPU，`AMIKI_BACKEND_GPU` 返回
+# `AMIKI_ERROR_BACKEND_UNAVAILABLE` —— 都是**显式行为**，不是静默降级。
+gpu = ["dep:amiki-gpu", "dep:pollster", "amiki/gpu"]
+
 [dependencies]
-amiki = { path = "../amiki" }
+amiki = { path = "../amiki", default-features = false }
+amiki-gpu = { workspace = true, optional = true }
+pollster = { workspace = true, optional = true }
 amiki-math = { workspace = true }
 amiki-scene = { workspace = true }
 amiki-text = { path = "../amiki-text" }
-amiki-gpu = { workspace = true }
 amiki-raster = { workspace = true }
 amiki-layout = { path = "../amiki-layout" }
-bytemuck = { workspace = true }
-pollster = { workspace = true }

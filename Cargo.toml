@@ -12,7 +12,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.4.0-alpha"
+version = "0.5.0-alpha"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 
@@ -31,3 +31,24 @@ amiki-gpu = { path = "crates/amiki-gpu" }
 [profile.release]
 debug = true
 lto = "thin"
+
+# WASM 专用 profile：**不嵌调试信息**。
+#
+# `[profile.release]` 的 `debug = true` 是为原生 profiling 加的，但在 wasm
+# 里它是纯浪费 —— 实测同一个模块：
+#
+#     带调试信息   11.7 MB
+#     不带调试信息  **945.9 KB**     ← 差 12 倍
+#
+# 体积是 WASM 的第一约束（浏览器要下载它），所以单独给一个 profile：
+#
+#     cargo build --profile wasm-release --target wasm32-unknown-unknown --no-default-features
+#
+# `opt-level = "z"` 偏尺寸、`lto = "fat"` 跨 crate 内联后能删掉更多死代码、
+# `panic = "abort"` 去掉展开表 —— 三条都是标准的 wasm 瘦身手段。
+[profile.wasm-release]
+inherits = "release"
+debug = false
+opt-level = "z"
+lto = "fat"
+panic = "abort"

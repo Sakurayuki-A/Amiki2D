@@ -5,6 +5,90 @@
 
 ---
 
+## [0.5.0-alpha] —— WASM
+
+**第五个 Alpha：引擎能在浏览器与任何 JS 运行时里跑。**
+
+C ABI 解决了"别的语言能不能用"，WASM 解决"Web 上能不能用" —— Web 是
+2D 渲染器最大的分发渠道。
+
+> **边界说明（诚实清单）**
+> - **WebGPU 构建未验证**：本机 Node 24 的 `navigator.gpu` 是 `undefined`，
+>   也没有可用的浏览器环境。所以这条**不写成"已支持"**
+> - 跨厂商硬件仍未验证（A1，已知限制）
+> - 现有 `examples/node/` 用的是 **koffi FFI 而不是 WASM** —— 两者是不同的东西
+
+### 模块体积：11.7 MB → **950.7 KB**
+
+实测最大的影响因素是仓库根 `[profile.release] debug = true` —— 那是为**原生
+profiling** 加的，在 wasm 里是纯浪费（浏览器不需要 DWARF）。同一个模块：
+
+| 构建 | 体积 |
+|---|---|
+| `--profile release` | 11.7 MB |
+| `--profile wasm-release`（`debug = false`） | **950.7 KB** |
+
+另立 `[profile.wasm-release]` 固化这一点。该 profile 里另外三个开关
+（`opt-level = "z"` / `lto = "fat"` / `panic = "abort"`）**实测只再省约 5 KB**，
+在噪声范围内 —— 保留是因为语义正确，不声称有效。
+
+### GPU 路径变成可选 feature
+
+新增 `gpu` feature（**默认开**，native 行为完全不变）。关掉之后：
+
+- `amiki-capi` / `amiki` 都可以纯 CPU 构建（`--no-default-features`）
+- wgpu 不被编进去 —— 这正是 23 MB → 950 KB 的另一半原因
+- 行为是**显式的**：`AMIKI_BACKEND_GPU` 返回 `AMIKI_ERROR_BACKEND_UNAVAILABLE`，
+  `AMIKI_BACKEND_AUTO` 落到 CPU。**不静默降级**
+
+顺带把 `amiki` 的两个示例与 `stroke_api` 测试声明为 `required-features = ["gpu"]`。
+
+### C ABI 新增 `amiki_alloc` / `amiki_free`
+
+WASM 上调用方（JS）没法自己分配引擎线性内存，只能通过导出的分配器 ——
+没有它就无法把像素、字体字节、渐变色标传进来。原生下也有用（同一个分配器
+分配与释放，避免跨 CRT 释放的未定义行为）。
+
+### JS 加载器：不依赖 wasm-bindgen
+
+`crates/amiki-capi/examples/wasm/amiki.js` 用**原生 WebAssembly API** 直接调
+C ABI。理由：wasm-bindgen 会在 Rust 与 JS 之间再插一层自己的 ABI，而
+C ABI 已经是一份设计好、测试过、三种语言验证过的边界。
+
+**这一版最实际的技术点**：WebAssembly 没有"结构体按值"的概念，所以 C ABI 会被
+**降级**成：
+
+1. **结构体返回 → sret**（隐藏的第一个参数是返回空间指针）
+2. **结构体参数 → 一律按指针传**
+
+实测 `amiki_canvas_stroke_path(i32, i32, i32, i32) -> i32` = canvas, path,
+`style*`, `paint*`。加载器把这两条规则集中在两个辅助里。
+新增 `tools/wasm_sig.py` 可随时打出真实签名 —— 核对比猜快。
+
+### 强验证：原生 CPU 与 WASM 输出**字节完全相同**
+
+```
+原生 CPU:  C1DDAF7DF7DBBCB0A5355B5A00A3EEB56C125E2F…
+WASM:      C1DDAF7DF7DBBCB0A5355B5A00A3EEB56C125E2F…
+```
+
+同一个场景、**不同目标架构**（wasm32 vs x86_64）、**不同的 ABI 降级方式** ——
+输出字节完全相同。这同时证明了 WASM 构建正确、加载器对降级的处理正确、
+渲染器跨目标确定。
+
+`examples/wasm/build.cmd` 会自动跑这个对比。
+
+（对比基准是**原生 CPU** 而不是原生默认的 GPU —— WASM 是纯 CPU 构建，
+与 GPU 产物本来就该不同。`examples/c/minimal.c` 为此支持了 `AMIKI_BACKEND` 环境变量。）
+
+### 测试
+
+- 默认 feature（含 GPU）：**180 测试 / 0 失败**
+- 纯 CPU（`--no-default-features`）：**31 测试 / 0 失败**
+- clippy 与 cargo doc 零警告
+
+---
+
 ## [0.4.0-alpha] —— C ABI
 
 **第四个 Alpha：让 Amiki2D 能被 Rust 之外的任何语言调用。**

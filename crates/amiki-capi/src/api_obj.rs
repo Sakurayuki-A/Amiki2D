@@ -12,6 +12,58 @@ use std::ffi::{CStr, CString};
 use std::sync::Arc;
 
 // ============================================================================
+// 后端选择（`gpu` feature 分派）
+// ============================================================================
+
+/// 把 C 侧的 `amiki_backend` 解析成一个真正可用的后端。
+///
+/// # `gpu` feature 关掉时（WASM 构建）
+///
+/// `AMIKI_BACKEND_GPU` **显式失败**（`AMIKI_ERROR_BACKEND_UNAVAILABLE`），
+/// 而不是静默给一个 CPU 后端 —— 调用方明确点名要 GPU，就得让它知道拿不到。
+/// `AUTO` 则正常落到 CPU（那正是 `AUTO` 的语义）。
+#[allow(clippy::type_complexity)]
+fn make_backend(backend: i32) -> Result<(Backend, CString), i32> {
+    match backend {
+        AMIKI_BACKEND_CPU => Ok((Backend::Cpu, c"CPU".to_owned())),
+
+        #[cfg(feature = "gpu")]
+        AMIKI_BACKEND_GPU => match pollster::block_on(amiki_gpu::GpuRenderer::new()) {
+            // 先取名字再 move —— `Box::new(r)` 会把 `r` 拿走，
+            // 同一个表达式里再用 `&r.adapter_name` 是借用已移动的值。
+            Ok(r) => {
+                let name = adapter_cstring(&r.adapter_name);
+                Ok((Backend::Gpu(Box::new(r)), name))
+            }
+            Err(_) => Err(AMIKI_ERROR_BACKEND_UNAVAILABLE),
+        },
+        #[cfg(not(feature = "gpu"))]
+        AMIKI_BACKEND_GPU => Err(AMIKI_ERROR_BACKEND_UNAVAILABLE),
+
+        #[cfg(feature = "gpu")]
+        AMIKI_BACKEND_AUTO => match pollster::block_on(amiki_gpu::GpuRenderer::new()) {
+            Ok(r) => {
+                let name = adapter_cstring(&r.adapter_name);
+                Ok((Backend::Gpu(Box::new(r)), name))
+            }
+            // 拿不到 GPU 就落 CPU —— 这是 AUTO 的承诺
+            Err(_) => Ok((Backend::Cpu, c"CPU".to_owned())),
+        },
+        #[cfg(not(feature = "gpu"))]
+        AMIKI_BACKEND_AUTO => Ok((Backend::Cpu, c"CPU".to_owned())),
+
+        _ => Err(AMIKI_ERROR_INVALID_ARGUMENT),
+    }
+}
+
+/// `CString::new` 只在适配器名里有内嵌 NUL 时失败 —— 那种名字不可信，
+/// 退回 `"GPU"` 而不是让整个创建失败。
+#[cfg(feature = "gpu")]
+fn adapter_cstring(name: &str) -> CString {
+    CString::new(name).unwrap_or_else(|_| c"GPU".to_owned())
+}
+
+// ============================================================================
 // 上下文
 // ============================================================================
 
@@ -25,25 +77,9 @@ pub extern "C" fn amiki_context_create(backend: i32, out: *mut *mut AmikiContext
         if out.is_null() {
             return AMIKI_ERROR_INVALID_ARGUMENT;
         }
-        let (b, name) = match backend {
-            AMIKI_BACKEND_CPU => (Backend::Cpu, c"CPU".to_owned()),
-            AMIKI_BACKEND_GPU | AMIKI_BACKEND_AUTO => {
-                match pollster::block_on(amiki_gpu::GpuRenderer::new()) {
-                    Ok(r) => {
-                        // `CString::new` 只在适配器名里有内嵌 NUL 时失败，
-                        // 那种名字不可信，退回 "GPU" 而不是让创建失败。
-                        let n = CString::new(r.adapter_name.clone())
-                            .unwrap_or_else(|_| c"GPU".to_owned());
-                        (Backend::Gpu(Box::new(r)), n)
-                    }
-                    // 显式要 GPU 却拿不到 → 明确失败，不偷偷降级
-                    Err(_) if backend == AMIKI_BACKEND_GPU => {
-                        return AMIKI_ERROR_BACKEND_UNAVAILABLE;
-                    }
-                    Err(_) => (Backend::Cpu, c"CPU".to_owned()),
-                }
-            }
-            _ => return AMIKI_ERROR_INVALID_ARGUMENT,
+        let (b, name) = match make_backend(backend) {
+            Ok(v) => v,
+            Err(r) => return r,
         };
         let ctx = Box::new(AmikiContext { backend: b, adapter_name: name, poison: Poison::default() });
         // SAFETY: `out` 已判空且调用方保证可写
@@ -72,6 +108,7 @@ pub extern "C" fn amiki_context_backend(ctx: *const AmikiContext) -> i32 {
     }
     // SAFETY: 已判空
     match unsafe { &*ctx }.backend {
+        #[cfg(feature = "gpu")]
         Backend::Gpu(_) => AMIKI_BACKEND_GPU,
         Backend::Cpu => AMIKI_BACKEND_CPU,
     }
@@ -611,12 +648,11 @@ pub extern "C" fn amiki_canvas_render_rgba8(
         if let Err(r) = ctx.poison.check() {
             return r;
         }
-        let rendered = match &ctx.backend {
-            Backend::Gpu(r) => r.render_blocking(scene, eps),
-            Backend::Cpu => {
-                let binned = amiki_raster::bin(scene, eps);
-                Ok(amiki_raster::render(&binned))
-            }
+        let rendered: Result<Vec<u8>, String> = match &ctx.backend {
+            #[cfg(feature = "gpu")]
+            Backend::Gpu(r) => r.render_blocking(scene, eps).map_err(|e| e.to_string()),
+            // CPU 路径与 GPU 无关 —— 这也是 WASM 构建下唯一的路径
+            Backend::Cpu => Ok(amiki_raster::render(&amiki_raster::bin(scene, eps))),
         };
         match rendered {
             Ok(px) if px.len() >= need => {
@@ -627,8 +663,7 @@ pub extern "C" fn amiki_canvas_render_rgba8(
             Ok(_) => AMIKI_ERROR_UNKNOWN,
             // GPU 后端的"不支持"要单独报出来（例如 GL 遇到位图），
             // 让调用方能区分"引擎坏了"与"这个后端做不了"。
-            Err(e) => {
-                let msg = e.to_string();
+            Err(msg) => {
                 if msg.contains("不支持") || msg.contains("无法") {
                     AMIKI_ERROR_NOT_SUPPORTED
                 } else {

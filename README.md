@@ -1,8 +1,9 @@
 # Amiki2D
 
-**版本 `0.4.0-alpha`** —— 第四个 Alpha：**新增 C ABI**，让引擎能被 Rust 之外的
-语言调用（C / C# / Node 三个示例的输出**逐像素一致**）。
-`0.3.0-alpha` 的发布判据 6 条**全部满足**。
+**版本 `0.5.0-alpha`** —— 第五个 Alpha：**新增 WASM**。
+C ABI（0.4.0）让引擎能被 Rust 之外的语言调用（C / C# / Node 三个示例输出**逐字节一致**）；
+WASM（0.5.0）让它在**浏览器与任何 JS 运行时**里跑（模块 **950.7 KB**，
+与原生 CPU 后端输出**逐字节一致**）。`0.3.0-alpha` 的发布判据 6 条**全部满足**。
 核心渲染管线（M1–M3）、工程硬化（M3.5）、增量渲染（M4）、文本（M5）、
 渐变/位图/滤镜（M6），加上 P0 能力门槛（描边、含层增量、帧路径层合成）、
 P1-1 性能（提取 **2.03 → 0.59 ms**）与 P3 工程成熟度六项。
@@ -103,6 +104,7 @@ cargo bench -p amiki-gpu                              # 基准（含显存与逐
 - [**现状总览**](docs/OVERVIEW.md) —— 一页看清"这是什么、现在到哪了、接下来做什么"
 - [发布报告 0.3.0-alpha](docs/RELEASE_0.3.0-alpha.md) —— 门禁状态、能力清单、性能数据、已知问题
 - [**C ABI**](crates/amiki-capi/README.md) —— 手写 header 契约 + 三个绑定示例（C / C# / Node）
+- [**WASM 示例**](crates/amiki-capi/examples/wasm/README.md) —— 原生 WebAssembly API，不依赖 wasm-bindgen
 - [**已知问题登记表**](docs/KNOWN_ISSUES.md) —— 未验证项 / 已知限制 / 明确不做 / 技术债（**有稳定编号**）
 - [发布计划](docs/RELEASE_PLAN.md) —— 各项验收标准与**已知未验证项**
 - [多后端验证清单](docs/VERIFY.md) —— 换机器时照着跑

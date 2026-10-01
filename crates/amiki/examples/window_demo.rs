@@ -21,6 +21,12 @@ struct FrameState {
     surface: wgpu::Surface<'static>,
     surface_cfg: wgpu::SurfaceConfiguration,
     renderer: GpuRenderer,
+    /// **跨帧复用的 `Frame`** —— 内部约 7 MB 缓冲不再每帧新建。
+    ///
+    /// 这是逐帧渲染的**正确用法**：`prepare()` 每次都会重新分配，
+    /// 而大于 128 KB 的分配走 `mmap` + 缺页，实测同一批数据慢 **5.3 倍**
+    /// （见 `GpuScene::reset_for_reuse` 的实测表）。
+    frame: amiki::gpu::Frame,
     blitter: Option<Blitter>,
     scene_tex: Option<(wgpu::Texture, wgpu::TextureView)>,
     scene_size: (u32, u32),
@@ -134,6 +140,7 @@ impl FrameState {
             surface,
             surface_cfg,
             renderer,
+            frame: amiki::gpu::Frame::default(),
             blitter: None,
             scene_tex: None,
             scene_size: (0, 0),
@@ -403,11 +410,14 @@ impl FrameState {
         };
         self.last_dirty_ratio = damage.tile_count() as f64 / damage.total_tiles().max(1) as f64;
 
-        let frame = self.renderer.prepare(&scene, 0.1).expect("prepare 失败");
+        // 复用 `self.frame`：缓冲跨帧保留容量，避免每帧 mmap + 缺页
+        self.renderer
+            .prepare_into(&scene, 0.1, &mut self.frame)
+            .expect("prepare 失败");
         let scene_tex = self.scene_tex.as_ref().expect("场景纹理未初始化");
         let skipped = self
             .renderer
-            .render_into_persistent(&scene_tex.0, &frame, Some(&damage))
+            .render_into_persistent(&scene_tex.0, &self.frame, Some(&damage))
             .expect("GPU 渲染失败");
         if skipped {
             // 无脏区：连一帧 GPU 工作都不做（静态界面即此情形）

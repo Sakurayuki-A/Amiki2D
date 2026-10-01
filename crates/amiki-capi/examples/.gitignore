@@ -10,6 +10,9 @@ amiki2d.lib
 *.bmp
 *.png
 
+# WASM 构建产物（951 KB，且代码一改就过时）—— build.cmd 会重新生成
+*.wasm
+
 # Node
 node_modules/
 package-lock.json

@@ -104,6 +104,7 @@ cargo bench -p amiki-gpu                              # 基准（含显存与逐
 | [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | 分层与边界 |
 | [`docs/RENDERING_STRATEGY.md`](docs/RENDERING_STRATEGY.md) | 算法推导与实测数据 |
 | [`docs/RELEASE_PLAN.md`](docs/RELEASE_PLAN.md) | 发布计划、验收标准与当前状态 |
+| [`docs/VERIFY.md`](docs/VERIFY.md) | 多适配器验证清单（换机器时照着跑） |
 | [`CHANGELOG.md`](CHANGELOG.md) | 逐项变更与踩过的坑 |
 
 ## 已验证的后端与已知限制

@@ -6,11 +6,15 @@
 在三种完全不同的运行时里**都被正确地封送了**。
 
 ```
-$ python cmp.py
-C     vs C#    最大通道差 =   0  不同像素 = 0
-C     vs Node  最大通道差 =   0  不同像素 = 0
-C#    vs Node  最大通道差 =   0  不同像素 = 0
+$ crates\amiki-capi\verify.cmd
+
+[5] the three examples produce byte-identical images
+    OK  all three identical -- SHA256 92B430853D1C675C24189F18D56DF941...
+ALL CHECKS PASSED
 ```
+
+三者不只是"逐像素一致"，而是**字节完全相同** —— 所以那条检查只要比 SHA256
+就够了，不需要逐像素遍历。
 
 | 示例 | 语言 | 构建 | 绑定方式 |
 |---|---|---|---|

@@ -66,6 +66,12 @@ static int write_bmp(const char *path, const uint8_t *rgba, uint32_t w, uint32_t
     const uint16_t planes = 1, bpp = 24;
     memcpy(&hdr[26], &planes, 2);
     memcpy(&hdr[28], &bpp, 2);
+    /* 分辨率写 2835（=72 DPI），与 C# / Node 两个示例一致。
+     * 不写就是 0 —— 多数解码器不在意，但会让三份产物**字节不同**，
+     * 而"三者字节相同"正是验证脚本最容易检查的一条。 */
+    const uint32_t ppm = 2835;
+    memcpy(&hdr[38], &ppm, 4);
+    memcpy(&hdr[42], &ppm, 4);
     memcpy(&hdr[34], &data_size, 4);
     fwrite(hdr, 1, sizeof(hdr), f);
 

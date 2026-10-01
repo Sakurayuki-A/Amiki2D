@@ -135,9 +135,31 @@ cargo test -p amiki-capi
 
 ---
 
-## 符号完整性
+## 一条命令验证全部
 
-导出的符号数与 header 的声明数**必须一致**。检查方法：
+```
+crates\amiki-capi\verify.cmd
+```
+
+它跑 **5 项检查**，每一项都对应一种"ABI 坏了"的具体表现：
+
+| # | 检查 | 能抓到什么 |
+|---|---|---|
+| 1 | `cargo build -p amiki-capi --release` | 构建失败 |
+| 2 | `amiki.h` 按 **C 与 C++** 各 `cl /W4 /WX` 编译 | 声明写错、类型缺失、`extern "C"` 保护失效 |
+| 3 | header 里声明的每个函数**都真的被导出** | 漏了 `#[no_mangle]`、符号名对不上 |
+| 4 | 三个绑定示例构建并运行 | 示例坏了、库链接不上 |
+| 5 | 三个示例产出的图片**字节完全相同** | **结构体布局、调用约定、字符串编码、所有权**任何一处封送出错 |
+
+**第 5 项是最强的一条** —— 三种完全不同的运行时做同样的绘制，
+只要有一处封送错了，输出就不可能字节相同。
+
+> **这个脚本验证过有牙**：把 C 示例背景色的一个通道从 24 改成 25，
+> 第 5 项立刻失败并返回退出码 1（C 的哈希变了，C# / Node 没变）。
+
+它检查的符号数当前是 **header 声明 68 / 导出 68，无缺失**。
+
+手工核对（不用脚本时）：
 
 ```bash
 # Windows
@@ -145,8 +167,6 @@ dumpbin /exports target/release/amiki2d.dll | findstr amiki_
 # Linux / macOS
 nm -D --defined-only target/release/libamiki2d.so | grep amiki_
 ```
-
-当前：**header 声明 68 个，导出 68 个，无缺失**。
 
 ---
 

@@ -7,7 +7,7 @@
 **核对方式**：扫过全部 `return err(...)` / "不支持" / "未实现" 点，
 以及能力关键词（`even_odd` / `bidi` / `HDR` / `WASM` / `mipmap`）在源码中的出现次数。
 
-图例：**A** 未验证（2）· **B** 已知限制（12）· **C** 明确不做（5）· **D** 技术债（4）
+图例：**A** 未验证（2）· **B** 已知限制（13）· **C** 明确不做（5）· **D** 技术债（4）
 
 ---
 
@@ -155,6 +155,27 @@ DXC 而挂住，已放弃）。**不是引擎代码慢**；Vulkan 后端冷启�
 
 GPU 后端的层内容渲染到 `Rgba8Unorm`，>1.0 在模糊之前就被裁到 1.0。
 同一 HDR 场景下 GPU 与 CPU 的最大通道差为 **52**，位置正是高光源中心。
+
+### B13 色调映射还没接进主机侧渲染路径与 C ABI
+
+`ToneMap`（Raw / Reinhard / ACES）与 `rgba8_from_f32_with` **已经实现并有测试**，
+但只能这样用：
+
+```rust
+let px = renderer.readback_f32(&tex)?;
+let out = rgba8_from_f32_with(&px, ToneMap::Aces);
+```
+
+**`render_blocking` 与 C ABI 固定用 `Raw`**（只裁剪）—— 也就是说，
+走那两个入口的用户**拿不到色调映射**，HDR 高光源会被直接截成白色。
+
+这是**待办，不是设计**：接进去需要给 `Scene`/`Canvas` 或渲染调用加一个参数，
+并同步 C ABI 的 header（多一个 `amiki_tone_map` 枚举与一个设置函数）。
+
+**当前影响有限**：`ToneMap::Raw` 是与 Skia / Cairo / canvas 一致的默认行为，
+所以"没接进去"等价于"行为与 0.5.0 之前相同"。
+
+---
 
 ## C. 明确不做（已决定的边界，避免范围蔓延）
 

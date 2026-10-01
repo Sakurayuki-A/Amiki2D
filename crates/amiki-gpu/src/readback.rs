@@ -252,6 +252,117 @@ pub fn f32_to_f16(v: f32) -> u16 {
     sign | (e16 << 10) | (m16 & 0x03FF)
 }
 
+// ============================================================================
+// 色调映射与输出编码
+// ============================================================================
+
+/// 把 HDR 值压到显示范围的映射方式。
+///
+/// # 为什么需要它
+///
+/// 引擎的层与滤镜路径是 HDR 的：>1.0 的值穿过层边界存活，模糊也在未裁剪的
+/// 数据上做。但**显示设备只有 `[0,1]`** —— 必须有一个明确的、可选的步骤把
+/// 它压下来。不写这一步，>1.0 就只是被 `clamp` 掉，高光源会糊成一片白。
+///
+/// # 取值
+///
+/// - [`ToneMap::Raw`]：只裁剪（`clamp`）。**默认**，与 0.5.0 之前的行为一致，
+///   也是与其它 2D 库（Skia / Cairo / canvas）一致的做法。
+/// - [`ToneMap::Reinhard`]：`x / (1 + x)`。便宜、单调、保序，
+///   高光源会保留可分辨的层次。
+/// - [`ToneMap::Aces`]：Narkowicz 的 ACES 近似。对比度与饱和度的观感最好，
+///   是电影/游戏里的常用选择。
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum ToneMap {
+    /// 只做裁剪（`[0,1]` 之外直接截断）。默认。
+    #[default]
+    Raw,
+    /// Reinhard：`x / (1 + x)`。
+    Reinhard,
+    /// ACES 近似（Narkowicz 2015）。
+    Aces,
+}
+
+impl ToneMap {
+    /// 作用在**单个通道**上。
+    ///
+    /// 注意：色调映射是**非线性**的，严格来说应在亮度上做、再按比例还原颜色，
+    /// 否则会偏色。但逐通道是三家的通行简化（包括 Narkowicz 的原文），
+    /// 而本项目对"与其它 2D 库一致"的重视高于色彩科学上的严格 ——
+    /// 需要严格做法时应当是一个独立的、明确的选择。
+    #[inline]
+    pub fn apply(self, x: f32) -> f32 {
+        match self {
+            ToneMap::Raw => x,
+            ToneMap::Reinhard => x / (1.0 + x),
+            ToneMap::Aces => {
+                // Narkowicz 2015 的拟合：a=2.51 b=0.03 c=2.43 d=0.59 e=0.14
+                const A: f32 = 2.51;
+                const B: f32 = 0.03;
+                const C: f32 = 2.43;
+                const D: f32 = 0.59;
+                const E: f32 = 0.14;
+                ((x * (A * x + B)) / (x * (C * x + D) + E)).clamp(0.0, 1.0)
+            }
+        }
+    }
+
+    /// 是否需要在映射后再做一次 sRGB 编码。
+    ///
+    /// 引擎的颜色值是 **sRGB 编码**的（见 `docs/COLOR.md`），不是线性的。
+    /// 所以 `Raw` 下**不需要**编码 —— 值本来就是显示空间。
+    /// 但 `Reinhard` / `ACES` 是**在线性光上定义**的数学，直接作用在 sRGB 编码
+    /// 的值上会偏亮；规范做法是"解码到线性 → 映射 → 再编码回 sRGB"。
+    pub fn is_linear_operator(self) -> bool {
+        !matches!(self, ToneMap::Raw)
+    }
+}
+
+/// sRGB 编码的值 → 线性光。
+#[inline]
+pub fn srgb_to_linear(x: f32) -> f32 {
+    if x <= 0.04045 {
+        x / 12.92
+    } else {
+        ((x + 0.055) / 1.055).powf(2.4)
+    }
+}
+
+/// 线性光 → sRGB 编码。
+#[inline]
+pub fn linear_to_srgb(x: f32) -> f32 {
+    if x <= 0.003_130_8 {
+        x * 12.92
+    } else {
+        1.055 * x.powf(1.0 / 2.4) - 0.055
+    }
+}
+
+/// 按指定的色调映射把 f32 直线 RGBA 降到 8 位。
+///
+/// 这是 **HDR 降到显示范围的唯一位置**。顺序很重要：
+/// 1. 若映射是线性算符（Reinhard / ACES），先把 sRGB 编码的值解码到线性；
+/// 2. 施加映射；
+/// 3. 再编码回 sRGB（显示空间）；
+/// 4. 量化到 8 位。
+///
+/// alpha **不参与映射** —— 它是覆盖率，不是光。
+pub fn rgba8_from_f32_with(px: &[[f32; 4]], tone: ToneMap) -> Vec<u8> {
+    let linear = tone.is_linear_operator();
+    let mut out = Vec::with_capacity(px.len() * 4);
+    for p in px {
+        // 前三个通道参与映射；alpha 不参与（它是覆盖率，不是光）
+        for &c in &p[..3] {
+            let v = if linear { srgb_to_linear(c.max(0.0)) } else { c };
+            let mapped = tone.apply(v);
+            let enc = if linear { linear_to_srgb(mapped) } else { mapped };
+            out.push((enc * 255.0 + 0.5).clamp(0.0, 255.0) as u8);
+        }
+        out.push((p[3] * 255.0 + 0.5).clamp(0.0, 255.0) as u8);
+    }
+    out
+}
+
 /// f32 直线 RGBA → 8 位直线 RGBA。
 ///
 /// **这里是 HDR 降到显示范围的地方**，也是唯一该做 `clamp` 的地方。
@@ -260,13 +371,7 @@ pub fn f32_to_f16(v: f32) -> u16 {
 /// 与 [`f16_to_f32`] 同样是"输出换 `Rgba16Float`"的准备工作，当前无调用方。
 #[allow(dead_code)]
 pub fn rgba8_from_f32(px: &[[f32; 4]]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(px.len() * 4);
-    for p in px {
-        for c in p {
-            out.push((c * 255.0 + 0.5).clamp(0.0, 255.0) as u8);
-        }
-    }
-    out
+    rgba8_from_f32_with(px, ToneMap::Raw)
 }
 
 #[cfg(test)]
@@ -346,5 +451,89 @@ mod tests {
         assert!(super::f16_to_f32(super::f32_to_f16(f32::NAN)).is_nan());
         // 4.0 是 HDR 场景里的典型值
         assert_eq!(super::f32_to_f16(4.0), 0x4400);
+    }
+    #[test]
+    fn tone_maps_are_monotone_and_land_in_range() {
+        use super::ToneMap;
+        for tm in [ToneMap::Raw, ToneMap::Reinhard, ToneMap::Aces] {
+            let mut prev = f32::NEG_INFINITY;
+            for i in 0..=200 {
+                let x = i as f32 * 0.1; // 0 .. 20，覆盖 HDR 高光源
+                let y = tm.apply(x);
+                assert!(y.is_finite(), "{tm:?} 在 {x} 处给出非有限值");
+                assert!(y >= prev - 1e-6, "{tm:?} 不单调：{x} 处 {y} < {prev}");
+                prev = y;
+            }
+            // 定义域内应当落进 [0,1]（Raw 会对 >1 越界，故单独断言）
+            if tm != ToneMap::Raw {
+                assert!(tm.apply(1000.0) <= 1.0, "{tm:?} 在大输入下越界");
+                assert!(tm.apply(1e9) <= 1.0, "{tm:?} 在极大输入下越界");
+            }
+        }
+        // 各映射的定义值
+        assert_eq!(ToneMap::Raw.apply(4.0), 4.0);
+        assert!((ToneMap::Reinhard.apply(1.0) - 0.5).abs() < 1e-6);
+        // ACES 在 1.0 处约 0.8（Narkowicz 拟合的已知值，容差放宽到 0.05）
+        assert!((ToneMap::Aces.apply(1.0) - 0.80).abs() < 0.05, "ACES(1.0) = {}", ToneMap::Aces.apply(1.0));
+    }
+
+    #[test]
+    fn srgb_encode_decode_round_trips() {
+        use super::{linear_to_srgb, srgb_to_linear};
+        for i in 0..=100 {
+            let x = i as f32 / 100.0;
+            let back = linear_to_srgb(srgb_to_linear(x));
+            assert!((back - x).abs() < 1e-4, "sRGB 往返 {x} → {back}");
+        }
+        // 端点与已知值
+        assert_eq!(srgb_to_linear(0.0), 0.0);
+        assert!((linear_to_srgb(1.0) - 1.0).abs() < 1e-5);
+        assert!((srgb_to_linear(0.5) - 0.2140).abs() < 1e-3, "sRGB(0.5) = {}", srgb_to_linear(0.5));
+    }
+
+    #[test]
+    fn tone_mapping_distinguishes_hdr_levels_instead_of_flattening_them() {
+        use super::{rgba8_from_f32_with, ToneMap};
+        // **取值本身是个坑，值得写在测试里**：
+        //
+        // 引擎的颜色值是 **sRGB 编码**的。sRGB 的 1.5 已经对应线性 2.57，
+        // sRGB 的 4.0 对应线性 **25.3** —— 那是天文数字的光量，
+        // 任何色调映射都会把它压到 255。
+        //
+        // 所以"高光源"在 sRGB 空间里是 1.2~2.0 这个量级，不是 4.0。
+        // 我第一版测试用了 4.0，三种映射里有两种给出 255，看起来像"没生效"，
+        // 其实是**输入选错了**，不是映射坏了。
+        //
+        // 这条测试要证明的是：**在真实的高光源量级上，不同的映射给出可分辨的
+        // 不同结果** —— 而不是都被压成同一个白。
+        let mut raws = Vec::new();
+        let mut reis = Vec::new();
+        let mut aces = Vec::new();
+        for &level in &[1.0f32, 1.25, 1.5, 1.75, 2.0] {
+            let px = [[level, level, level, 1.0]];
+            raws.push(rgba8_from_f32_with(&px, ToneMap::Raw)[0]);
+            reis.push(rgba8_from_f32_with(&px, ToneMap::Reinhard)[0]);
+            aces.push(rgba8_from_f32_with(&px, ToneMap::Aces)[0]);
+        }
+
+        // Raw 在 1.0 以上全部裁成 255 —— 这正是"没有色调映射"的病症
+        assert!(raws.iter().all(|&v| v == 255), "Raw 在高光源下应当全部饱和：{raws:?}");
+        // 两种映射都必须保留层次：1.0 与 2.0 的读数要能区分开
+        assert!(reis[0] < reis[4], "Reinhard 丢了层次：{reis:?}");
+        assert!(aces[0] < aces[4], "ACES 丢了层次：{aces:?}");
+        // 单调不减
+        for v in [&reis, &aces] {
+            for w in v.windows(2) {
+                assert!(w[1] >= w[0], "色调映射必须单调：{v:?}");
+            }
+        }
+        // 三者互不相同 —— 否则"加了选项"就是假的
+        assert!(raws != reis && reis != aces, "三种映射应当给出不同的结果");
+
+        // alpha 不参与映射（它是覆盖率，不是光）
+        let px = [[1.5f32, 1.5, 1.5, 0.5]];
+        for tm in [ToneMap::Raw, ToneMap::Reinhard, ToneMap::Aces] {
+            assert_eq!(rgba8_from_f32_with(&px, tm)[3], 128, "{tm:?} 改了 alpha");
+        }
     }
 }

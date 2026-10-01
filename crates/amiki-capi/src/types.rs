@@ -170,6 +170,33 @@ pub const AMIKI_PAINT_LINEAR: i32 = 1;
 pub const AMIKI_PAINT_RADIAL: i32 = 2;
 pub const AMIKI_PAINT_SWEEP: i32 = 3;
 
+// ---- 色调映射（header 的 `amiki_tone_map`）----
+pub const AMIKI_TONEMAP_RAW: i32 = 0;
+pub const AMIKI_TONEMAP_REINHARD: i32 = 1;
+pub const AMIKI_TONEMAP_ACES: i32 = 2;
+
+/// C 侧的 `amiki_tone_map` → 引擎的 [`amiki_scene::ToneMap`]。
+///
+/// 越界值返回 `None` —— 调用方据此报 `AMIKI_ERROR_INVALID_ARGUMENT`，
+/// **不静默退回默认值**（静默退回会让"设错了"看起来像"设上了"）。
+pub(crate) fn tone_map_from_raw(v: i32) -> Option<amiki_scene::ToneMap> {
+    match v {
+        AMIKI_TONEMAP_RAW => Some(amiki_scene::ToneMap::Raw),
+        AMIKI_TONEMAP_REINHARD => Some(amiki_scene::ToneMap::Reinhard),
+        AMIKI_TONEMAP_ACES => Some(amiki_scene::ToneMap::Aces),
+        _ => None,
+    }
+}
+
+/// 引擎的 [`amiki_scene::ToneMap`] → C 侧取值。
+pub(crate) fn tone_map_to_raw(t: amiki_scene::ToneMap) -> i32 {
+    match t {
+        amiki_scene::ToneMap::Raw => AMIKI_TONEMAP_RAW,
+        amiki_scene::ToneMap::Reinhard => AMIKI_TONEMAP_REINHARD,
+        amiki_scene::ToneMap::Aces => AMIKI_TONEMAP_ACES,
+    }
+}
+
 pub const AMIKI_BACKEND_AUTO: i32 = 0;
 pub const AMIKI_BACKEND_GPU: i32 = 1;
 pub const AMIKI_BACKEND_CPU: i32 = 2;

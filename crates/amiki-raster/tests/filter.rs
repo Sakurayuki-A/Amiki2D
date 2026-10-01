@@ -540,3 +540,89 @@ fn layer_blend_f32_matches_u8_where_both_are_valid() {
     );
     eprintln!("层合成 u8/f32 一致（最大差 {max_diff}，原样保留的像素 {untouched}/{})", w * h);
 }
+
+
+// ============================================================================
+// 色调映射：CPU 出口也必须能把它用上
+// ============================================================================
+
+#[test]
+fn render_with_tone_reaches_the_cpu_output() {
+    // 这条测试的存在理由：色调映射**实现**在 `amiki-scene`，但只有**接进出口**
+    // 才有意义。若 `render_with_tone` 忘了用 tone（或快路径判错），
+    // 三种映射会给出完全一样的图 —— 那正是这条要抓的。
+    use amiki_raster::{bin, render, render_with_tone};
+    use amiki_scene::ToneMap;
+
+    // 一个带模糊层的 HDR 高光源：正是发光效果需要的那种内容
+    let mut s = Scene::new(240, 180);
+    {
+        let mut pb = PathBuilder::new();
+        pb.rect(0.0, 0.0, 240.0, 180.0);
+        s.push(Affine::IDENTITY, pb.build(), Paint::Solid(Color::rgb8(20, 20, 24)));
+    }
+    s.push_layer(
+        amiki_scene::Layer {
+            bounds: LayerBounds::new(60, 20, 120, 140),
+            scene: Scene::new(240, 180),
+            filter: Filter::Blur { sigma: 8.0 },
+            opacity: 1.0,
+            blend: BlendMode::Normal,
+        },
+        |s| {
+            let mut pb = PathBuilder::new();
+            pb.rect(114.0, 60.0, 126.0, 120.0);
+            // 1.8 —— sRGB 空间里的"高光源"量级（见 docs/COLOR.md：4.0 已经是天文数字）
+            s.push(
+                Affine::IDENTITY,
+                pb.build(),
+                Paint::Solid(Color { r: 1.8, g: 1.8, b: 1.8, a: 1.0 }),
+            );
+        },
+    );
+
+    let b = bin(&s, 0.05);
+    let raw = render(&b);
+    let raw_explicit = render_with_tone(&b, ToneMap::Raw);
+    let reinhard = render_with_tone(&b, ToneMap::Reinhard);
+    let aces = render_with_tone(&b, ToneMap::Aces);
+
+    // 快路径必须与 render() 逐字节一致（否则"Raw 不多花钱"就是假的）
+    assert_eq!(raw, raw_explicit, "ToneMap::Raw 应当与 render() 完全一致");
+
+    let diff = |a: &[u8], b: &[u8]| -> (u32, usize) {
+        let mut m = 0u32;
+        let mut n = 0usize;
+        for i in 0..a.len() {
+            let d = (a[i] as i32 - b[i] as i32).unsigned_abs();
+            if d > 0 {
+                n += 1;
+            }
+            m = m.max(d);
+        }
+        (m, n)
+    };
+    let (d_rei, n_rei) = diff(&raw, &reinhard);
+    let (d_ace, n_ace) = diff(&raw, &aces);
+    let (d_ra, n_ra) = diff(&reinhard, &aces);
+
+    eprintln!("色调映射对 CPU 输出的影响：Reinhard 最大差 {d_rei}/255（{n_rei} 像素），ACES {d_ace}（{n_ace}），两者互差 {d_ra}（{n_ra}）");
+
+    assert!(
+        d_rei > 0 && d_ace > 0,
+        "色调映射没有影响 CPU 输出（Reinhard 差 {d_rei}，ACES 差 {d_ace}）——\n\
+         说明 render_with_tone 没有真的用上 tone。"
+    );
+    assert!(
+        d_ra > 0,
+        "Reinhard 与 ACES 给出完全相同的输出 —— 那等于只有一个映射"
+    );
+    // alpha 不该被色调映射改动（它是覆盖率，不是光）
+    let mut alpha_diff = 0u32;
+    for i in 0..(240 * 180) {
+        alpha_diff = alpha_diff.max(
+            (raw[i * 4 + 3] as i32 - aces[i * 4 + 3] as i32).unsigned_abs(),
+        );
+    }
+    assert_eq!(alpha_diff, 0, "色调映射改了 alpha");
+}

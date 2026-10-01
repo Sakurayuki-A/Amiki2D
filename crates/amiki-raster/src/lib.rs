@@ -33,7 +33,7 @@
 #![forbid(unsafe_code)]
 
 use amiki_math::{CubicBez, QuadBez};
-use amiki_scene::{PathEl, Paint, Scene};
+use amiki_scene::{rgba8_from_f32_with, PathEl, Paint, Scene, ToneMap};
 
 mod persist;
 pub use persist::{FrameStats, PersistentRenderer};
@@ -1134,6 +1134,74 @@ fn render_tiles_flat(
 ///
 /// M6：图元画完后按顺序合成离屏层（滤镜）。层在**所有图元之后**合成，
 /// 保证"层内先画完、再整层滤波"的语义。
+/// 与 [`render`] 同结果，但**保持 f32 且不裁剪**（含层，层合成也在 f32 里做）。
+///
+/// # 为什么需要它
+///
+/// [`render`] 的输出是 8 位 —— 那对"最终显示"是对的，但 HDR 值在降到 8 位
+/// **之前**必须先经过色调映射。要在映射前拿到未裁剪的数据，就需要这条路径。
+///
+/// 它比 [`render`] 贵：整幅画布用 `[f32; 4]`（每像素 16 字节，是 u8 的 4 倍）。
+/// 所以只有**真的要用非 Raw 色调映射**时才走这里（见 [`render_with_tone`]）。
+pub fn render_f32(binned: &BinnedScene) -> Vec<[f32; 4]> {
+    let w = binned.width as usize;
+    let h = binned.height as usize;
+    let mut img = vec![[0.0f32; 4]; w * h];
+    for ty in 0..binned.tiles_y as usize {
+        for tx in 0..binned.tiles_x as usize {
+            shade_tile_f32(binned, &mut img, w, h, tx, ty);
+        }
+    }
+    // 层在 f32 上合成：>1.0 的高光源能穿过层边界存活
+    for layer in &binned.scene_layers {
+        composite_layer_f32(&mut img, &binned.source_scene, layer, binned.eps);
+    }
+    img
+}
+
+/// 与 [`render`] 同样的出口（8 位直线 RGBA），但按 `tone` 把 HDR 压到显示范围。
+///
+/// `ToneMap::Raw`（默认）走**快路径**，直接调用 [`render`] —— 不分配那块 f32
+/// 缓冲。也就是说"不用色调映射"的调用方一分钱都不多花。
+///
+/// 完整说明见 `docs/COLOR.md`。
+pub fn render_with_tone(binned: &BinnedScene, tone: ToneMap) -> Vec<u8> {
+    if tone == ToneMap::Raw {
+        return render(binned);
+    }
+    rgba8_from_f32_with(&render_f32(binned), tone)
+}
+
+/// [`composite_layer`] 的 f32 版本：全量、未裁剪。
+fn composite_layer_f32(
+    root: &mut [[f32; 4]],
+    scene: &amiki_scene::Scene,
+    layer: &amiki_scene::Layer,
+    eps: f32,
+) {
+    if layer.bounds.is_empty() {
+        return;
+    }
+    // 层内容走 f32（>1.0 存活），滤镜在未裁剪的数据上做，合成也不裁剪
+    let content = render_inner_f32(scene.width, scene.height, &layer.scene, eps);
+    let Some((bx, by, buf)) =
+        layer_buffer_from_content_f32(&content, scene.width, scene.height, layer)
+    else {
+        return;
+    };
+    blend_layer_rect_f32(
+        root,
+        scene.width,
+        scene.height,
+        &buf,
+        bx,
+        by,
+        layer.opacity,
+        layer.blend.id(),
+        (0, 0, scene.width, scene.height),
+    );
+}
+
 pub fn render(binned: &BinnedScene) -> Vec<u8> {
     let mut img = render_tiles(binned, None);
     for layer in &binned.scene_layers {

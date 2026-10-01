@@ -156,26 +156,29 @@ DXC 而挂住，已放弃）。**不是引擎代码慢**；Vulkan 后端冷启�
 GPU 后端的层内容渲染到 `Rgba8Unorm`，>1.0 在模糊之前就被裁到 1.0。
 同一 HDR 场景下 GPU 与 CPU 的最大通道差为 **52**，位置正是高光源中心。
 
-### B13 色调映射还没接进主机侧渲染路径与 C ABI
+### B13 色调映射还没接进主机侧渲染路径与 C ABI —— **已修复**
 
-`ToneMap`（Raw / Reinhard / ACES）与 `rgba8_from_f32_with` **已经实现并有测试**，
-但只能这样用：
+> **这一条已关闭。**
+>
+> - `amiki-raster` 新增 `render_f32` / `render_with_tone`（`Raw` 走快路径，
+>   不分配 f32 缓冲）
+> - `amiki-gpu` 新增 `render_blocking_with(scene, eps, tone)`
+> - C ABI 新增 `amiki_tone_map` 枚举 + `amiki_canvas_set_tone_map` /
+>   `amiki_canvas_tone_map`，**两条后端路径都用上它**（CPU 与 GPU）
+> - 越界枚举**显式失败且不改动已有设置** —— 静默退回默认会让"设错了"
+>   看起来像"设上了"
+>
+> **验证**：`tone_map_changes_the_output_of_an_hdr_pixel`（ABI 层）与
+> `render_with_tone_reaches_the_cpu_output`（光栅器层）都断言三种映射
+> 给出**互不相同**的输出；`verify.cmd` 的符号数从 70 变成 **72**。
+>
+> `ToneMap` 也搬到了 `amiki-scene` —— WASM 是**纯 CPU 构建**，看不到
+> `amiki-gpu`，色调映射必须住在两者都能访问的地方。
 
-```rust
-let px = renderer.readback_f32(&tex)?;
-let out = rgba8_from_f32_with(&px, ToneMap::Aces);
-```
+**以下为修复前的记录，保留以便对照：**
 
-**`render_blocking` 与 C ABI 固定用 `Raw`**（只裁剪）—— 也就是说，
-走那两个入口的用户**拿不到色调映射**，HDR 高光源会被直接截成白色。
-
-这是**待办，不是设计**：接进去需要给 `Scene`/`Canvas` 或渲染调用加一个参数，
-并同步 C ABI 的 header（多一个 `amiki_tone_map` 枚举与一个设置函数）。
-
-**当前影响有限**：`ToneMap::Raw` 是与 Skia / Cairo / canvas 一致的默认行为，
-所以"没接进去"等价于"行为与 0.5.0 之前相同"。
-
----
+`ToneMap` 只能通过 `readback_f32` + `rgba8_from_f32_with` 使用；
+`render_blocking` 与 C ABI 固定用 `Raw`。
 
 ## C. 明确不做（已决定的边界，避免范围蔓延）
 

@@ -32,7 +32,7 @@ const FINE_WGSL: &str = include_str!("fine.wgsl");
 const SPARSE_FINE_WGSL: &str = include_str!("sparse_fine.wgsl");
 
 /// M6：GPU 离屏层滤镜（可分离盒式模糊）。
-use readback::rgba8_from_f32;
+use amiki_scene::rgba8_from_f32_with;
 pub mod blit;
 pub mod blur;
 pub mod consistency;
@@ -1667,7 +1667,21 @@ impl GpuRenderer {
         self.composite_layers_gpu(&frame.scene, tex, None, frame.eps)
     }
 
+    /// 与 [`Self::render_blocking_with`] 相同，但用默认的 `ToneMap::Raw`。
     pub fn render_blocking(&self, scene: &Scene, eps: f32) -> Result<Vec<u8>, RenderError> {
+        self.render_blocking_with(scene, eps, amiki_scene::ToneMap::Raw)
+    }
+
+    /// 渲染并读回 8 位，按 `tone` 把 HDR 压到显示范围。
+    ///
+    /// `ToneMap::Raw`（默认）等价于旧行为：只裁剪。
+    /// 完整说明见 `docs/COLOR.md`。
+    pub fn render_blocking_with(
+        &self,
+        scene: &Scene,
+        eps: f32,
+        tone: amiki_scene::ToneMap,
+    ) -> Result<Vec<u8>, RenderError> {
         // 含层场景的参考实现：**层内容与模糊都在 GPU，合成在主机侧**。
         //
         // 为什么合成留在主机侧：着色与模糊（真正的大头）都在 GPU，而合成是每像素
@@ -1687,7 +1701,7 @@ impl GpuRenderer {
         // 降到 8 位是最后一步（`rgba8_from_f32`）。
         let mut root = self.readback_f32(&tex)?;
         if scene.layers.is_empty() {
-            return Ok(rgba8_from_f32(&root));
+            return Ok(rgba8_from_f32_with(&root, tone));
         }
 
         // M6：逐层渲染 → GPU 模糊 → 合成回根图像。
@@ -1757,8 +1771,8 @@ impl GpuRenderer {
                 shadow_img.as_deref(),
             );
         }
-        // 唯一的 8 位出口：HDR 在这里降到显示范围
-        Ok(rgba8_from_f32(&root))
+        // 唯一的 8 位出口：HDR 在这里降到显示范围（按调用方选的映射）
+        Ok(rgba8_from_f32_with(&root, tone))
     }
 }
 

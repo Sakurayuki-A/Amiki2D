@@ -145,6 +145,7 @@ pub extern "C" fn amiki_canvas_create(
             return AMIKI_ERROR_INVALID_ARGUMENT;
         }
         let cv = Box::new(AmikiCanvas {
+            tone_map: amiki_scene::ToneMap::Raw,
             ctx,
             width,
             height,
@@ -648,11 +649,17 @@ pub extern "C" fn amiki_canvas_render_rgba8(
         if let Err(r) = ctx.poison.check() {
             return r;
         }
+        // 色调映射作用在**出口量化**这一步，两条后端路径都要用上它
+        let tone = c.tone_map;
         let rendered: Result<Vec<u8>, String> = match &ctx.backend {
             #[cfg(feature = "gpu")]
-            Backend::Gpu(r) => r.render_blocking(scene, eps).map_err(|e| e.to_string()),
+            Backend::Gpu(r) => r
+                .render_blocking_with(scene, eps, tone)
+                .map_err(|e| e.to_string()),
             // CPU 路径与 GPU 无关 —— 这也是 WASM 构建下唯一的路径
-            Backend::Cpu => Ok(amiki_raster::render(&amiki_raster::bin(scene, eps))),
+            Backend::Cpu => {
+                Ok(amiki_raster::render_with_tone(&amiki_raster::bin(scene, eps), tone))
+            }
         };
         match rendered {
             Ok(px) if px.len() >= need => {
@@ -686,6 +693,33 @@ pub extern "C" fn amiki_canvas_set_flatten_tolerance(
         c.eps = eps;
         AMIKI_OK
     })
+}
+
+// ============================================================================
+// 色调映射
+// ============================================================================
+
+/// 设置输出量化时用的色调映射。默认 `AMIKI_TONEMAP_RAW`（只裁剪）。
+#[no_mangle]
+pub extern "C" fn amiki_canvas_set_tone_map(cv: *mut AmikiCanvas, tone: i32) -> i32 {
+    ffi!(cv, |c| {
+        // 越界值**显式失败**，不静默退回默认 ——
+        // 静默退回会让"设错了"看起来像"设上了"
+        let Some(t) = crate::types::tone_map_from_raw(tone) else {
+            return AMIKI_ERROR_INVALID_ARGUMENT;
+        };
+        c.tone_map = t;
+        AMIKI_OK
+    })
+}
+
+/// 读回当前的色调映射设置。空画布返回 `AMIKI_TONEMAP_RAW`。
+#[no_mangle]
+pub extern "C" fn amiki_canvas_tone_map(cv: *const AmikiCanvas) -> i32 {
+    if cv.is_null() {
+        return crate::types::AMIKI_TONEMAP_RAW;
+    }
+    crate::types::tone_map_to_raw(unsafe { &*cv }.tone_map)
 }
 
 // ============================================================================

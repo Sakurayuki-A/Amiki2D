@@ -370,6 +370,50 @@ typedef struct amiki_paint {
 } amiki_paint;
 
 /* ==========================================================================
+ * 色调映射
+ * ========================================================================== */
+
+/**
+ * 把 HDR 值压到显示范围的方式。
+ *
+ * ## 为什么需要它
+ *
+ * 层与滤镜路径是 **HDR** 的：`> 1.0` 的颜色穿过层边界存活，模糊也在未裁剪的
+ * 数据上做（那是发光效果的前提）。但**显示设备只有 [0,1]** —— 必须有一个
+ * 明确的步骤把它压下来。不指定就等于 `AMIKI_TONEMAP_RAW`（只裁剪），
+ * `> 1.0` 会糊成一片白。
+ *
+ * ## 取值
+ *
+ * - `RAW`（**默认**）：只裁剪。与 Skia / Cairo / canvas 一致，也是 0.5.0 之前
+ *   的行为。
+ * - `REINHARD`：`x / (1 + x)`。便宜、单调，高光源保留可分辨的层次。
+ * - `ACES`：Narkowicz 的 ACES 近似。观感最好，电影/游戏常用。
+ *
+ * ## 顺序（引擎内部做的，调用方不用管）
+ *
+ * ```
+ * sRGB 编码值 → 解码到线性 → 施加映射 → 编码回 sRGB → 量化到 8 位
+ *      RAW 跳过解码/编码（值本来就是显示空间）
+ * ```
+ *
+ * alpha **不参与映射** —— 它是覆盖率，不是光。
+ *
+ * ## 取值量级（容易搞错的地方）
+ *
+ * 引擎的颜色值是 **sRGB 编码**的。sRGB 的 `1.5` 已经对应线性 `2.57`，
+ * sRGB 的 `4.0` 对应线性 **25.3** —— 那是天文数字的光量，任何映射都会把它
+ * 压到 255。所以"高光源"在 sRGB 空间里是 **1.2 ~ 2.0** 这个量级。
+ *
+ * 完整说明见仓库的 `docs/COLOR.md`。
+ */
+typedef enum amiki_tone_map {
+    AMIKI_TONEMAP_RAW = 0,      /**< 只裁剪（默认） */
+    AMIKI_TONEMAP_REINHARD = 1, /**< x / (1 + x) */
+    AMIKI_TONEMAP_ACES = 2,     /**< ACES 近似（Narkowicz 2015） */
+} amiki_tone_map;
+
+/* ==========================================================================
  * 堆分配（WASM 必需；原生下也有用）
  * ========================================================================== */
 
@@ -389,6 +433,17 @@ typedef struct amiki_paint {
  * - 返回指针**对齐到 16 字节**；`size == 0` 或分配失败返回 NULL
  * - 必须用 `amiki_free` 释放，**且传入与分配时相同的 `size`**（重建 layout 需要）
  */
+/**
+ * 设置画布的色调映射方式。默认 `AMIKI_TONEMAP_RAW`。
+ *
+ * 只影响 `amiki_canvas_render_rgba8` 的**输出量化**，不影响绘制本身。
+ * 越界的枚举值被拒绝（返回 `AMIKI_ERROR_INVALID_ARGUMENT`），画布状态不变。
+ */
+AMIKI_API amiki_result amiki_canvas_set_tone_map(amiki_canvas* cv, amiki_tone_map tone);
+
+/** 读回当前设置。空画布返回 `AMIKI_TONEMAP_RAW`（不写 out 之外的东西）。 */
+AMIKI_API amiki_tone_map amiki_canvas_tone_map(const amiki_canvas* cv);
+
 AMIKI_API uint8_t* amiki_alloc(size_t size);
 
 /** 释放 `amiki_alloc` 的返回值。传 NULL 是空操作。 */

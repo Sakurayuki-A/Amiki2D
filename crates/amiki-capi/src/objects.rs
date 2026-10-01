@@ -98,6 +98,9 @@ pub struct AmikiCanvas {
     /// 裁剪栈深度。**由本层自己跟踪**：引擎的 `Canvas` 没暴露 `clip_stack`，
     /// 而"弹多了"必须显式报错（引擎那边是静默空操作）。
     pub(crate) clip_depth: usize,
+    /// 输出量化时用的色调映射（`amiki_canvas_set_tone_map`）。
+    /// 只影响 `render_rgba8` 的**出口**，不影响绘制本身。
+    pub(crate) tone_map: amiki_scene::ToneMap,
     pub(crate) poison: Poison,
 }
 
@@ -116,6 +119,7 @@ impl AmikiCanvas {
         self.root = amiki::Canvas::new(self.width, self.height);
         self.layers.clear();
         self.clip_depth = 0;
+        self.tone_map = amiki_scene::ToneMap::Raw;
         self.poison = Poison::default();
     }
 }

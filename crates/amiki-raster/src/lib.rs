@@ -864,6 +864,71 @@ fn layer_buffer_from_content_f32(
     Some((bx, by, buf))
 }
 
+/// 与 [`blend_layer_rect`] 同一份数学，但目标是**未裁剪的 f32**。
+///
+/// # 为什么必须存在
+///
+/// `render_blocking`（GPU 参考实现）把渲染结果读回成 f32，再在主机侧按层合成。
+/// 若用 u8 版，每一层的中间结果都会被裁到 1.0 —— HDR 高光源跨层就丢了。
+///
+/// # 为什么不是把 u8 版泛型化
+///
+/// 那样要引入像素存储的抽象 trait，改动面比"多一个函数"大；而这里真正需要
+/// 共享的**数学**（[`composite_premul`]）本来就是共享的，两个函数只是存储类型
+/// 不同。防漂移靠测试：`blend_layer_rect_f32` 与 u8 版在 `[0,1]` 范围内的结果
+/// **必须一致**（见 `raster` 的 `layer_blend_f32_matches_u8`）。
+///
+/// 唯一的语义差别：本函数**不做 clamp** —— 那是最终输出才该做的事。
+#[allow(clippy::too_many_arguments)]
+pub fn blend_layer_rect_f32(
+    root: &mut [[f32; 4]],
+    root_w: u32,
+    root_h: u32,
+    buf: &LayerBuffer,
+    x: i32,
+    y: i32,
+    opacity: f32,
+    blend: u32,
+    rect: (u32, u32, u32, u32),
+) {
+    if buf.is_empty() {
+        return;
+    }
+    let opacity = opacity.clamp(0.0, 1.0);
+    let (rx0, ry0, rx1, ry1) = rect;
+    let lx0 = (rx0 as i32 - x).max(0).min(buf.width as i32);
+    let ly0 = (ry0 as i32 - y).max(0).min(buf.height as i32);
+    let lx1 = (rx1 as i32 - x).max(0).min(buf.width as i32);
+    let ly1 = (ry1 as i32 - y).max(0).min(buf.height as i32);
+    if lx0 >= lx1 || ly0 >= ly1 {
+        return;
+    }
+    for ly in ly0..ly1 {
+        for lx in lx0..lx1 {
+            let gx = x + lx;
+            let gy = y + ly;
+            if gx < 0 || gy < 0 || gx >= root_w as i32 || gy >= root_h as i32 {
+                continue;
+            }
+            let p = buf.get(lx as u32, ly as u32);
+            let sa = p[3] * opacity;
+            if sa <= 0.0 {
+                continue;
+            }
+            let src_pm = [p[0] * sa, p[1] * sa, p[2] * sa, sa];
+            let idx = (gy as u32 * root_w + gx as u32) as usize;
+            let d = root[idx];
+            let da = d[3];
+            let dst_pm = [d[0] * da, d[1] * da, d[2] * da, da];
+            let out_pm = composite_premul(dst_pm, src_pm, blend);
+            let oa = out_pm[3];
+            let inv = if oa > 0.0 { 1.0 / oa } else { 0.0 };
+            // **不 clamp** —— >1.0 要留给后面的层与最终的色调映射
+            root[idx] = [out_pm[0] * inv, out_pm[1] * inv, out_pm[2] * inv, oa];
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn blend_layer_rect(
     root: &mut [u8],

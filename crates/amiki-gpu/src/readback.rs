@@ -134,6 +134,92 @@ impl GpuRenderer {
         self.give_readback_buffer(buf);
         Ok(out)
     }
+}
 
+/// IEEE 754 binary16 → f32。
+///
+/// # 为什么需要它
+///
+/// HDR 要求渲染输出能存住 >1.0 的值，而 8 位格式在写入时就裁到 1.0，
+/// 所以输出格式要换成 `Rgba16Float` —— 回读时硬件给的是 f16，必须自己解。
+///
+/// 不引 `half` crate：整个项目对第三方依赖很克制，而这段是标准算法、
+/// 有单元测试守着（含次正规数、±0、±∞、NaN）。
+///
+/// 这个函数**当前还没有调用方** —— 它是为"把渲染输出换成 `Rgba16Float`"
+/// 准备的。那件事牵动 GPU 的模糊上传/回读格式与主机侧合成（约 100 行），
+/// 见 `docs/KNOWN_ISSUES.md` 的 B12。
+#[allow(dead_code)]
+pub fn f16_to_f32(h: u16) -> f32 {
+    let sign = (h >> 15) & 1;
+    let exp = (h >> 10) & 0x1F;
+    let man = h & 0x3FF;
+    let v = if exp == 0 {
+        // 次正规数（含 ±0）：没有隐含的前导 1，指数固定 2^-14
+        (man as f32) * 2.0f32.powi(-24)
+    } else if exp == 0x1F {
+        if man == 0 { f32::INFINITY } else { f32::NAN }
+    } else {
+        (1.0 + (man as f32) / 1024.0) * 2.0f32.powi(exp as i32 - 15)
+    };
+    if sign == 1 { -v } else { v }
+}
 
+/// f32 直线 RGBA → 8 位直线 RGBA。
+///
+/// **这里是 HDR 降到显示范围的地方**，也是唯一该做 `clamp` 的地方。
+/// 用 `+ 0.5` 四舍五入，与 CPU 光栅器的量化方式一致。
+///
+/// 与 [`f16_to_f32`] 同样是"输出换 `Rgba16Float`"的准备工作，当前无调用方。
+#[allow(dead_code)]
+pub fn rgba8_from_f32(px: &[[f32; 4]]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(px.len() * 4);
+    for p in px {
+        for c in p {
+            out.push((c * 255.0 + 0.5).clamp(0.0, 255.0) as u8);
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::f16_to_f32;
+
+    #[test]
+    fn f16_decodes_the_textbook_values() {
+        // 这些位模式是 IEEE 754 binary16 的定义值，不是"跑出来的结果"
+        assert_eq!(f16_to_f32(0x0000), 0.0);
+        assert_eq!(f16_to_f32(0x8000), -0.0);
+        assert_eq!(f16_to_f32(0x3C00), 1.0);
+        assert_eq!(f16_to_f32(0xBC00), -1.0);
+        assert_eq!(f16_to_f32(0x4000), 2.0);
+        assert_eq!(f16_to_f32(0x3800), 0.5);
+        assert_eq!(f16_to_f32(0x7C00), f32::INFINITY);
+        assert_eq!(f16_to_f32(0xFC00), f32::NEG_INFINITY);
+        assert!(f16_to_f32(0x7E00).is_nan());
+        assert_eq!(f16_to_f32(0x7BFF), 65504.0); // 最大正规数
+        assert_eq!(f16_to_f32(0x0400), 2.0f32.powi(-14)); // 最小正规数
+        assert_eq!(f16_to_f32(0x0001), 2.0f32.powi(-24)); // 最小次正规数
+    }
+
+    #[test]
+    fn f16_covers_the_range_the_renderer_writes() {
+        // 引擎写出的颜色值落在 [0, 几十] 这个量级。f16 有 10 位尾数，
+        // 相对误差约 2^-11，对这些量级足够。
+        for &v in &[0.0f32, 0.001, 0.25, 1.0, 4.0, 16.0, 100.0] {
+            let back = f16_to_f32(f32_to_f16_bits(v));
+            let rel = if v == 0.0 { 0.0 } else { ((back - v) / v).abs() };
+            assert!(rel < 1e-3, "f16 往返 {v} → {back}，相对误差 {rel}");
+        }
+    }
+
+    /// 仅测试用：f32 → binary16 位模式（用于验证解码）。
+    fn f32_to_f16_bits(v: f32) -> u16 {
+        let bits = v.to_bits();
+        let sign = ((bits >> 16) & 0x8000) as u16;
+        let exp = ((bits >> 23) & 0xFF) as i32 - 127 + 15;
+        let man = ((bits >> 13) & 0x3FF) as u16;
+        if exp <= 0 { sign } else if exp >= 31 { sign | 0x7C00 } else { sign | ((exp as u16) << 10) | man }
+    }
 }

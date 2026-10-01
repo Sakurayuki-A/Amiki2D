@@ -470,3 +470,73 @@ fn hdr_values_survive_a_blurred_layer() {
     );
     eprintln!("HDR 存活：level=1.0 能量 {e1}，level=4.0 能量 {e4}（比值 {:.2}）", e4 as f64 / e1 as f64);
 }
+
+
+// ============================================================================
+// f32 层合成与 u8 层合成必须给出同一个答案（防漂移）
+// ============================================================================
+
+#[test]
+fn layer_blend_f32_matches_u8_where_both_are_valid() {
+    // HDR 需要一条 f32 的层合成路径（未裁剪），于是同一个 `composite_premul`
+    // 有了两个外壳：u8 版与 f32 版。两份外壳迟早会漂移 —— 这条测试就是
+    // 拦住它的东西：**在 `[0,1]` 范围内两者必须逐字节一致**。
+    use amiki_raster::{blend_layer_rect, blend_layer_rect_f32, LayerBuffer};
+
+    let (w, h) = (24u32, 16u32);
+    let mut buf = LayerBuffer::new(w, h);
+    // 半透明 + 渐变 + 全透明混合，覆盖多个分支
+    for y in 0..h {
+        for x in 0..w {
+            let t = x as f32 / w as f32;
+            let a = if (x + y) % 5 == 0 { 0.0 } else { 0.6 };
+            buf.set(x, y, [t, 1.0 - t, 0.35, a]);
+        }
+    }
+
+    // 目标：一个同样有变化的底图（都在 `[0,1]` 内）
+    let mut u8_root = vec![0u8; (w * h * 4) as usize];
+    let mut f32_root = vec![[0.0f32; 4]; (w * h) as usize];
+    for y in 0..h {
+        for x in 0..w {
+            let i = (y * w + x) as usize;
+            let c = [
+                (x as f32 / w as f32) * 0.8,
+                (y as f32 / h as f32) * 0.6,
+                0.25,
+                if (x * 3 + y) % 7 == 0 { 0.0 } else { 0.9 },
+            ];
+            f32_root[i] = c;
+            for k in 0..4 {
+                u8_root[i * 4 + k] = (c[k] * 255.0 + 0.5).clamp(0.0, 255.0) as u8;
+            }
+        }
+    }
+    let backup = f32_root.clone();
+
+    blend_layer_rect(&mut u8_root, w, h, &buf, 0, 0, 1.0, 0, (0, 0, w, h));
+    blend_layer_rect_f32(&mut f32_root, w, h, &buf, 0, 0, 1.0, 0, (0, 0, w, h));
+
+    let mut max_diff = 0i32;
+    let mut worst = (0usize, 0usize);
+    for i in 0..(w * h) as usize {
+        for k in 0..4 {
+            let a = u8_root[i * 4 + k] as i32;
+            let b = (f32_root[i][k] * 255.0 + 0.5).clamp(0.0, 255.0) as i32;
+            if (a - b).abs() > max_diff {
+                max_diff = (a - b).abs();
+                worst = ((i as u32 % w) as usize, (i as u32 / w) as usize);
+            }
+        }
+    }
+
+    // 只在**没被写到的像素**上确认 f32 版是原样保留的（不被清零）
+    let untouched = (0..(w * h) as usize).filter(|&i| f32_root[i] == backup[i]).count();
+
+    assert!(
+        max_diff <= 1,
+        "u8 与 f32 层合成在 `[0,1]` 范围内必须一致，最大差 {max_diff}（位于 {worst:?}）。\n\
+         两者不一致说明两份外壳已经漂移 —— 那会让 CPU 与 GPU 后端给出不同的图。"
+    );
+    eprintln!("层合成 u8/f32 一致（最大差 {max_diff}，原样保留的像素 {untouched}/{})", w * h);
+}

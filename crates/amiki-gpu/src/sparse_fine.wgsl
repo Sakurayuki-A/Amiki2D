@@ -179,7 +179,10 @@ struct FineParams {
 @group(0) @binding(6) var<storage, read> tile_start: array<u32>;
 @group(0) @binding(7) var<storage, read> tile_list: array<vec4<u32>>;
 @group(0) @binding(8) var<storage, read> grad_data: array<vec4<f32>>;
-@group(0) @binding(9) var out_tex: texture_storage_2d<rgba8unorm, write>;
+// **rgba16float 而不是 rgba8unorm**：HDR 要求 >1.0 的颜色能存下来。
+// 8 位格式在写入时就裁到 1.0，高光源会在这一步直接消失。
+// 降到显示范围是最后一步（主机侧回读 + 量化）的事。
+@group(0) @binding(9) var out_tex: texture_storage_2d<rgba16float, write>;
 @group(0) @binding(10) var clip_tex0: texture_2d<f32>;
 @group(0) @binding(11) var clip_tex1: texture_2d<f32>;
 @group(0) @binding(12) var clip_tex2: texture_2d<f32>;

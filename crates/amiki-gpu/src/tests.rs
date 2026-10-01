@@ -487,7 +487,7 @@ fn dump_pipeline(renderer: &GpuRenderer, scene: &Scene, eps: f32) -> (GpuScene, 
         mip_level_count: 1,
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
-        format: wgpu::TextureFormat::Rgba8Unorm,
+        format: wgpu::TextureFormat::Rgba16Float,
         usage: wgpu::TextureUsages::STORAGE_BINDING
             | wgpu::TextureUsages::TEXTURE_BINDING
             | wgpu::TextureUsages::COPY_SRC,
@@ -985,7 +985,7 @@ fn gpu_frame_path_composites_layers() {
         renderer
             .render_into(&tex, &frame)
             .unwrap_or_else(|e| panic!("{name}层：帧路径不得拒绝含层场景（{e}）"));
-        let got = renderer.readback(&tex).expect("读回失败");
+        let got = renderer.readback_rgba8(&tex).expect("读回失败");
 
         // ② 帧持久路径（全域 damage，等价全量）
         let frame2 = renderer.prepare(&scene, 0.05).expect("prepare 失败");
@@ -994,7 +994,7 @@ fn gpu_frame_path_composites_layers() {
         renderer
             .render_into_persistent(&tex2, &frame2, Some(&d))
             .unwrap_or_else(|e| panic!("{name}层：帧持久路径不得拒绝含层场景（{e}）"));
-        let got_persist = renderer.readback(&tex2).expect("读回失败");
+        let got_persist = renderer.readback_rgba8(&tex2).expect("读回失败");
 
         let diff = |a: &[u8], b: &[u8]| -> u32 {
             a.iter()
@@ -1442,7 +1442,7 @@ fn gpu_damage_dispatch_matches_full() {
     renderer
         .render_into_persistent(&tex, &frame, None)
         .expect("全量渲染失败");
-    let full = renderer.readback(&tex).expect("读回失败");
+    let full = renderer.readback_rgba8(&tex).expect("读回失败");
 
     // 1) 局部脏区（含偏移，确保不是左上角起步）
     let mut d = Damage::new(scene.width, scene.height);
@@ -1452,7 +1452,7 @@ fn gpu_damage_dispatch_matches_full() {
         .render_into_persistent(&tex, &frame, Some(&d))
         .expect("局部脏区渲染失败");
     assert!(!skipped, "有脏区时不得跳过");
-    let after = renderer.readback(&tex).expect("读回失败");
+    let after = renderer.readback_rgba8(&tex).expect("读回失败");
     assert_eq!(after, full, "只派发脏 tile 后，画面与全量派发不一致");
 
     // 2) 无脏区：必须完全跳过且不改变像素
@@ -1463,7 +1463,7 @@ fn gpu_damage_dispatch_matches_full() {
         .render_into_persistent(&tex, &frame, Some(&d2))
         .expect("空脏区渲染失败");
     assert!(skipped, "无脏区时必须跳过");
-    let after2 = renderer.readback(&tex).expect("读回失败");
+    let after2 = renderer.readback_rgba8(&tex).expect("读回失败");
     assert_eq!(after2, full, "跳过的帧不得改变任何像素");
 
     // 3) 全脏：也必须等于全量
@@ -1472,7 +1472,7 @@ fn gpu_damage_dispatch_matches_full() {
     renderer
         .render_into_persistent(&tex, &frame, Some(&d3))
         .expect("全脏渲染失败");
-    let after3 = renderer.readback(&tex).expect("读回失败");
+    let after3 = renderer.readback_rgba8(&tex).expect("读回失败");
     assert_eq!(after3, full, "全脏渲染与全量派发不一致");
 
     // 4) 脏区 tile 数校验：尺寸不匹配的 damage 必须被断言拦下（防"全脏被误判为局部"）
@@ -1722,7 +1722,7 @@ fn profile_frame_path_phases() {
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8Unorm,
+            format: wgpu::TextureFormat::Rgba16Float,
             usage: wgpu::TextureUsages::STORAGE_BINDING
                 | wgpu::TextureUsages::TEXTURE_BINDING
                 | wgpu::TextureUsages::COPY_SRC,
@@ -2296,10 +2296,6 @@ fn profile_extract_root_cause() {
 /// 那么**同一个场景在两个后端上会渲染出不同的图** —— 那比"两边都不支持 HDR"
 /// 更糟，因为它是静默的、只在特定内容下才暴露的不一致。
 #[test]
-#[ignore = "已知缺口：GPU 的层内容仍渲染到 Rgba8Unorm，>1.0 在模糊前被裁到 1.0；\
-            修它需要 f16 输出管线（WGSL 的存储纹理格式是类型的一部分，改格式就要第二条\
-            管线变体，或把整条 GPU 管线改成 Rgba16Float）。见 docs/KNOWN_ISSUES.md 的 B12。\
-            去掉 ignore 即可复现：当前最大通道差 52。"]
 fn gpu_hdr_layer_matches_cpu() {
     use amiki_math::Affine;
     use amiki_scene::{BlendMode, Color, Filter, Layer, LayerBounds, Paint, PathBuilder, Scene};

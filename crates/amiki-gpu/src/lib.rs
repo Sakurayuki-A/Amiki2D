@@ -32,6 +32,7 @@ const FINE_WGSL: &str = include_str!("fine.wgsl");
 const SPARSE_FINE_WGSL: &str = include_str!("sparse_fine.wgsl");
 
 /// M6：GPU 离屏层滤镜（可分离盒式模糊）。
+use readback::rgba8_from_f32;
 pub mod blit;
 pub mod blur;
 pub mod consistency;
@@ -358,14 +359,14 @@ fn pack_image_place(gs: &GpuScene) -> Vec<[f32; 4]> {
 /// 只做"着色 + 偏移 + 置于下方"）—— 两份实现必然漂移，共用一份才对。
 #[allow(clippy::too_many_arguments)]
 fn composite_layer_gpu(
-    root: &mut [u8],
+    root: &mut [[f32; 4]],
     root_w: u32,
     root_h: u32,
     layer: &amiki_scene::Layer,
-    layer_img: &[u8],
+    layer_img: &[[f32; 4]],
     layer_w: u32,
     layer_h: u32,
-    shadow: Option<&[u8]>,
+    shadow: Option<&[[f32; 4]]>,
 ) {
     use amiki_raster::{inflated_bounds, LayerBuffer};
 
@@ -391,13 +392,7 @@ fn composite_layer_gpu(
             let sx = bx + x as i32;
             let sy = by + y as i32;
             let src = if sx >= 0 && sy >= 0 && (sx as u32) < layer_w && (sy as u32) < layer_h {
-                let o = ((sy as u32 * layer_w + sx as u32) * 4) as usize;
-                [
-                    layer_img[o] as f32 / 255.0,
-                    layer_img[o + 1] as f32 / 255.0,
-                    layer_img[o + 2] as f32 / 255.0,
-                    layer_img[o + 3] as f32 / 255.0,
-                ]
+                layer_img[(sy as u32 * layer_w + sx as u32) as usize]
             } else {
                 [0.0; 4]
             };
@@ -418,13 +413,7 @@ fn composite_layer_gpu(
                 let gxs = bx + x as i32 - dx.round() as i32;
                 let gys = by + y as i32 - dy.round() as i32;
                 let sp = if gxs >= 0 && gys >= 0 && (gxs as u32) < root_w && (gys as u32) < root_h {
-                    let o = ((gys as u32 * root_w + gxs as u32) * 4) as usize;
-                    [
-                        sh[o] as f32 / 255.0,
-                        sh[o + 1] as f32 / 255.0,
-                        sh[o + 2] as f32 / 255.0,
-                        sh[o + 3] as f32 / 255.0,
-                    ]
+                    sh[(gys as u32 * root_w + gxs as u32) as usize]
                 } else {
                     [0.0; 4]
                 };
@@ -453,21 +442,15 @@ fn composite_layer_gpu(
             let src_pm = [p[0] * sa, p[1] * sa, p[2] * sa, sa];
             let gx = (bx + x as i32) as u32;
             let gy = (by + y as i32) as u32;
-            let o = ((gy * root_w + gx) * 4) as usize;
-            let da = root[o + 3] as f32 / 255.0;
-            let dst_pm = [
-                root[o] as f32 / 255.0 * da,
-                root[o + 1] as f32 / 255.0 * da,
-                root[o + 2] as f32 / 255.0 * da,
-                da,
-            ];
+            let o = (gy * root_w + gx) as usize;
+            let d = root[o];
+            let da = d[3];
+            let dst_pm = [d[0] * da, d[1] * da, d[2] * da, da];
             let out_pm = amiki_raster::composite_premul(dst_pm, src_pm, layer.blend.id());
             let oa = out_pm[3];
             let inv = if oa > 0.0 { 1.0 / oa } else { 0.0 };
-            let straight = [out_pm[0] * inv, out_pm[1] * inv, out_pm[2] * inv, oa];
-            for k in 0..4 {
-                root[o + k] = (straight[k] * 255.0 + 0.5).clamp(0.0, 255.0) as u8;
-            }
+            // **不 clamp** —— >1.0 要留给后续的层与最终的量化
+            root[o] = [out_pm[0] * inv, out_pm[1] * inv, out_pm[2] * inv, oa];
         }
     }
 }
@@ -951,7 +934,10 @@ impl GpuRenderer {
             visibility: wgpu::ShaderStages::COMPUTE,
             ty: wgpu::BindingType::StorageTexture {
                 access: wgpu::StorageTextureAccess::WriteOnly,
-                format: wgpu::TextureFormat::Rgba8Unorm,
+                // **必须与着色器里的 `texture_storage_2d<...>` 格式一致** ——
+                // 不一致会在创建管线时报 "shader requirements against the
+                // pipeline"，而不是静默画错。HDR 要 >1.0 存得住，故为 f16。
+                format: wgpu::TextureFormat::Rgba16Float,
                 view_dimension: wgpu::TextureViewDimension::D2,
             },
             count: None,
@@ -1487,7 +1473,7 @@ impl GpuRenderer {
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8Unorm,
+            format: wgpu::TextureFormat::Rgba16Float,
             usage: wgpu::TextureUsages::STORAGE_BINDING
                 | wgpu::TextureUsages::TEXTURE_BINDING
                 | wgpu::TextureUsages::COPY_SRC,
@@ -1651,7 +1637,7 @@ impl GpuRenderer {
                 mip_level_count: 1,
                 sample_count: 1,
                 dimension: wgpu::TextureDimension::D2,
-                format: wgpu::TextureFormat::Rgba8Unorm,
+                format: wgpu::TextureFormat::Rgba16Float,
                 usage: wgpu::TextureUsages::STORAGE_BINDING
                     | wgpu::TextureUsages::TEXTURE_BINDING
                     | wgpu::TextureUsages::COPY_SRC,
@@ -1697,9 +1683,11 @@ impl GpuRenderer {
         let frame = self.prepare(scene, eps)?;
         let tex = self.create_output_texture(&frame.scene);
         self.run_pipeline(&frame.scene, &tex, false, &frame.clip_views, None)?;
-        let mut root = self.readback(&tex)?;
+        // 根图像保持 **f32 且不裁剪**：层之间要能累积 >1.0 的值，
+        // 降到 8 位是最后一步（`rgba8_from_f32`）。
+        let mut root = self.readback_f32(&tex)?;
         if scene.layers.is_empty() {
-            return Ok(root);
+            return Ok(rgba8_from_f32(&root));
         }
 
         // M6：逐层渲染 → GPU 模糊 → 合成回根图像。
@@ -1721,7 +1709,7 @@ impl GpuRenderer {
             let lframe = self.prepare(&sub, eps)?;
             let ltex = self.create_output_texture(&lframe.scene);
             self.run_pipeline(&lframe.scene, &ltex, false, &lframe.clip_views, None)?;
-            let mut limg = self.readback(&ltex)?;
+            let mut limg = self.readback_f32(&ltex)?;
 
             // 内容与阴影必须**分开**模糊：
             //
@@ -1729,8 +1717,9 @@ impl GpuRenderer {
             // - `Filter::DropShadow`：内容**不模糊**；阴影是"用层 alpha 形状 +
             //   固定阴影色先着色、再模糊"（与 CPU 一致）。若直接拿模糊后的内容
             //   当阴影，就变成"模糊内容再着色"，语义不同（实测差 125/255）。
-            let mut shadow_img: Option<Vec<u8>> = None;
-            let mut shadow_img_buf: Vec<u8> = vec![0u8; (root_w * root_h * 4) as usize];
+            let mut shadow_img: Option<Vec<[f32; 4]>> = None;
+            let mut shadow_img_buf: Vec<[f32; 4]> =
+                vec![[0.0f32; 4]; (root_w * root_h) as usize];
             match layer.filter {
                 amiki_scene::Filter::Blur { sigma } => {
                     limg = self.blur_rgba(&limg, root_w, root_h, sigma, 3)?;
@@ -1744,20 +1733,15 @@ impl GpuRenderer {
                     // 而 GPU 模糊作用在整画布纹理上、坐标空间与层范围不同，
                     // 拼接时极易错位（我试过，差 125~162）。既然 CPU 已有这份数学，
                     // 直接复用最稳妥；GPU 仍承担**内容**的模糊（那才是大头）。
-                    let mut mask: Vec<[f32; 4]> = Vec::with_capacity((root_w * root_h) as usize);
-                    for i in 0..((root_w * root_h) as usize) {
-                        let a = limg[i * 4 + 3] as f32 / 255.0;
-                        mask.push([color.r, color.g, color.b, a * color.a]);
-                    }
+                    let mask: Vec<[f32; 4]> = limg
+                        .iter()
+                        .map(|p| [color.r, color.g, color.b, p[3] * color.a])
+                        .collect();
                     let mut lb = amiki_raster::LayerBuffer::new(root_w, root_h);
                     lb.data.copy_from_slice(&mask);
                     amiki_raster::blur_layer(&mut lb, sigma);
-                    for (i, p) in lb.data.iter().enumerate() {
-                        shadow_img_buf[i * 4] = (p[0] * 255.0 + 0.5).clamp(0.0, 255.0) as u8;
-                        shadow_img_buf[i * 4 + 1] = (p[1] * 255.0 + 0.5).clamp(0.0, 255.0) as u8;
-                        shadow_img_buf[i * 4 + 2] = (p[2] * 255.0 + 0.5).clamp(0.0, 255.0) as u8;
-                        shadow_img_buf[i * 4 + 3] = (p[3] * 255.0 + 0.5).clamp(0.0, 255.0) as u8;
-                    }
+                    // f32 直存：阴影同样不能在这里被裁，否则高光源的投影会失真
+                    shadow_img_buf.copy_from_slice(&lb.data);
                     shadow_img = Some(std::mem::take(&mut shadow_img_buf));
                 }
                 amiki_scene::Filter::None => {}
@@ -1773,7 +1757,8 @@ impl GpuRenderer {
                 shadow_img.as_deref(),
             );
         }
-        Ok(root)
+        // 唯一的 8 位出口：HDR 在这里降到显示范围
+        Ok(rgba8_from_f32(&root))
     }
 }
 

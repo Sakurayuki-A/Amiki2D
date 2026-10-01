@@ -81,7 +81,7 @@ struct Params {
 /// 层内容**模糊后**的纹理（仅投影用；不启用阴影时绑同一个视图）
 @group(0) @binding(3) var shadow_tex: texture_2d<f32>;
 // 绑定名不用 `target`：**它是 WGSL 保留字**，用它会让着色器解析失败。
-@group(0) @binding(4) var out_tex: texture_storage_2d<rgba8unorm, write>;
+@group(0) @binding(4) var out_tex: texture_storage_2d<rgba16float, write>;
 
 /// 预乘空间下的 W3C 合成 —— 与 `amiki_raster::composite_premul` **逐式对应**。
 fn composite_premul(dst: vec4<f32>, src: vec4<f32>, mode: u32) -> vec4<f32> {
@@ -203,7 +203,7 @@ pub fn create_resources(device: &wgpu::Device) -> LayerCompositeResources {
                 visibility: wgpu::ShaderStages::COMPUTE,
                 ty: wgpu::BindingType::StorageTexture {
                     access: wgpu::StorageTextureAccess::WriteOnly,
-                    format: wgpu::TextureFormat::Rgba8Unorm,
+                    format: wgpu::TextureFormat::Rgba16Float,
                     view_dimension: wgpu::TextureViewDimension::D2,
                 },
                 count: None,
@@ -283,7 +283,7 @@ pub fn create_layer_texture(
         mip_level_count: 1,
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
-        format: wgpu::TextureFormat::Rgba8Unorm,
+        format: wgpu::TextureFormat::Rgba16Float,
         // 需要：被 compute 管线写（STORAGE）、被模糊 pass 写（RENDER_ATTACHMENT）、
         // 被合成 pass 读（TEXTURE_BINDING）、被拷贝（COPY_SRC/DST）
         usage: wgpu::TextureUsages::STORAGE_BINDING
@@ -313,12 +313,12 @@ impl crate::GpuRenderer {
     /// 因此这里**不做**预乘/反预乘 —— 详见函数末尾的说明。
     pub(crate) fn blur_rgba(
         &self,
-        src: &[u8],
+        src: &[[f32; 4]],
         width: u32,
         height: u32,
         sigma: f32,
         passes: u32,
-    ) -> Result<Vec<u8>, RenderError> {
+    ) -> Result<Vec<[f32; 4]>, RenderError> {
         self.blur_rgba_impl(src, width, height, sigma, passes, None)
     }
 
@@ -329,23 +329,24 @@ impl crate::GpuRenderer {
     /// （实测差 125/255）。
     pub(crate) fn blur_rgba_impl(
         &self,
-        src: &[u8],
+        src: &[[f32; 4]],
         width: u32,
         height: u32,
         sigma: f32,
         passes: u32,
         override_rgb: Option<[f32; 3]>,
-    ) -> Result<Vec<u8>, RenderError> {
+    ) -> Result<Vec<[f32; 4]>, RenderError> {
         let box_w = blur::box_width_for(sigma, 3);
         // 先做可选的 RGB 覆盖（生成阴影遮罩）
+        // f32 直进直出 —— 不再经过 8 位，HDR 的高光源才能参与模糊。
         let mut owned;
-        let src: &[u8] = match override_rgb {
+        let src: &[[f32; 4]] = match override_rgb {
             Some(c) => {
                 owned = src.to_vec();
-                for px in owned.as_chunks_mut::<4>().0.iter_mut() {
-                    px[0] = (c[0] * 255.0 + 0.5).clamp(0.0, 255.0) as u8;
-                    px[1] = (c[1] * 255.0 + 0.5).clamp(0.0, 255.0) as u8;
-                    px[2] = (c[2] * 255.0 + 0.5).clamp(0.0, 255.0) as u8;
+                for px in owned.iter_mut() {
+                    px[0] = c[0];
+                    px[1] = c[1];
+                    px[2] = c[2];
                 }
                 &owned
             }
@@ -357,6 +358,14 @@ impl crate::GpuRenderer {
         let (t_a, v_a) = blur::create_blur_texture(&self.device, "amiki_blur_a", width, height)?;
         let (_t_b, v_b) = blur::create_blur_texture(&self.device, "amiki_blur_b", width, height)?;
 
+        // 纹理是 Rgba16Float，上传必须是**目标格式的字节** —— 故这里编码成 f16。
+        // （不是因为省内存，是格式要求。）
+        let mut upload = Vec::with_capacity(src.len() * 8);
+        for p in src {
+            for c in p {
+                upload.extend_from_slice(&crate::readback::f32_to_f16(*c).to_le_bytes());
+            }
+        }
         self.queue.write_texture(
             wgpu::TexelCopyTextureInfo {
                 texture: &t_a,
@@ -364,10 +373,10 @@ impl crate::GpuRenderer {
                 origin: wgpu::Origin3d::ZERO,
                 aspect: wgpu::TextureAspect::All,
             },
-            src,
+            &upload,
             wgpu::TexelCopyBufferLayout {
                 offset: 0,
-                bytes_per_row: Some(width * 4),
+                bytes_per_row: Some(width * 8),
                 rows_per_image: Some(height),
             },
             wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
@@ -420,7 +429,7 @@ impl crate::GpuRenderer {
         // 不一致** —— 结果是 `Filter::Blur` 的差异从 1 恶化到 64。
         // 既然对拍基准是 CPU 实现，就必须与它一致；若将来要把两端都改成
         // 预乘语义，那是**一次同时改两端**的独立决定，不能只改一侧。
-        self.readback(&t_a)
+        self.readback_f32(&t_a)
     }
 
     /// P0-3：把场景的离屏层**在 GPU 上**合成进 `tex`（不读回；帧路径用）。
@@ -472,7 +481,7 @@ impl crate::GpuRenderer {
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8Unorm,
+            format: wgpu::TextureFormat::Rgba16Float,
             usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         });

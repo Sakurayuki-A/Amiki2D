@@ -106,6 +106,7 @@ cargo bench -p amiki-gpu                              # 基准（含显存与逐
 | [`docs/RELEASE_PLAN.md`](docs/RELEASE_PLAN.md) | 发布计划、验收标准与当前状态 |
 | [`docs/VERIFY.md`](docs/VERIFY.md) | 多适配器验证清单（换机器时照着跑） |
 | [`docs/DECISIONS.md`](docs/DECISIONS.md) | **待你决策的三件事**（实测数据 + 选项 + 建议） |
+| [`docs/PLAN_EXTRACT_GPU_COUNTS.md`](docs/PLAN_EXTRACT_GPU_COUNTS.md) | 提取达标的实施方案（段数计算移到 GPU，已设计未实施） |
 | [`CHANGELOG.md`](CHANGELOG.md) | 逐项变更与踩过的坑 |
 
 ## 已验证的后端与已知限制

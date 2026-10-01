@@ -1,0 +1,23 @@
+帧路径再省 0.36 ms：data 装配从逐元素 push 改为一次 memcpy
+
+sparse.rs 里装配上传用的大数组，原本是三个 push 循环：
+
+    for c in &gs.cubics { data.push(c[0]); data.push(c[1]); }
+
+圆场景 4 万条三次曲线 → 光这一段就是 8 万次 push（加 quad 的 2 万次，
+共约 10 万次），与提取本身同量级。
+
+它一直没被发现，是因为**名字**：这段时间被记在 `upload_ms`（「上传」）名下
+（0.74 ms）—— 看名字会以为那是驱动上传开销，实际几乎全是这个 push 循环。
+
+改成 `bytemuck::cast_slice` 展平后 `extend_from_slice`（一段连续内存拷贝）：
+`[[f32;4];2]` 与 `[f32;4]` 都是 Pod。
+
+实测（单跑 --test-threads=1）：
+  帧路径主机侧渲染  2.60 → 2.24 ms（判据 <3 ms）
+  GPU pass          2.11 ms 不变
+
+注：`cpu_extract` 基准只测 `build_gpu_scene`，不含这段装配，所以它不变 ——
+改善体现在帧路径口径上。
+
+门禁：并行全量 149 通过 / 0 失败；clippy 零警告

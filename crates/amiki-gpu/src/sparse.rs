@@ -67,18 +67,19 @@ impl GpuRenderer {
         let t_upload = Instant::now();
 
         // —— 上传（与稠密路径同构）——
+        // **用 `extend_from_slice` 一次 memcpy，而不是逐元素 push。**
+        //
+        // 这里原本是三个 `push` 循环：一条圆场景的三次曲线是 4 万条 →
+        // 光这一段就是 **8 万次 push**（加上 quad 的 2 万次，共约 10 万次），
+        // 与提取本身同量级。而它被记在"上传"名下（`upload_ms` 0.74 ms），
+        // 所以一直没被当成 push 问题 —— **名字掩盖了它**。
+        //
+        // `[[f32;4];2]` 与 `[f32;4]` 都是 `Pod`，用 `cast_slice` 展平后
+        // `extend_from_slice` 就是一段连续内存拷贝。
         let mut data: Vec<[f32; 4]> = Vec::with_capacity((nq_len(gs) + nc_len(gs)) * 2 + nl_len(gs));
-        for q in &gs.quads {
-            data.push(q[0]);
-            data.push(q[1]);
-        }
-        for c in &gs.cubics {
-            data.push(c[0]);
-            data.push(c[1]);
-        }
-        for l in &gs.lines {
-            data.push(*l);
-        }
+        data.extend_from_slice(bytemuck::cast_slice::<[[f32; 4]; 2], [f32; 4]>(&gs.quads));
+        data.extend_from_slice(bytemuck::cast_slice::<[[f32; 4]; 2], [f32; 4]>(&gs.cubics));
+        data.extend_from_slice(&gs.lines);
         let mut entry_draws: Vec<u32> = Vec::with_capacity(data.len());
         entry_draws.extend_from_slice(&gs.quad_draws);
         entry_draws.extend_from_slice(&gs.cubic_draws);

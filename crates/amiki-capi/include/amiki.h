@@ -43,6 +43,23 @@
  * 任何 panic 都变成 `AMIKI_ERROR_PANIC`。跨 FFI 的 panic 是未定义行为，
  * 不能让调用方承担。
  *
+ * ### 哪些函数「不」返回 `amiki_result`
+ *
+ * 68 个导出里有 42 个返回 `amiki_result`。其余 26 个**都不可能失败**，
+ * 分三类 —— 这条规则是刻意的，不是遗漏：
+ *
+ * 1. **`_destroy`**（返回 `void`）：销毁空指针是合法空操作，没有失败态。
+ * 2. **纯值构造**（`amiki_affine_*` / `amiki_color_*` / `amiki_stroke_style_*` /
+ *    `amiki_filter_*` / `amiki_paint_*` / `amiki_version*` / `amiki_result_string`）：
+ *    只做算术或返回静态字符串，无分配、无 I/O。
+ * 3. **不写 out 参数的查询**（`amiki_context_backend`、`amiki_context_adapter_name`）：
+ *    它们只**返回一个标量**，传 NULL 时返回中性值（`AMIKI_BACKEND_AUTO` /
+ *    `"(null)"`），方便调用方直接 printf 而不必先判空。
+ *
+ * 反过来，**任何要写 out 参数的函数都返回 `amiki_result`** —— 因为"该不该写"
+ * 本身就是一个必须能报告的决定（例如 `amiki_canvas_size` 拿到 NULL 画布时
+ * 必须什么都不写）。
+ *
  *
  * ## 内存所有权（最容易出事的地方，请逐条读完）
  *

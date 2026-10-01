@@ -1769,6 +1769,17 @@ fn profile_frame_path_phases() {
     eprintln!(
         "         （profile 主机侧合计 {host_total_ms:.2} ms 含读回与时间戳解析，不能当作帧的主机开销）"
     );
+    // **判据口径一致性**：发布计划记的原始值是「2.03 ms」，那是**帧内单次采样**
+    // （`profile()` 的 `extract_ms`）。而 `cpu_extract` 基准给的是**均值**。
+    // 两者不可直接比 —— 这里把**同一口径**的数字也打出来。
+    let mut in_frame_extract = f64::MAX;
+    for _ in 0..3 {
+        let p = renderer.profile(&scene, 0.05).expect("profile");
+        in_frame_extract = in_frame_extract.min(p.extract_ms);
+    }
+    eprintln!(
+        "[口径] 帧内提取（与判据原始值 2.03 ms 同口径，取 3 次最小）= {in_frame_extract:.3} ms"
+    );
 
     // ---- P1-1 的「帧路径」判据：**拆成三项可测口径**，而不是一个总墙钟 ----
     //

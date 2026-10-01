@@ -140,6 +140,8 @@ cargo bench -p amiki-gpu                              # 基准（含显存与逐
 后半句"一套 WGSL 通吃"是**实测过**的，不是宣称：同一份 WGSL 在三个 wgpu 后端上
 跑通全部测试（`AMIKI_BACKENDS` 可指定后端）。
 
+> **Verified on NVIDIA RTX 3050 / Windows only. Cross-vendor validation is not planned for 0.x.**
+>
 > ⚠️ **范围说明**：这三个后端是在**同一块 GPU** 上验证的。
 > **跨厂商硬件属于已知未验证项** —— 单人开发、手上只有一块显卡，无条件执行。
 > 这条验证曾抓到两个"一换后端就起不来"的真 bug，所以未验证意味着

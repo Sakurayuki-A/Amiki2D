@@ -11,6 +11,8 @@ mod damage;
 pub use damage::{changed_bounds, draw_device_bounds, edit_damage};
 mod stroke;
 pub use stroke::{flatten_path, stroke_path, stroke_polyline, LineCap, LineJoin, StrokeStyle};
+mod tone;
+pub use tone::{linear_to_srgb, rgba8_from_f32_with, srgb_to_linear, ToneMap};
 
 /// 路径元素。
 #[derive(Clone, Copy, Debug, PartialEq)]

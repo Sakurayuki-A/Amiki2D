@@ -118,52 +118,43 @@ pub struct GpuScene {
 impl GpuScene {
 }
 
-/// 单块 draw 的图元提取结果（P1-1：并行提取的中间产物）。
+/// 图元提取的累加缓冲。
 ///
-/// 提取是**逐 draw 独立**的，所以可以分块并行、再按序拼接 ——
-/// 拼接顺序与串行遍历完全一致，因此结果**逐字节相同**（这是并行化的前提）。
+/// # 为什么图元→draw 的映射不逐图元 push
 ///
-/// 按**块**而不是按 draw 收集：10k 条 draw 若各自产出一个结构，
-/// 就是 6 万次小分配，开销反而超过串行。
+/// 每条图元都要记"它属于哪个 draw"。最直接的写法是跟着图元 push 一个 draw 索引，
+/// 但那就是**每个图元一次 push**（圆场景是 4 万条三次曲线 → 8 万次 push）。
+///
+/// 改成：提取时只把**每 draw 的计数**写进三个定长数组（每 draw 一次下标写，
+/// 计数在局部变量里累加，不进内存），末尾再用 [`fill_draws`] 按计数
+/// **一次性批量填充**。数据完全相同，但少了一半的 push。
 #[derive(Default)]
 struct DrawPrims {
     quads: Vec<[[f32; 4]; 2]>,
-    quad_draws: Vec<u32>,
     cubics: Vec<[[f32; 4]; 2]>,
-    cubic_draws: Vec<u32>,
     lines: Vec<[f32; 4]>,
+    /// 每 draw 的图元计数（下标 = draw 序号），提取阶段填充。
+    n_quads: Vec<u32>,
+    n_cubics: Vec<u32>,
+    n_lines: Vec<u32>,
+    /// 图元 → draw 的映射，末尾由 [`fill_draws`] 批量生成。
+    quad_draws: Vec<u32>,
+    cubic_draws: Vec<u32>,
     line_draws: Vec<u32>,
 }
 
-impl DrawPrims {
-    fn push_line(&mut self, draw: u32, a: amiki_math::Vec2, b: amiki_math::Vec2) {
-        if (a - b).hypot() > 1e-9 {
-            self.lines.push([a.x, a.y, b.x, b.y]);
-            self.line_draws.push(draw);
+/// 按每 draw 的计数批量生成"图元 → draw"映射。
+///
+/// 用 `resize` 而不是逐元素 `push`：一次容量检查 + 一段连续写，
+/// 而不是每个元素一次带边界检查的 push。
+fn fill_draws(counts: &[u32], total: usize) -> Vec<u32> {
+    let mut out = Vec::with_capacity(total);
+    for (d, &c) in counts.iter().enumerate() {
+        if c > 0 {
+            out.resize(out.len() + c as usize, d as u32);
         }
     }
-    fn push_quad(
-        &mut self,
-        draw: u32,
-        p0: amiki_math::Vec2,
-        c: amiki_math::Vec2,
-        p2: amiki_math::Vec2,
-    ) {
-        self.quads.push([[p0.x, p0.y, c.x, c.y], [p2.x, p2.y, 0.0, 0.0]]);
-        self.quad_draws.push(draw);
-    }
-    fn push_cubic(
-        &mut self,
-        draw: u32,
-        p0: amiki_math::Vec2,
-        c1: amiki_math::Vec2,
-        c2: amiki_math::Vec2,
-        p3: amiki_math::Vec2,
-    ) {
-        self.cubics.push([[p0.x, p0.y, c1.x, c1.y], [c2.x, c2.y, p3.x, p3.y]]);
-        self.cubic_draws.push(draw);
-    }
-
+    out
 }
 
 /// 把一条 draw 的路径提取成图元（变换 + 控制点收集），累加进 `out`。
@@ -176,11 +167,22 @@ fn extract_prims_into(draw: &amiki_scene::Draw, di: u32, out: &mut DrawPrims) {
     let t = &draw.transform;
     let mut cur: Option<Vec2> = None;
     let mut sub_start: Option<Vec2> = None;
+    // 计数在**局部变量**里累加，每 draw 只在末尾写一次内存
+    let (mut nq, mut nc, mut nl) = (0u32, 0u32, 0u32);
+    macro_rules! line {
+        ($a:expr, $b:expr) => {{
+            let (a, b) = ($a, $b);
+            if (a - b).hypot() > 1e-9 {
+                out.lines.push([a.x, a.y, b.x, b.y]);
+                nl += 1;
+            }
+        }};
+    }
     for el in &draw.path.els {
         match *el {
             PathEl::MoveTo(p) => {
                 if let (Some(c), Some(s)) = (cur, sub_start) {
-                    out.push_line(di, c, s);
+                    line!(c, s);
                 }
                 let m = t.map_point(p);
                 cur = Some(m);
@@ -189,42 +191,45 @@ fn extract_prims_into(draw: &amiki_scene::Draw, di: u32, out: &mut DrawPrims) {
             PathEl::LineTo(p) => {
                 if let Some(c) = cur {
                     let m = t.map_point(p);
-                    out.push_line(di, c, m);
+                    line!(c, m);
                     cur = Some(m);
                 }
             }
             PathEl::QuadTo(c, p) => {
                 if let Some(c0) = cur {
                     let m = t.map_point(p);
-                    out.push_quad(di, c0, t.map_point(c), m);
+                    let cc = t.map_point(c);
+                    out.quads.push([[c0.x, c0.y, cc.x, cc.y], [m.x, m.y, 0.0, 0.0]]);
+                    nq += 1;
                     cur = Some(m);
                 }
             }
             PathEl::CubicTo(c1, c2, p) => {
                 if let Some(c0) = cur {
                     let m = t.map_point(p);
-                    out.push_cubic(di, c0, t.map_point(c1), t.map_point(c2), m);
+                    let (a, b) = (t.map_point(c1), t.map_point(c2));
+                    out.cubics
+                        .push([[c0.x, c0.y, a.x, a.y], [b.x, b.y, m.x, m.y]]);
+                    nc += 1;
                     cur = Some(m);
                 }
             }
             PathEl::Close => {
                 if let (Some(c), Some(s)) = (cur, sub_start) {
-                    out.push_line(di, c, s);
+                    line!(c, s);
                     cur = Some(s);
                 }
             }
         }
     }
     if let (Some(c), Some(s)) = (cur, sub_start) {
-        out.push_line(di, c, s);
+        line!(c, s);
     }
+    out.n_quads[di as usize] = nq;
+    out.n_cubics[di as usize] = nc;
+    out.n_lines[di as usize] = nl;
 }
 
-/// 提取所有 draw 的图元。
-///
-/// # 为什么这里是**串行**的（一次被实测否定的尝试）
-///
-/// 逐 draw 的提取互不依赖，看上去是并行的理想对象。我按"分块 + 按序合并"实现过
 /// 逐 draw 提取图元，按 draw 顺序累加。
 ///
 /// # 为什么是串行
@@ -248,9 +253,18 @@ fn extract_all_prims(scene: &Scene) -> DrawPrims {
     acc.cubic_draws.reserve(cap);
     acc.lines.reserve(cap);
     acc.line_draws.reserve(cap);
+    // 计数数组按 draw 数预置（定长，提取阶段按下标写，不 push）
+    let n = scene.draws.len();
+    acc.n_quads = vec![0; n];
+    acc.n_cubics = vec![0; n];
+    acc.n_lines = vec![0; n];
     for (d, draw) in scene.draws.iter().enumerate() {
         extract_prims_into(draw, d as u32, &mut acc);
     }
+    // 末尾一次性生成"图元 → draw"映射（见 `fill_draws`）
+    acc.quad_draws = fill_draws(&acc.n_quads, acc.quads.len());
+    acc.cubic_draws = fill_draws(&acc.n_cubics, acc.cubics.len());
+    acc.line_draws = fill_draws(&acc.n_lines, acc.lines.len());
     acc
 }
 /// 场景 → GpuScene（CPU 只做变换、控制点收集与闭式段数计算；不压平、不分箱）。
@@ -336,28 +350,30 @@ pub fn build_gpu_scene(scene: &Scene, eps: f32) -> GpuScene {
     // 的入口顺序严格一致。此前的遍历顺序 counts 与类型分块布局错位，
     // 导致混合场景（线 + 曲线）的段数张冠李戴（M2f 曲线偏差的根因）。
     // counts 按图元数预留：每个 quad/cubic/line 一项，无预留时同样会反复扩容。
+    // **批量写而不是逐次 push**：`extend` 能按长度提示一次预留、再紧凑写入；
+    // 线段部分只是填 `1`，用 `resize`（一次容量检查 + 连续填）更直接。
+    // 圆场景下这一段是 4 万项，push 与批量写的差别是可测的。
     gs.counts.clear();
-    gs.counts.reserve(gs.quads.len() + gs.cubics.len() + gs.lines.len());
-    for q in &gs.quads {
-        let q = amiki_math::QuadBez::new(
+    let total = gs.quads.len() + gs.cubics.len() + gs.lines.len();
+    gs.counts.reserve(total);
+    gs.counts.extend(gs.quads.iter().map(|q| {
+        amiki_math::QuadBez::new(
             amiki_math::Vec2::new(q[0][0], q[0][1]),
             amiki_math::Vec2::new(q[0][2], q[0][3]),
             amiki_math::Vec2::new(q[1][0], q[1][1]),
-        );
-        gs.counts.push(q.uniform_segments(eps));
-    }
-    for c in &gs.cubics {
-        let c = amiki_math::CubicBez::new(
+        )
+        .uniform_segments(eps)
+    }));
+    gs.counts.extend(gs.cubics.iter().map(|c| {
+        amiki_math::CubicBez::new(
             amiki_math::Vec2::new(c[0][0], c[0][1]),
             amiki_math::Vec2::new(c[0][2], c[0][3]),
             amiki_math::Vec2::new(c[1][0], c[1][1]),
             amiki_math::Vec2::new(c[1][2], c[1][3]),
-        );
-        gs.counts.push(c.uniform_segments(eps));
-    }
-    for _ in &gs.lines {
-        gs.counts.push(1);
-    }
+        )
+        .uniform_segments(eps)
+    }));
+    gs.counts.resize(gs.counts.len() + gs.lines.len(), 1);
     gs.total_segments = gs.counts.iter().sum();
     let wg = gs.total_segments.div_ceil(64).max(1);
     gs.indirect = [wg, 1, 1];

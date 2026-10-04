@@ -90,21 +90,31 @@ const W = 640, H = 400;
         amiki.endLayer(cv);
 
         // ---- 文本（字体找不到就跳过）----
+        // 与 c/ 、csharp/ 、node/ 三个示例**完全相同的顺序与参数** ——
+        // 这条链的一端是"wasm 与原生 CPU 逐字节一致"，参数差一点就断。
         {
-            const candidates = [
-                path.join(__dirname, '..', '..', '..', '..', 'assets', 'fonts', 'Inter-Regular.ttf'),
-            ];
-            let font = null;
-            for (const p of candidates) {
+            const names = ['Inter-Regular.ttf', 'NotoSansSC-Regular.ttf'];
+            const fonts = [];
+            for (const name of names) {
+                const p = path.join(__dirname, '..', '..', '..', '..', 'assets', 'fonts', name);
                 if (!fs.existsSync(p)) continue;
-                font = amiki.fontCreateFromMemory(fs.readFileSync(p));
+                fonts.push(amiki.fontCreateFromMemory(fs.readFileSync(p)));
                 console.log(`字体：${path.relative(process.cwd(), p)}`);
-                break;
             }
-            if (font) {
-                amiki.drawText(cv, font, 'Amiki2D C ABI', 40, 120, 42,
-                    amiki.paintSolid(amiki.colorRgb8(240, 244, 255)));
-                amiki.fontDestroy(font);
+            if (fonts.length > 0) {
+                const ink = amiki.paintSolid(amiki.colorRgb8(240, 244, 255));
+                const stack = amiki.fontStackCreate();
+                for (const font of fonts) {
+                    amiki.fontStackPush(stack, font);
+                }
+                // 单字体路径：拉丁
+                amiki.drawText(cv, fonts[0], 'Amiki2D C ABI', 40, 120, 42, ink);
+                // 字体回退路径：中英混排（汉字由 Noto 渲染）
+                amiki.drawTextWithStack(cv, stack, '你好 Amiki2D 世界', 40, 180, 32, ink, 0);
+                amiki.fontStackDestroy(stack);
+                for (const font of fonts) {
+                    amiki.fontDestroy(font);
+                }
             } else {
                 console.log('字体：未找到，跳过文本');
             }

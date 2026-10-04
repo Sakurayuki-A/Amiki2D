@@ -11,6 +11,7 @@
 // ============================================================================
 
 using System;
+using System.Collections.Generic;
 using System.IO;
 using Amiki;
 // `Path` 与 `System.IO.Path` 撞名 —— 用别名把引擎的路径类型区分出来
@@ -76,35 +77,47 @@ cv.EndLayer();
 
 // ---- 文本（字体找不到就跳过，示例不假设机器上有哪个字体）----
 {
-    var candidates = new[]
+    // 两个字体：Inter 管拉丁、Noto Sans SC 管汉字（0.7.0 的字体回退）
+    var names = new[] { "Inter-Regular.ttf", "NotoSansSC-Regular.ttf" };
+    var roots = new[] { "../../../../", "../../", "", "../" };
+    var loaded = new List<(string Path, Font Font)>();
+    foreach (var name in names)
     {
-        "../../../../assets/fonts/Inter-Regular.ttf",
-        "../../assets/fonts/Inter-Regular.ttf",
-        "assets/fonts/Inter-Regular.ttf",
-        "../assets/fonts/Inter-Regular.ttf",
-    };
-    Font? font = null;
-    foreach (var path in candidates)
-    {
-        try
+        foreach (var root in roots)
         {
-            font = Font.FromFile(path);
-            Console.WriteLine($"字体：{path}");
-            break;
-        }
-        catch (AmikiException)
-        {
-            // 这个路径没有字体，试下一个
+            var path = root + "assets/fonts/" + name;
+            try
+            {
+                loaded.Add((path, Font.FromFile(path)));
+                Console.WriteLine($"字体：{path}");
+                break;
+            }
+            catch (AmikiException)
+            {
+                // 这个路径没有字体，试下一个
+            }
         }
     }
 
-    if (font is not null)
+    if (loaded.Count > 0)
     {
-        using (font)
+        var (ascent, descent, gap) = loaded[0].Font.Metrics;
+        Console.WriteLine($"字体度量（每 em）：ascent {ascent:F3} / descent {descent:F3} / line_gap {gap:F3}");
+        var ink = Paint.Solid(Color.Rgb8(240, 244, 255));
+        using (var stack = FontStack.Create())
         {
-            var (ascent, descent, gap) = font.Metrics;
-            Console.WriteLine($"字体度量（每 em）：ascent {ascent:F3} / descent {descent:F3} / line_gap {gap:F3}");
-            cv.DrawText(font, "Amiki2D C ABI", 40, 120, 42, Paint.Solid(Color.Rgb8(240, 244, 255)));
+            foreach (var (_, f) in loaded)
+            {
+                stack.Push(f);
+            }
+            // 单字体路径：拉丁（与 C / Node 两个示例逐字节一致）
+            cv.DrawText(loaded[0].Font, "Amiki2D C ABI", 40, 120, 42, ink);
+            // 字体回退路径：中英混排 —— 汉字由 Noto 渲染，不需要调用方自己挑字体
+            cv.DrawTextWithStack(stack, "你好 Amiki2D 世界", 40, 180, 32, ink);
+        }
+        foreach (var (_, f) in loaded)
+        {
+            f.Dispose();
         }
     }
     else

@@ -30,6 +30,7 @@
 | `Canvas::push_layer_filtered` | 离屏层 + 滤镜（M6/P0-2/P0-3） |
 | `Canvas::rect` / `circle` / `pentagram` | 便捷图形 |
 | `Canvas::text` | 文字（M5） |
+| `Canvas::text_with_stack` | 文字 + **字体回退**（0.7.0） |
 | `Canvas::set_transform` / `translate` / `rotate` / `scale` / `reset` | 变换 |
 | `Canvas::set_blend` | 混合模式 |
 | `Canvas::push_clip` / `pop_clip` | 裁剪 |
@@ -60,6 +61,10 @@
 | `amiki_text::ShapedGlyph` | 带 `cluster` 的字形（排版对齐用） |
 | `amiki_layout::layout`、`LayoutOptions`、`LayoutResult`、`Line`、`Align` | 断行与排版 |
 | `amiki_layout::is_no_line_start` / `is_no_line_end` | 禁则判定（文本编辑器等也会用到） |
+| **0.7.0：`amiki_text::FontStack`**、`MissingGlyphPolicy`、`TextOptions`、`shape_with_stack`、`Font::id`、`FontId` | **字体回退**：有序字体栈按序解析，一段文本里多字体；缺字策略显式可选（默认报错） |
+| **0.7.0：`amiki_layout::layout_with_stack`**、`layout_with_stack_policy` | 混排排版：断行/禁则与单字体路径**完全共用**，行高取栈里第一个字体 |
+| **0.7.0：`amiki_scene::expand_text_run_with`**、`TextCache::expand_with`、`TextRun::push_glyph_in`、`GlyphKey::with_font` | 按**字体下标**取字形轮廓；缓存键带字体内部 ID |
+| **0.7.0：`amiki::Canvas::text_with_stack`** | 门面侧的字体回退绘制入口 |
 
 ## 三、实验面
 
@@ -93,7 +98,7 @@
 | **GL 后端不支持位图** | 引擎**显式报错**（该后端读不出 `texture_2d_array`），见 RELEASE_PLAN §5 |
 | **DX12 冷启动约 2.3 s** | FXC 运行期编译着色器；可用 `AMIKI_BACKENDS` 指定后端 |
 | **并发创建 context 在启用 Vulkan 校验层时会崩** | 校验层在 debug 构建下由 wgpu 默认启用；**release 不受影响**。统一按"串行创建、并行使用"写。见 `KNOWN_ISSUES.md` **B14** 与 `amiki.h` 的「线程模型」 |
-| **引擎不做字体回退（无 font stack）** | `shape` / `layout` 每次只吃一个 `Font`：**一段文本只能用一种字体**。CJK 需要调用方显式用 `assets/fonts/NotoSansSC-Regular.ttf`（已随仓库分发，OFL 1.1）；只加载 Inter 时中文会画成方框。**这是声称能力上的缺口，正在补** |
+| **引擎不做字体回退（无 font stack）** | ~~`shape` / `layout` 每次只吃一个 `Font`：一段文本只能用一种字体~~ —— **0.7.0 已关闭**：新增 `FontStack` / `shape_with_stack` / `layout_with_stack` / `Canvas::text_with_stack`（**新入口**，老入口签名与行为不变）。见下方稳定面与 `KNOWN_ISSUES.md` **B15** |
 | **不做的能力** | 双向文本、Knuth-Plass、宽色域、各向异性过滤、动画系统 —— 见 RELEASE_PLAN §6（HDR 与 mipmap 已于 0.5.0 / 0.6.0 落地） |
 
 ## 六、环境变量

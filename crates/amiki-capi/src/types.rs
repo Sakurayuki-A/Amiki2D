@@ -26,6 +26,9 @@ pub const AMIKI_ERROR_BACKEND_UNAVAILABLE: i32 = 3;
 pub const AMIKI_ERROR_NOT_SUPPORTED: i32 = 4;
 pub const AMIKI_ERROR_PANIC: i32 = 5;
 pub const AMIKI_ERROR_UNKNOWN: i32 = 6;
+/// 0.7.0 新增：**找得到对象类型、但里面没有要找的东西** ——
+/// 目前只用于 `amiki_font_stack_resolve`（字体栈里没有一个字体含该码点）。
+pub const AMIKI_ERROR_NOT_FOUND: i32 = 7;
 
 /// 人类可读的说明。与 header 里 `amiki_result_string` 的返回值一致。
 ///
@@ -39,10 +42,61 @@ pub(crate) fn result_message(r: i32) -> &'static std::ffi::CStr {
         AMIKI_ERROR_BACKEND_UNAVAILABLE => c"backend unavailable",
         AMIKI_ERROR_NOT_SUPPORTED => c"not supported by this backend",
         AMIKI_ERROR_PANIC => c"engine panicked (this is a bug in Amiki2D)",
+        AMIKI_ERROR_NOT_FOUND => c"not found in this font stack",
         // 给出比 "unknown" 更有用的信息：调用方看到它就知道"引擎报了个未分类错误"，
         // 而 "unknown" 只留给**越界的错误码**（那是调用方自己的 bug）。
         AMIKI_ERROR_UNKNOWN => c"unspecified engine error",
         _ => c"unknown",
+    }
+}
+
+// ============================================================================
+// 文本 shaping 选项（字体回退，0.7.0）
+// ============================================================================
+
+/// 缺字策略：与 header 的 `amiki_missing_glyph_policy` 一一对应。
+pub const AMIKI_MISSING_GLYPH_ERROR: i32 = 0;
+pub const AMIKI_MISSING_GLYPH_NOTDEF: i32 = 1;
+pub const AMIKI_MISSING_GLYPH_SKIP: i32 = 2;
+
+/// shaping 选项的 C 镜像（header 的 `amiki_text_options`）。
+///
+/// `bool` 在 C 里是 1 字节、Rust 里也是 1 字节，`_pad` 显式补齐到 4 字节对齐 ——
+/// 布局由 `tests::text_options_layout_matches_the_contract` 钉住。
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct AmikiTextOptions {
+    pub missing_glyph: i32,
+    pub kerning: bool,
+    pub ligatures: bool,
+    pub _pad: u32,
+}
+
+impl AmikiTextOptions {
+    /// header 承诺的默认值（缺字报错、字距与连字都开）。
+    pub(crate) fn default_options() -> AmikiTextOptions {
+        AmikiTextOptions {
+            missing_glyph: AMIKI_MISSING_GLYPH_ERROR,
+            kerning: true,
+            ligatures: true,
+            _pad: 0,
+        }
+    }
+
+    /// 转成引擎的选项。越界的 `missing_glyph` ⇒ `AMIKI_ERROR_INVALID_ARGUMENT`
+    /// （与其它枚举一样：越界值被拒绝，不猜）。
+    pub(crate) fn to_options(self) -> Result<amiki_text::TextOptions, i32> {
+        let missing_glyph = match self.missing_glyph {
+            AMIKI_MISSING_GLYPH_ERROR => amiki_text::MissingGlyphPolicy::Error,
+            AMIKI_MISSING_GLYPH_NOTDEF => amiki_text::MissingGlyphPolicy::NotDef,
+            AMIKI_MISSING_GLYPH_SKIP => amiki_text::MissingGlyphPolicy::Skip,
+            _ => return Err(AMIKI_ERROR_INVALID_ARGUMENT),
+        };
+        Ok(amiki_text::TextOptions {
+            missing_glyph,
+            kerning: self.kerning,
+            ligatures: self.ligatures,
+        })
     }
 }
 
@@ -524,6 +578,43 @@ mod layout_tests {
         assert_eq!(cap_from_i32(3), None);
         assert_eq!(join_from_i32(3, 0.0), None);
         assert_eq!(AmikiFilter { kind: 99, ..Default::default() }.to_filter(), None);
+    }
+
+    /// 缺字策略的**布局与取值**都要与 header 一致（C 侧按 `sizeof` 传值）。
+    #[test]
+    fn text_options_layout_matches_the_contract() {
+        assert_eq!(size_of::<AmikiTextOptions>(), 12);
+        assert_eq!(offset_of!(AmikiTextOptions, missing_glyph), 0);
+        assert_eq!(offset_of!(AmikiTextOptions, kerning), 4);
+        assert_eq!(offset_of!(AmikiTextOptions, ligatures), 5);
+        assert_eq!(offset_of!(AmikiTextOptions, _pad), 8);
+    }
+
+    /// 三个策略值必须映射到引擎的三种行为；越界值必须被拒绝。
+    #[test]
+    fn missing_glyph_policy_is_mapped_one_to_one() {
+        use amiki_text::MissingGlyphPolicy;
+        for (v, expect) in [
+            (AMIKI_MISSING_GLYPH_ERROR, MissingGlyphPolicy::Error),
+            (AMIKI_MISSING_GLYPH_NOTDEF, MissingGlyphPolicy::NotDef),
+            (AMIKI_MISSING_GLYPH_SKIP, MissingGlyphPolicy::Skip),
+        ] {
+            let o = AmikiTextOptions { missing_glyph: v, ..AmikiTextOptions::default_options() };
+            assert_eq!(o.to_options().expect("合法取值").missing_glyph, expect);
+        }
+        let bad = AmikiTextOptions { missing_glyph: 3, ..AmikiTextOptions::default_options() };
+        assert_eq!(bad.to_options().unwrap_err(), AMIKI_ERROR_INVALID_ARGUMENT);
+        // 默认值 = header 写的那三个
+        let d = AmikiTextOptions::default_options();
+        assert_eq!(d.missing_glyph, AMIKI_MISSING_GLYPH_ERROR);
+        assert!(d.kerning && d.ligatures);
+    }
+
+    /// 新的错误码必须有可读说明（header 承诺 `amiki_result_string` 覆盖全部取值）。
+    #[test]
+    fn not_found_has_a_message() {
+        assert_eq!(result_message(AMIKI_ERROR_NOT_FOUND).to_str().unwrap(), "not found in this font stack");
+        assert_ne!(result_message(AMIKI_ERROR_NOT_FOUND), c"unknown");
     }
 
     /// `miter_limit <= 0` 要变成 Canvas/SVG 的默认值 10（header 承诺的语义）。

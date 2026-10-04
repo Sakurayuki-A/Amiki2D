@@ -64,8 +64,12 @@
  * ## 内存所有权（最容易出事的地方，请逐条读完）
  *
  * 1. **谁创建谁销毁。** `amiki_context` / `amiki_canvas` / `amiki_path` /
- *    `amiki_image` / `amiki_font` / `amiki_gradient` 都是拥有所有权的对象，
- *    必须用**同名的** `_destroy` 释放。用 `free()` 释放它们是错的。
+ *    `amiki_image` / `amiki_font` / `amiki_font_stack` / `amiki_gradient`
+ *    都是拥有所有权的对象，必须用**同名的** `_destroy` 释放。
+ *    用 `free()` 释放它们是错的。
+ *
+ *    `amiki_font_stack_push` 是**拷贝**：压进栈的字体与你的 `amiki_font`
+ *    句柄互不影响（字体字节在内部共享，所以这一步不复制数据）。
  *
  * 2. **`_destroy(NULL)` 是合法操作**（空操作），所以不必在调用点判空。
  *
@@ -175,6 +179,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <stdbool.h>
 
 /* --------------------------------------------------------------------------
  * 导出宏（**必须最先定义**，后面所有声明都用它）
@@ -203,8 +208,8 @@ extern "C" {
  * ========================================================================== */
 
 #define AMIKI_VERSION_MAJOR 0
-#define AMIKI_VERSION_MINOR 6
-#define AMIKI_VERSION_PATCH 1
+#define AMIKI_VERSION_MINOR 7
+#define AMIKI_VERSION_PATCH 0
 /** 预发布标签（正式版为空串）。**不参与数值比较**，只用于展示。 */
 #define AMIKI_VERSION_PRERELEASE "alpha"
 
@@ -250,7 +255,13 @@ typedef enum amiki_result {
      * `amiki_version_string()` 一起上报。它保证不会让进程崩掉。
      */
     AMIKI_ERROR_PANIC = 5,
-    AMIKI_ERROR_UNKNOWN = 6
+    AMIKI_ERROR_UNKNOWN = 6,
+    /**
+     * **0.7.0 新增**：找得到对象类型，但里面**没有要找的东西**。
+     * 目前只有一处：`amiki_font_stack_resolve` / `amiki_canvas_draw_text_with_stack`
+     * —— 字体栈里没有任何字体含该字符。
+     */
+    AMIKI_ERROR_NOT_FOUND = 7
 } amiki_result;
 
 /** 人类可读的说明（静态字符串，不可释放）。越界值返回 `"unknown"`。 */
@@ -342,6 +353,48 @@ typedef struct amiki_layer_bounds {
 } amiki_layer_bounds;
 
 /* ==========================================================================
+ * 文本 shaping 选项（字体回退，0.7.0）
+ * ========================================================================== */
+
+/**
+ * **缺字策略**：字体栈里没有任何字体含某个字符时怎么办。
+ *
+ * 「缺字」指**整个栈**都不含该码点；只要有一个字体含它，就由那个字体渲染。
+ */
+typedef enum amiki_missing_glyph_policy {
+    /**
+     * **默认**：`amiki_canvas_draw_text_with_stack` 返回 `AMIKI_ERROR_NOT_FOUND`。
+     *
+     * 这是本项目"不支持就显式报错，不静默画错"的一贯取舍 —— 方框在不少界面里
+     * "看起来像是对的"，所以这个决定必须由调用方做。
+     */
+    AMIKI_MISSING_GLYPH_ERROR = 0,
+    /** 用 `.notdef`（字形 0）替代：画出一个方框，位置与前进量按该字体算。 */
+    AMIKI_MISSING_GLYPH_NOTDEF = 1,
+    /** 跳过该字符：不产生字形，前进量为 0（后续字形紧接着排）。 */
+    AMIKI_MISSING_GLYPH_SKIP = 2
+} amiki_missing_glyph_policy;
+
+/**
+ * shaping 选项。**按值传**（很小），默认值见 `amiki_text_options_default()`：
+ *
+ *     missing_glyph = AMIKI_MISSING_GLYPH_ERROR
+ *     kerning       = true
+ *     ligatures     = true
+ *
+ * `_pad` 必须为 0（保留字段，用于将来扩展；当前版本忽略它）。
+ */
+typedef struct amiki_text_options {
+    amiki_missing_glyph_policy missing_glyph;
+    bool kerning;
+    bool ligatures;
+    uint32_t _pad;
+} amiki_text_options;
+
+/** 上述默认值。纯函数，不分配、不会失败。 */
+AMIKI_API amiki_text_options amiki_text_options_default(void);
+
+/* ==========================================================================
  * 不透明句柄（先声明，供下面的结构体引用）
  * ========================================================================== */
 
@@ -350,6 +403,7 @@ typedef struct amiki_canvas amiki_canvas;
 typedef struct amiki_path amiki_path;
 typedef struct amiki_image amiki_image;
 typedef struct amiki_font amiki_font;
+typedef struct amiki_font_stack amiki_font_stack;
 typedef struct amiki_gradient amiki_gradient;
 
 /* ==========================================================================
@@ -620,6 +674,27 @@ AMIKI_API amiki_result amiki_canvas_draw_text(amiki_canvas* canvas, const amiki_
                                               const char* utf8, size_t utf8_len, float x, float y,
                                               float size, amiki_paint paint);
 
+/**
+ * 绘制一段 UTF-8 文本，字形按**字体栈**做回退（0.7.0）—— 一段文本里不同字符
+ * 可以由不同字体渲染（例如拉丁用 Inter、汉字用 Noto Sans SC）。
+ *
+ * 与 `amiki_canvas_draw_text` 的**唯一**区别是字体来源：这里给一个有序的
+ * `amiki_font_stack`，引擎按顺序取**第一个**含该字符的字体。
+ * 基线原点、显式长度、字形走同一管线（任意缩放不糊）三者完全相同。
+ *
+ * - `options` 可为 `NULL`，等价于 `amiki_text_options_default()`。
+ * - 缺字（栈里没有一个字体含该字符）且策略为 `AMIKI_MISSING_GLYPH_ERROR` 时
+ *   返回 `AMIKI_ERROR_NOT_FOUND`，**不画出任何东西**（画布状态不变）。
+ * - `stack` 为空返回 `AMIKI_ERROR_NOT_FOUND`（没有任何字体可用）。
+ * - 不支持双向文本（见 `docs/KNOWN_ISSUES.md` C1）。
+ */
+AMIKI_API amiki_result amiki_canvas_draw_text_with_stack(amiki_canvas* canvas,
+                                                         const amiki_font_stack* stack,
+                                                         const char* utf8, size_t utf8_len,
+                                                         float x, float y, float size,
+                                                         amiki_paint paint,
+                                                         const amiki_text_options* options);
+
 /* ---- 离屏层（模糊 / 投影 / 分组不透明度）---- */
 
 /**
@@ -744,6 +819,47 @@ AMIKI_API void amiki_font_destroy(amiki_font* font);
  */
 AMIKI_API amiki_result amiki_font_metrics(const amiki_font* font, float* out_ascent,
                                           float* out_descent, float* out_line_gap);
+
+/* --------------------------------------------------------------------------
+ * 字体栈（字体回退，0.7.0）
+ *
+ * 用法：
+ *
+ *     amiki_font_stack* st = amiki_font_stack_create();
+ *     amiki_font_stack_push(st, latin);      // 先压的先赢
+ *     amiki_font_stack_push(st, cjk);
+ *     amiki_canvas_draw_text_with_stack(cv, st, "你好 world", 0, 40, 90, 32, paint, NULL);
+ *     amiki_font_stack_destroy(st);          // latin / cjk 句柄仍归你，另行销毁
+ * ------------------------------------------------------------------------ */
+
+/** 创建空字体栈。**失败返回 NULL**（内存不足或内部 panic）。 */
+AMIKI_API amiki_font_stack* amiki_font_stack_create(void);
+
+/**
+ * 销毁字体栈。传 NULL 是空操作。
+ *
+ * **不影响**压栈用过的字体：压栈是拷贝一份廉价句柄（字体字节内部共享），
+ * `amiki_font` 句柄仍归调用方，该 `amiki_font_destroy` 还得调。
+ */
+AMIKI_API void amiki_font_stack_destroy(amiki_font_stack* stack);
+
+/**
+ * 追加一个字体。**顺序即优先级**：靠前的字体先被选中。
+ *
+ * 同一个字体可以压多次（会各占一个下标 → 各有一份字形缓存键，
+ * 一般没必要）。
+ */
+AMIKI_API amiki_result amiki_font_stack_push(amiki_font_stack* stack, const amiki_font* font);
+
+/**
+ * 查询**第一个**含该码点的字体下标（0 起）。
+ *
+ * - 都不含 ⇒ `AMIKI_ERROR_NOT_FOUND`（且不写出参）。
+ * - `codepoint` 不是合法标量值（代理区、> U+10FFFF）⇒ `AMIKI_ERROR_INVALID_ARGUMENT`。
+ * - `out_index` 可为 NULL（那样只能靠返回码判断"有没有"）。
+ */
+AMIKI_API amiki_result amiki_font_stack_resolve(const amiki_font_stack* stack, uint32_t codepoint,
+                                                uint32_t* out_index);
 
 /* ==========================================================================
  * 渐变（可跨多次绘制复用）

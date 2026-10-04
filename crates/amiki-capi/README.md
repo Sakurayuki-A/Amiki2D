@@ -44,6 +44,31 @@ amiki_canvas_destroy(cv);
 amiki_context_destroy(ctx);
 ```
 
+**字体回退**（0.7.0）：一段文本里不同字符可以由不同字体渲染。
+调用方给一个**有序**字体栈，引擎按序取第一个含该字符的字体：
+
+```c
+amiki_font *latin = NULL, *cjk = NULL;
+amiki_font_create_from_file("assets/fonts/Inter-Regular.ttf", &latin);
+amiki_font_create_from_file("assets/fonts/NotoSansSC-Regular.ttf", &cjk);
+
+amiki_font_stack *stack = amiki_font_stack_create();
+amiki_font_stack_push(stack, latin);   /* 顺序即优先级：先压的先赢 */
+amiki_font_stack_push(stack, cjk);
+
+/* options 传 NULL = 默认：缺字返回 AMIKI_ERROR_NOT_FOUND（不静默画方框） */
+amiki_canvas_draw_text_with_stack(cv, stack, "你好 Amiki2D 世界", 0,
+                                  40, 120, 32, amiki_paint_solid(amiki_color_rgb8(0,0,0)), NULL);
+
+amiki_font_stack_destroy(stack);   /* 压栈是拷贝，字体句柄仍归你 */
+amiki_font_destroy(latin);
+amiki_font_destroy(cjk);
+```
+
+缺字想画方框或跳过？用 `amiki_text_options` 把 `missing_glyph` 设成
+`AMIKI_MISSING_GLYPH_NOTDEF` / `AMIKI_MISSING_GLYPH_SKIP`
+（默认值见 `amiki_text_options_default()`）。
+
 编译（Windows）：
 ```
 cl /utf-8 /W4 your_app.c /link amiki2d.dll.lib
@@ -157,7 +182,10 @@ crates\amiki-capi\verify.cmd
 > **这个脚本验证过有牙**：把 C 示例背景色的一个通道从 24 改成 25，
 > 第 5 项立刻失败并返回退出码 1（C 的哈希变了，C# / Node 没变）。
 
-它检查的符号数当前是 **header 声明 74 / 导出 74，无缺失**（0.6.0 新增 `amiki_image_set_mipmap_mode` / `amiki_canvas_set_mip_bias`）。
+它检查的符号数当前是 **header 声明 80 / 导出 80，无缺失**（0.7.0 新增
+`amiki_font_stack_create` / `amiki_font_stack_destroy` / `amiki_font_stack_push` /
+`amiki_font_stack_resolve` / `amiki_canvas_draw_text_with_stack` /
+`amiki_text_options_default`）。
 
 手工核对（不用脚本时）：
 

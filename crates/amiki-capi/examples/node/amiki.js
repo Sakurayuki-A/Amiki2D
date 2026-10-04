@@ -175,6 +175,14 @@ const native = {
     font_destroy: f('void amiki_font_destroy(void *font)'),
     font_metrics: f('int32_t amiki_font_metrics(void *font, _Out_ float *a, _Out_ float *d, _Out_ float *g)'),
 
+    // 字体栈 / 字体回退（0.7.0）。
+    // `options` 传 null 即用 header 承诺的默认值，所以不必构造结构体。
+    font_stack_create: f('void *amiki_font_stack_create(void)'),
+    font_stack_destroy: f('void amiki_font_stack_destroy(void *stack)'),
+    font_stack_push: f('int32_t amiki_font_stack_push(void *stack, void *font)'),
+    font_stack_resolve: f('int32_t amiki_font_stack_resolve(void *stack, uint32_t codepoint, _Out_ uint32_t *out_index)'),
+    canvas_draw_text_with_stack: f('int32_t amiki_canvas_draw_text_with_stack(void *cv, void *stack, const char *utf8, size_t len, float x, float y, float size, AmikiPaint paint, void *options)'),
+
     gradient_create_linear: f('int32_t amiki_gradient_create_linear(float x0, float y0, float x1, float y1, _In_ const AmikiGradientStop *stops, uint32_t n, _Out_ void **out)'),
     gradient_create_radial: f('int32_t amiki_gradient_create_radial(float cx, float cy, float r, _In_ const AmikiGradientStop *stops, uint32_t n, _Out_ void **out)'),
     gradient_create_sweep: f('int32_t amiki_gradient_create_sweep(float cx, float cy, float s, _In_ const AmikiGradientStop *stops, uint32_t n, _Out_ void **out)'),

@@ -38,7 +38,13 @@ struct FrameState {
     last_dirty_ratio: f64,
     /// M5：字体与字形轮廓缓存（轮廓解析一次后复用，避免每帧重新解析）。
     /// 用 `RefCell`：`build_scene` 是 `&self`，而缓存的填充需要内部可变性。
-    font: Option<amiki_text::Font>,
+    ///
+    /// 0.7.0 起是**有序字体栈**：拉丁走 Inter、汉字走 Noto Sans SC。
+    /// 顺序即优先级（谁先压谁赢）。
+    fonts: amiki_text::FontStack,
+    /// shaping 选项：缺字画 `.notdef` 方框而不是让整段文字消失 ——
+    /// 示例要能一眼看出"哪个字没字体"，而不是"文字不见了"。
+    text_opts: amiki_text::TextOptions,
     text_cache: std::cell::RefCell<OutlineCache>,
     /// dogfooding 列表视图的状态
     show_list: bool,
@@ -47,23 +53,35 @@ struct FrameState {
     cursor: Vec2,
 }
 
-/// 字形轮廓缓存：`glyph id → 轮廓`。
+/// 字形轮廓缓存：`(字体 ID, glyph id) → 轮廓`。
 ///
 /// 为什么必须缓存：轮廓解析（含二次曲线还原）比拷贝一条路径贵得多，
 /// 而同一个字形每帧都会被复用。缓存让"每帧重新 shaping"变得廉价。
 /// 用 `Vec` 而非 `HashMap`：字形数量小（几十到几百），线性查找更快且无哈希依赖。
+///
+/// **键必须带字体**：同一个 glyph id 在 Inter 与 Noto 里是不同字形，
+/// 只按 id 分键的话，遇到两边都有的码点（如数字、拉丁字母在 Noto 里也有）
+/// 就会把甲字体的轮廓用在乙字体上 —— 画出来是"串形"的字。
+/// 用**字体内部 ID** 而不是栈下标：下标会随栈的调整而变，内部 ID 不会。
 #[derive(Default)]
 struct OutlineCache {
-    entries: Vec<(u32, amiki::scene::GlyphOutline)>,
+    entries: Vec<((amiki_text::FontId, u32), amiki::scene::GlyphOutline)>,
 }
 
 impl OutlineCache {
-    fn get_or_insert(&mut self, font: &amiki_text::Font, id: u32) -> Option<amiki::scene::GlyphOutline> {
-        if let Some((_, o)) = self.entries.iter().find(|(k, _)| *k == id) {
+    fn get_or_insert(
+        &mut self,
+        stack: &amiki_text::FontStack,
+        font_index: usize,
+        id: u32,
+    ) -> Option<amiki::scene::GlyphOutline> {
+        let font = stack.get(font_index)?;
+        let key = (font.id(), id);
+        if let Some((_, o)) = self.entries.iter().find(|(k, _)| *k == key) {
             return Some(o.clone());
         }
         let o = font.outline(id).ok()?;
-        self.entries.push((id, o.clone()));
+        self.entries.push((key, o.clone()));
         Some(o)
     }
 }
@@ -120,21 +138,31 @@ impl FrameState {
         surface.configure(&device, &surface_cfg);
 
         let renderer = GpuRenderer::from_device(device, queue).expect("渲染器初始化失败");
-        // 字体可选：缺失时示例仍应能演示图形能力
-        let font = match amiki_text::Font::from_file("assets/fonts/Inter-Regular.ttf") {
-            Ok(f) => {
-                println!(
-                    "已加载 Inter：units_per_em = {}, 字形数 = {}",
-                    f.units_per_em(),
-                    f.glyph_count()
-                );
-                Some(f)
+        // 字体栈：**有序**（先压的先赢）。Inter 管拉丁，Noto Sans SC 管汉字
+        // —— 这正是 0.7.0 的字体回退：一段文本里不同字符由不同字体渲染。
+        // 缺字体时示例仍应能演示图形能力，所以这里是"能加载几个算几个"。
+        let mut fonts = amiki_text::FontStack::new();
+        for path in [
+            "assets/fonts/Inter-Regular.ttf",
+            "assets/fonts/NotoSansSC-Regular.ttf",
+        ] {
+            match amiki_text::Font::from_file(path) {
+                Ok(f) => {
+                    let idx = fonts.push(f);
+                    let f = fonts.get(idx).expect("刚压入");
+                    println!(
+                        "已加载字体 #{idx}：{path}（{}），units_per_em = {}, 字形数 = {}",
+                        f.id_name(),
+                        f.units_per_em(),
+                        f.glyph_count()
+                    );
+                }
+                Err(e) => eprintln!("未加载字体 {path}（{e}）"),
             }
-            Err(e) => {
-                eprintln!("未加载字体（{e}）；文本部分将跳过");
-                None
-            }
-        };
+        }
+        if fonts.is_empty() {
+            eprintln!("一个字体都没加载成功；文本部分将跳过");
+        }
         FrameState {
             window,
             surface,
@@ -148,7 +176,10 @@ impl FrameState {
             prev_scene: None,
             last_ms: 0.0,
             last_dirty_ratio: 1.0,
-            font,
+            fonts,
+            // 缺字画方框：示例里宁可看见"这里有个字没字体"，也不要整段消失
+            text_opts: amiki_text::TextOptions::default()
+                .with_missing_glyph(amiki_text::MissingGlyphPolicy::NotDef),
             text_cache: std::cell::RefCell::new(OutlineCache::default()),
             // 默认进**应用视图**（列表）；展示页用 Tab 切换。
             show_list: true,
@@ -202,10 +233,13 @@ impl FrameState {
                 y + ROW_H - 7.0,
                 Paint::Solid(Color { r: 0.2 + 0.7 * hue, g: 0.7 - 0.4 * hue, b: 0.9 - 0.5 * hue, a: 1.0 }),
             );
-            if let Some(font) = self.font.as_ref() {
-                let label = format!("第 {i} 行 · Amiki2D dogfooding");
-                if let Ok(run) = amiki_text::shape(font, &label, 15.0) {
-                    canvas.text(
+            if !self.fonts.is_empty() {
+                // 中英混排：汉字由 Noto 渲染、拉丁与数字由 Inter 渲染
+                let label = format!("第 {i} 行 · Amiki2D 渲染引擎 dogfooding");
+                if let Ok(run) =
+                    amiki_text::shape_with_stack(&self.fonts, &label, 15.0, &self.text_opts)
+                {
+                    canvas.text_with_stack(
                         &run,
                         Vec2::new(34.0, y + 20.0),
                         Paint::Solid(if sel {
@@ -213,7 +247,11 @@ impl FrameState {
                         } else {
                             Color::rgba8(200, 208, 214, 255)
                         }),
-                        |id| self.text_cache.borrow_mut().get_or_insert(font, id),
+                        |fi, id| {
+                            self.text_cache
+                                .borrow_mut()
+                                .get_or_insert(&self.fonts, fi, id)
+                        },
                     );
                 }
             }
@@ -222,17 +260,22 @@ impl FrameState {
         // 固定表头：**不随滚动移动**，于是滚动时它是唯一"每帧相同"的部分，
         // 增量渲染会把它排除在脏区之外。
         canvas.rect(0.0, 0.0, w, HEADER, Paint::Solid(Color::rgba8(12, 15, 18, 255)));
-        if let Some(font) = self.font.as_ref() {
+        if !self.fonts.is_empty() {
             let label = format!(
                 "Amiki2D 列表 · {ROWS} 行 · 滚动 {:.0} · Tab 切换视图 · 滚轮/↑↓ 滚动 · 点击选中",
                 self.scroll
             );
-            if let Ok(run) = amiki_text::shape(font, &label, 15.0) {
-                canvas.text(
+            if let Ok(run) = amiki_text::shape_with_stack(&self.fonts, &label, 15.0, &self.text_opts)
+            {
+                canvas.text_with_stack(
                     &run,
                     Vec2::new(16.0, 28.0),
                     Paint::Solid(Color::rgba8(236, 240, 241, 255)),
-                    |id| self.text_cache.borrow_mut().get_or_insert(font, id),
+                    |fi, id| {
+                        self.text_cache
+                            .borrow_mut()
+                            .get_or_insert(&self.fonts, fi, id)
+                    },
                 );
             }
         }
@@ -356,16 +399,21 @@ impl FrameState {
         // 6) 文本（M5）：字形轮廓直入解析覆盖率管线 —— 任意缩放不糊。
         //    每帧重新 shaping（很快），但轮廓只解析一次并缓存；
         //    文字随时间轻微缩放，用来直观展示"放大不糊"。
-        if let Some(font) = self.font.as_ref() {
+        if !self.fonts.is_empty() {
             let size = (h * 0.10) * (1.0 + 0.25 * (t * 0.8).sin());
-            if let Ok(run) = amiki_text::shape(font, "Amiki2D", size) {
+            let label = "Amiki2D 渲染引擎";
+            if let Ok(run) = amiki_text::shape_with_stack(&self.fonts, label, size, &self.text_opts) {
                 let ox = w * 0.5 - size * 1.75;
                 let oy = h * 0.46;
-                canvas.text(
+                canvas.text_with_stack(
                     &run,
                     Vec2::new(ox, oy),
                     Paint::Solid(Color { r: 0.96, g: 0.94, b: 0.90, a: 0.96 }),
-                    |id| self.text_cache.borrow_mut().get_or_insert(font, id),
+                    |fi, id| {
+                        self.text_cache
+                            .borrow_mut()
+                            .get_or_insert(&self.fonts, fi, id)
+                    },
                 );
             }
         }

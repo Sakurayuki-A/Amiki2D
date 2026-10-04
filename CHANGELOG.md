@@ -5,6 +5,81 @@
 
 ---
 
+## [0.7.0-alpha] —— 字体回退（一段文本里多个字体）
+
+**新能力**：一段文本里的不同字符可以由**不同字体**渲染 —— 拉丁走 Inter、
+汉字走 Noto Sans SC。此前引擎只接受单个字体，于是"支持 CJK"实际上要求调用方
+**自己为每段文本挑对字体**：挑错了（比如只加载 Inter）就整段画成方框，
+而这个缺口此前只写在 `docs/API.md` 的限制表里，没有编号、也不在测试覆盖内。
+
+### 新增 API（**新入口，老 API 一字未动**）
+
+| 层 | 新增 |
+|---|---|
+| `amiki-text` | `FontStack`（有序字体栈）、`MissingGlyphPolicy`（`Error`/`NotDef`/`Skip`）、`TextOptions`、`shape_with_stack`、`Font::id()`（内部稳定 ID）、`FontId` |
+| `amiki-scene` | `PositionedGlyph::font_index` / `cluster`、`TextRun::push_glyph_in`、`GlyphKey::with_font`、`expand_text_run_with`、`TextCache::expand_with` |
+| `amiki-layout` | `layout_with_stack` / `layout_with_stack_policy` |
+| `amiki`（门面） | `Canvas::text_with_stack` |
+| C ABI | `amiki_font_stack_create/destroy/push/resolve`、`amiki_canvas_draw_text_with_stack`、`amiki_text_options_default`（符号 **74 → 80**）+ `amiki_missing_glyph_policy` / `amiki_text_options` / `AMIKI_ERROR_NOT_FOUND` |
+
+### 设计与取舍
+
+- **顺序显式**：`FontStack` 按顺序解析，**第一个含该字形的字体胜出**。
+  不做任何"按脚本优先级猜"的隐式规则 —— 谁先压谁赢，可预测、可测试
+  （有一条测试专门把栈倒过来验证这一点）。
+- **缺字默认报错**：`MissingGlyphPolicy::Error` 返回 `Err(MissingGlyph(码点))`，
+  由调用方显式选择 `.notdef` 兜底或跳过。方框在很多界面里"看起来像是对的"，
+  所以这个决定不能替调用方做（沿用本项目"不支持就显式报错"的取舍）。
+- **缓存键用字体内部 ID**：`GlyphKey` 新增 `font_id`，取字体**自己声明的**名字
+  （PostScript 名 → Unique ID → Full name → Family+Subfamily → 字节哈希）。
+  用路径或栈下标都不行：路径会变、下标会随栈调整而变，而同一个 glyph id
+  在不同字体里是**不同字形** —— 键里不带字体就会跨字体误命中（画出串形的字）。
+  `FontId` 放在 `amiki-scene`（`GlyphKey` 在那里，而依赖方向是 `text → scene`），
+  从 `amiki_text` 再导出。
+- **行高取栈里第一个字体**：混合串里拉丁与汉字的高度不同，不做"取最大值"的
+  隐式合并 —— 否则行高会随内容变化（同字号不同文本行高不同，界面会抖）。
+- **run 边界不做字距**：那是字体内部信息。同字体的整段文本不受影响
+  （有一条测试用 4 行混排验证"行宽 = 各 run 之和 ±0.5px"）。
+
+### 零破坏怎么保证（可执行证据）
+
+- `shape` / `shape_clustered` / `layout` / `expand_text_run` / `TextCache::expand` /
+  `Canvas::text` 的**签名与实现都没动**；
+- `shape_with_stack` 有条**快速路径**：单字体栈 + `TextOptions::LEGACY`（缺字交给
+  shaping）时直接调用老的 `shape` ⇒ 结果逐字节一致（测试断言 `f32::to_bits` 相等）；
+- `layout_with_stack` 在单字体栈时直接调用老的 `layout`（测试逐位比对行数/宽度/基线）；
+- 老入口的**行为**按原样保留，包括单字体路径遇缺字时"交给 shaping 映射成 `.notdef`"
+  （栈路径才默认报错）—— 否则老调用方的输出会变。
+
+### 顺带修掉的
+
+- `Font` 的字节改为 `Arc` 共享 ⇒ `Font` 变**廉价可克隆**（C ABI 的
+  `amiki_font_stack_push` 依赖它：压栈不复制那 10 MB），并手写 `Debug`
+  避免打印几 MB 字节；
+- 三处过时注释：`amiki-layout` 说"仓库里没有 CJK 字体"（早已入库）、
+  `tests/layout.rs` 的同一个说法；
+- `docs/API.md` 里"`assets/fonts/` 没有 CJK 字体"那条**本来就是错的**（0.3.0 起
+  就有 Noto），已改成真正的限制（当时是"不做字体回退"），如今随本版关闭。
+
+### 测试（224 → 256）
+
+| 位置 | 新增 | 覆盖 |
+|---|---|---|
+| `amiki-text/tests/stack.rs` | 13 | 解析/run 切分/缺字三策略/字距开关/单字体栈等价/cluster 指回原文/`FontId` 稳定性 |
+| `amiki-scene`（内联） | 3 | 按字体取轮廓、缓存按字体分键、老 `GlyphKey::new` 语义不变 |
+| `amiki-layout/tests/stack_layout.rs` | 7 | 混排单行/折行不丢内容/**各 run 之和 ⇄ 行宽 ≤0.5px**/CJK 禁则/行高随首字体/单字体栈等价/缺字策略 |
+| `amiki-capi`（内联 + types） | 8 | 空指针、`resolve` 顺序与 `NOT_FOUND`、**压栈后即可销毁字体句柄**、缺字策略端到端、**栈路径与单字体路径逐字节一致**、结构体布局与枚举映射 |
+| `amiki-gpu`（内联） | 1 | **CJK 字形 GPU↔CPU 逐像素 ≤2/255**（实测最大通道差 **1**，4127 个非零通道） |
+
+### 人工验证
+
+`window_demo` 现在加载 Inter + Noto 并全程走字体栈：
+列表首行 `第 109 行 · Amiki2D 渲染引擎 dogfooding` 的汉字**全部正常显示，无方框**
+（截图 `out/cjk_list.png`）。绘制顺序与三语言示例一致，`verify.cmd` 的三份产物
+仍然**逐字节相同**。
+
+---
+
 ## [0.6.1-alpha] —— GPU 增量渲染的脏区派发修复
 
 **修复一个**从 M4（0.3.0）起就存在**的静默错误**：GPU 帧持久路径只重算

@@ -554,6 +554,75 @@ pub extern "C" fn amiki_canvas_draw_text(
     })
 }
 
+/// 绘制一段 UTF-8 文本，字形按**字体栈**做回退（0.7.0）。
+///
+/// 与 [`amiki_canvas_draw_text`] 的区别只有一处：字体来源从单个 `amiki_font`
+/// 换成有序的 `amiki_font_stack` —— 因此一段文本里拉丁与汉字可以来自不同字体。
+/// 其余（基线原点、显式长度、字形走同一管线）完全相同。
+#[no_mangle]
+pub extern "C" fn amiki_canvas_draw_text_with_stack(
+    canvas: *mut AmikiCanvas,
+    stack: *const AmikiFontStack,
+    utf8: *const std::ffi::c_char,
+    utf8_len: usize,
+    x: f32,
+    y: f32,
+    size: f32,
+    paint: AmikiPaint,
+    options: *const AmikiTextOptions,
+) -> i32 {
+    if stack.is_null() || utf8.is_null() {
+        return AMIKI_ERROR_INVALID_ARGUMENT;
+    }
+    ffi!(canvas, |c| {
+        if !x.is_finite() || !y.is_finite() || !size.is_finite() || size <= 0.0 {
+            return AMIKI_ERROR_INVALID_ARGUMENT;
+        }
+        // SAFETY: 已判空
+        let s = unsafe { &*stack };
+        if let Err(r) = s.poison.check() {
+            return r;
+        }
+        // 选项可为 NULL ⇒ 用 header 承诺的默认值（缺字报错、字距与连字都开）
+        let opts = if options.is_null() {
+            AmikiTextOptions::default_options()
+        } else {
+            // SAFETY: 已判空
+            unsafe { *options }
+        };
+        let Ok(text_opts) = opts.to_options() else {
+            return AMIKI_ERROR_INVALID_ARGUMENT;
+        };
+        // 显式长度：0 表示"按 \0 求长"（与 amiki_canvas_draw_text 同语义）
+        let bytes = if utf8_len == 0 {
+            // SAFETY: 调用方保证 utf8 以 \0 结尾
+            unsafe { CStr::from_ptr(utf8) }.to_bytes()
+        } else {
+            // SAFETY: 调用方保证 [utf8, utf8+utf8_len) 可读
+            unsafe { std::slice::from_raw_parts(utf8.cast::<u8>(), utf8_len) }
+        };
+        let Ok(text) = std::str::from_utf8(bytes) else {
+            return AMIKI_ERROR_INVALID_ARGUMENT;
+        };
+        let run = match amiki_text::shape_with_stack(&s.stack, text, size, &text_opts) {
+            Ok(r) => r,
+            // 缺字（策略为 Error 时）是**内容**问题而不是参数问题：明确告诉调用方
+            // "栈里没有这个字"，它据此可以换策略或补字体 —— 比含糊的
+            // INVALID_ARGUMENT 有用得多。其余失败仍按字体数据问题处理。
+            Err(amiki_text::TextError::MissingGlyph(_)) => return AMIKI_ERROR_NOT_FOUND,
+            Err(_) => return AMIKI_ERROR_INVALID_ARGUMENT,
+        };
+        with_paint!(c, paint, |paint| {
+            let stack_ref = &s.stack;
+            c.target()
+                .text_with_stack(&run, amiki_math::Vec2::new(x, y), paint, |fi, id| {
+                    stack_ref.get(fi)?.outline(id).ok()
+                });
+            AMIKI_OK
+        })
+    })
+}
+
 // ---- 离屏层 ----
 
 #[no_mangle]
@@ -1080,6 +1149,90 @@ pub extern "C" fn amiki_font_metrics(
         write_out(out_line_gap, m.line_gap);
     }
     AMIKI_OK
+}
+
+// ---- 字体栈（字体回退，0.7.0）----
+
+/// 创建一个**空**字体栈。失败（分配失败 / panic）返回 NULL。
+#[no_mangle]
+pub extern "C" fn amiki_font_stack_create() -> *mut AmikiFontStack {
+    // 这里不用 `ffi_free!`：它在 panic 时返回 `AMIKI_ERROR_PANIC`（i32），
+    // 而本函数返回指针 —— 用 `unwrap_or(null)` 表达"创建失败"。
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        Box::into_raw(Box::new(AmikiFontStack::new()))
+    }))
+    .unwrap_or(std::ptr::null_mut())
+}
+
+/// 销毁字体栈。传 NULL 是空操作。
+///
+/// **不影响**压栈用过的 `amiki_font`：压栈是克隆（字节用 Arc 共享），
+/// 句柄仍归调用方，该 `amiki_font_destroy` 还得调。
+#[no_mangle]
+pub extern "C" fn amiki_font_stack_destroy(stack: *mut AmikiFontStack) {
+    if stack.is_null() {
+        return;
+    }
+    // SAFETY: 调用方保证指针来自 `amiki_font_stack_create` 且未被销毁
+    drop(unsafe { Box::from_raw(stack) });
+}
+
+/// 把一个字体压入栈（**追加**：顺序即优先级，先压的先赢）。
+#[no_mangle]
+pub extern "C" fn amiki_font_stack_push(
+    stack: *mut AmikiFontStack,
+    font: *const AmikiFont,
+) -> i32 {
+    if font.is_null() {
+        return AMIKI_ERROR_INVALID_ARGUMENT;
+    }
+    ffi!(stack, |s| {
+        // SAFETY: 已判空
+        let f = unsafe { &*font };
+        if let Err(r) = f.poison.check() {
+            return r;
+        }
+        // 克隆 `Font` 很便宜：字体字节在 `Arc` 里共享，这里不复制那几 MB。
+        s.stack.push(f.font.clone());
+        AMIKI_OK
+    })
+}
+
+/// 查询**第一个**含该码点的字体下标（0 起）。
+///
+/// 都不含时返回 `AMIKI_ERROR_NOT_FOUND`（并且不写出参）。
+/// `codepoint` 不是合法标量值（代理区 / > U+10FFFF）⇒ `AMIKI_ERROR_INVALID_ARGUMENT`。
+#[no_mangle]
+pub extern "C" fn amiki_font_stack_resolve(
+    stack: *const AmikiFontStack,
+    codepoint: u32,
+    out_index: *mut u32,
+) -> i32 {
+    if stack.is_null() {
+        return AMIKI_ERROR_INVALID_ARGUMENT;
+    }
+    // SAFETY: 已判空
+    let s = unsafe { &*stack };
+    if let Err(r) = s.poison.check() {
+        return r;
+    }
+    let Some(c) = char::from_u32(codepoint) else {
+        return AMIKI_ERROR_INVALID_ARGUMENT;
+    };
+    match s.stack.resolve(c) {
+        Some(i) => {
+            // SAFETY: out 可为 NULL（header 契约）
+            unsafe { write_out(out_index, i as u32) };
+            AMIKI_OK
+        }
+        None => AMIKI_ERROR_NOT_FOUND,
+    }
+}
+
+/// `amiki_text_options` 的默认值（与 header 里写的三个默认值一致）。
+#[no_mangle]
+pub extern "C" fn amiki_text_options_default() -> AmikiTextOptions {
+    AmikiTextOptions::default_options()
 }
 
 // ---- 渐变 ----

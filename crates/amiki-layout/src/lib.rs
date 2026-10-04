@@ -39,7 +39,193 @@
 
 use amiki_math::Vec2;
 use amiki_scene::TextRun;
-use amiki_text::{shape, Font, FontMetrics};
+use amiki_text::{shape, shape_with_stack, Font, FontMetrics, FontStack, TextOptions};
+
+/// 排版过程需要的"字体能力"。
+///
+/// 抽这一层是为了让**贪心断行的主循环只有一份**：单字体与字体栈各自实现这 4 个方法，
+/// 其余（段落切分、行高、基线、对齐、溢出标记）完全共用 —— 否则两套排版代码
+/// 迟早会在某个边界上不一致。
+trait FontProvider {
+    /// 行高与基线用谁的度量。
+    ///
+    /// 字体栈取**第一个**字体（顺序即优先级）：混合串里拉丁与汉字的高度不同，
+    /// 这里不做"取最大值"的隐式合并，因为那会让行高随内容变化（同字号不同文本
+    /// 行高不同，界面会抖）。需要别的规则请显式传单字体或自己调 `line_spacing`。
+    fn metrics(&self) -> Result<FontMetrics, LayoutError>;
+    /// 断行：返回每行的原文切片与**段内**字节范围。
+    ///
+    /// 返回的切片借用 `para`（不是 `self`），因此显式标注生命周期。
+    fn break_lines<'a>(
+        &self,
+        para: &'a str,
+        opts: &LayoutOptions,
+        overflow: &mut bool,
+    ) -> Result<Vec<(&'a str, std::ops::Range<usize>)>, LayoutError>;
+    /// shaping 一行（位置为 em 单位）。
+    fn shape_line(&self, text: &str, size: f32) -> Result<TextRun, LayoutError>;
+    /// 行宽（末字形位置 + **其所属字体**的前进量）。
+    fn line_width(&self, run: &TextRun, size: f32) -> f32;
+}
+
+/// 单字体（老路径）。
+struct SingleFont<'a>(&'a Font);
+
+impl FontProvider for SingleFont<'_> {
+    fn metrics(&self) -> Result<FontMetrics, LayoutError> {
+        Ok(self.0.metrics()?)
+    }
+
+    fn break_lines<'a>(
+        &self,
+        para: &'a str,
+        opts: &LayoutOptions,
+        overflow: &mut bool,
+    ) -> Result<Vec<(&'a str, std::ops::Range<usize>)>, LayoutError> {
+        Ok(greedy_break(self.0, para, opts, overflow))
+    }
+
+    fn shape_line(&self, text: &str, size: f32) -> Result<TextRun, LayoutError> {
+        Ok(shape(self.0, text, size)?)
+    }
+
+    fn line_width(&self, run: &TextRun, size: f32) -> f32 {
+        measure_run(self.0, run, size)
+    }
+}
+
+/// 字体栈（字体回退）。
+struct StackFonts<'a> {
+    stack: &'a FontStack,
+    text_opts: &'a TextOptions,
+}
+
+impl FontProvider for StackFonts<'_> {
+    fn metrics(&self) -> Result<FontMetrics, LayoutError> {
+        let first = self
+            .stack
+            .get(0)
+            .ok_or_else(|| LayoutError::Text("字体栈为空".into()))?;
+        Ok(first.metrics()?)
+    }
+
+    fn break_lines<'a>(
+        &self,
+        para: &'a str,
+        opts: &LayoutOptions,
+        overflow: &mut bool,
+    ) -> Result<Vec<(&'a str, std::ops::Range<usize>)>, LayoutError> {
+        greedy_break_with_stack(self.stack, para, opts, self.text_opts, overflow)
+    }
+
+    fn shape_line(&self, text: &str, size: f32) -> Result<TextRun, LayoutError> {
+        Ok(shape_with_stack(self.stack, text, size, self.text_opts)?)
+    }
+
+    fn line_width(&self, run: &TextRun, size: f32) -> f32 {
+        measure_run_with_stack(self.stack, run, size)
+    }
+}
+
+/// 对一段文本做排版。
+///
+/// `text` 中的 `\n` 强制换行；`max_width` 为 `INFINITY` 时不自动折行。
+pub fn layout(
+    font: &Font,
+    text: &str,
+    opts: &LayoutOptions,
+) -> Result<LayoutResult, LayoutError> {
+    layout_impl(&SingleFont(font), text, opts)
+}
+
+/// **字体回退**版 [`layout`]：一段文本里不同字符可以由不同字体渲染。
+///
+/// - 逐字符解析走 [`FontStack::resolve`]（顺序即优先级），断行/禁则/对齐逻辑与
+///   单字体路径**完全共用**；
+/// - 行高与基线取**栈里第一个字体**的度量（顺序即优先级，不做"取最大值"的隐式合并）；
+/// - 缺字默认报错（[`TextOptions::default`]）。想用 `.notdef` 兜底或跳过，
+///   请用 [`layout_with_stack_policy`]。
+///
+/// `stack` 只有一个字体时**直接走老的 [`layout`]**，结果逐字节一致。
+pub fn layout_with_stack(
+    stack: &FontStack,
+    text: &str,
+    opts: &LayoutOptions,
+) -> Result<LayoutResult, LayoutError> {
+    layout_with_stack_policy(stack, text, opts, &TextOptions::default())
+}
+
+/// 同 [`layout_with_stack`]，但可指定缺字策略等 shaping 选项。
+pub fn layout_with_stack_policy(
+    stack: &FontStack,
+    text: &str,
+    opts: &LayoutOptions,
+    text_opts: &TextOptions,
+) -> Result<LayoutResult, LayoutError> {
+    if stack.is_empty() {
+        return Err(LayoutError::Text("字体栈为空".into()));
+    }
+    // 单字体栈 = 老路径（逐字节一致，也让"只有一个字体"的调用方零成本）
+    if stack.len() == 1 {
+        return layout(stack.get(0).expect("len == 1"), text, opts);
+    }
+    layout_impl(&StackFonts { stack, text_opts }, text, opts)
+}
+
+/// 排版主循环：单字体与字体栈共用。
+fn layout_impl<P: FontProvider>(
+    p: &P,
+    text: &str,
+    opts: &LayoutOptions,
+) -> Result<LayoutResult, LayoutError> {
+    if text.is_empty() {
+        return Ok(LayoutResult { lines: Vec::new(), size: Vec2::ZERO, overflow: false });
+    }
+    let metrics: FontMetrics = p.metrics()?;
+    let line_h = metrics.line_height() * opts.line_spacing * opts.size;
+    let baseline_in_line = metrics.ascent * opts.size;
+
+    let mut lines: Vec<Line> = Vec::new();
+    let mut overflow = false;
+
+    // 逐段（以 \n 分段）；段内贪心断行
+    let mut para_start = 0usize;
+    let mut cursor_y = 0.0f32;
+    for para in text.split('\n') {
+        let para_len = para.len();
+        let breaks = p.break_lines(para, opts, &mut overflow)?;
+
+        for (line_text, range) in breaks {
+            let run = p.shape_line(line_text, opts.size)?;
+            // 行宽 = 末字形位置 + 其前进量（更准确；shaping 已含 kerning）
+            let width = p.line_width(&run, opts.size);
+            let x = match opts.align {
+                Align::Left => 0.0,
+                Align::Center => (opts.max_width - width) / 2.0,
+                Align::Right => opts.max_width - width,
+            };
+            lines.push(Line {
+                run,
+                baseline: Vec2::new(x, cursor_y + baseline_in_line),
+                width,
+                text_range: (para_start + range.start)..(para_start + range.end),
+            });
+            cursor_y += line_h;
+        }
+        para_start += para_len + 1; // +1 吃掉 '\n'
+        if opts.paragraph_spacing > 0.0 && para_start <= text.len() {
+            cursor_y += opts.paragraph_spacing;
+        }
+    }
+
+    let max_line_w = lines.iter().map(|l| l.width).fold(0.0f32, f32::max);
+    let total_h = if lines.is_empty() { 0.0 } else { cursor_y };
+    Ok(LayoutResult {
+        lines,
+        size: Vec2::new(max_line_w, total_h),
+        overflow,
+    })
+}
 
 /// 排版错误。
 #[derive(Debug)]
@@ -139,8 +325,9 @@ fn kinsoku_forbids_break(before: char, after: char) -> bool {
 /// - 若可断点全被禁则否决，退回**最后一个可断点**（禁则不是硬约束）；
 /// - `false` 表示本行根本没有可断点（调用方走"不可断片段"的溢出路径）。
 ///
-/// 抽成**纯函数**是为了可测：禁则只与字符有关、与字体无关，
-/// 而这个仓库里没有 CJK 字体，靠端到端排版是验证不了它的。
+/// 抽成**纯函数**是为了可测：禁则只与字符有关、与字体无关。
+/// （端到端的中文排版另有 `tests/layout.rs` 与 `tests/stack_layout.rs` 覆盖，
+/// 它们用 `assets/fonts/NotoSansSC-Regular.ttf`。）
 fn pick_break(kinds: &[(BreakKind, char)], start: usize, end: usize) -> (Option<usize>, bool) {
     let mut any: Option<usize> = None;
     let mut kinsoku_ok: Option<usize> = None;
@@ -240,63 +427,6 @@ impl LayoutResult {
     }
 }
 
-/// 对一段文本做排版。
-///
-/// `text` 中的 `\n` 强制换行；`max_width` 为 `INFINITY` 时不自动折行。
-pub fn layout(
-    font: &Font,
-    text: &str,
-    opts: &LayoutOptions,
-) -> Result<LayoutResult, LayoutError> {
-    if text.is_empty() {
-        return Ok(LayoutResult { lines: Vec::new(), size: Vec2::ZERO, overflow: false });
-    }
-    let metrics: FontMetrics = font.metrics()?;
-    let line_h = metrics.line_height() * opts.line_spacing * opts.size;
-    let baseline_in_line = metrics.ascent * opts.size;
-
-    let mut lines: Vec<Line> = Vec::new();
-    let mut overflow = false;
-
-    // 逐段（以 \n 分段）；段内贪心断行
-    let mut para_start = 0usize;
-    let mut cursor_y = 0.0f32;
-    for para in text.split('\n') {
-        let para_len = para.len();
-        let breaks = greedy_break(font, para, opts, &mut overflow);
-
-        for (line_text, range) in breaks {
-            let run = shape(font, line_text, opts.size)?;
-            // 行宽 = 末字形位置 + 其前进量（更准确；shaping 已含 kerning）
-            let width = measure_run(font, &run, opts.size);
-            let x = match opts.align {
-                Align::Left => 0.0,
-                Align::Center => (opts.max_width - width) / 2.0,
-                Align::Right => opts.max_width - width,
-            };
-            lines.push(Line {
-                run,
-                baseline: Vec2::new(x, cursor_y + baseline_in_line),
-                width,
-                text_range: (para_start + range.start)..(para_start + range.end),
-            });
-            cursor_y += line_h;
-        }
-        para_start += para_len + 1; // +1 吃掉 '\n'
-        if opts.paragraph_spacing > 0.0 && para_start <= text.len() {
-            cursor_y += opts.paragraph_spacing;
-        }
-    }
-
-    let max_line_w = lines.iter().map(|l| l.width).fold(0.0f32, f32::max);
-    let total_h = if lines.is_empty() { 0.0 } else { cursor_y };
-    Ok(LayoutResult {
-        lines,
-        size: Vec2::new(max_line_w, total_h),
-        overflow,
-    })
-}
-
 /// 用 shaping 结果测行宽：末字形位置 + 其前进量。
 ///
 /// 不用逐字符累加 advance —— 那样会丢掉 kerning 与连字带来的宽度变化。
@@ -304,6 +434,20 @@ fn measure_run(font: &Font, run: &TextRun, size: f32) -> f32 {
     let Some(last) = run.glyphs.last() else { return 0.0 };
     let adv = font.advance(last.id).unwrap_or(0.0);
     (last.x + adv) * size
+}
+
+/// 字体回退版 [`measure_run`]：前进量必须查**该字形所属的字体**。
+fn measure_run_with_stack(stack: &FontStack, run: &TextRun, size: f32) -> f32 {
+    let Some(last) = run.glyphs.last() else { return 0.0 };
+    (last.x + advance_of(stack, last.font_index, last.id)) * size
+}
+
+/// 某个字形在**其所属字体**里的前进量（em）；查不到按 0 处理（与老路径一致）。
+fn advance_of(stack: &FontStack, font_index: usize, glyph: u32) -> f32 {
+    stack
+        .get(font_index)
+        .and_then(|f| f.advance(glyph).ok())
+        .unwrap_or(0.0)
 }
 
 /// 预处理：每个字符的 `(字节偏移, 字节长度, 其后断点类型)`，
@@ -380,6 +524,49 @@ fn measure_chars(font: &Font, para: &str, size: f32) -> CharMetrics {
     CharMetrics { chars, prefix }
 }
 
+/// 字体回退版 [`measure_chars`]：前缀宽度同样**来自 shaping**（不是逐字符累加），
+/// 区别只是 shaping 走字体栈、推进量按各自字体查。
+///
+/// 与单字体路径的差异：shaping 失败**直接返回错误**（栈路径的失败几乎只有
+/// "缺字且策略为 Error"这一种，那正是调用方要看的结果）。单字体路径保留
+/// "回退到逐字符 advance 并打日志"的老行为，以免改变既有输出。
+fn measure_chars_with_stack(
+    stack: &FontStack,
+    para: &str,
+    size: f32,
+    text_opts: &TextOptions,
+) -> Result<CharMetrics, LayoutError> {
+    let mut chars = Vec::new();
+    let mut prev_cjk = false;
+    for (i, c) in para.char_indices() {
+        let kind = break_kind_after(c, prev_cjk);
+        prev_cjk = is_cjk(c);
+        chars.push((i, c.len_utf8(), kind, c));
+    }
+
+    // 字号传 1.0：位置直接是 em，与单字体路径同口径（后面再乘 size）
+    let run = shape_with_stack(stack, para, 1.0, text_opts)?;
+    let mut prefix = vec![0.0f32; chars.len() + 1];
+    if !run.glyphs.is_empty() {
+        let last = run.glyphs[run.glyphs.len() - 1];
+        let end_pen = (last.x + advance_of(stack, last.font_index, last.id)) * size;
+        let mut gi = 0usize;
+        for (k, &(off, _, _, _)) in chars.iter().enumerate() {
+            let off = off as u32;
+            while gi < run.glyphs.len() && run.glyphs[gi].cluster < off {
+                gi += 1;
+            }
+            prefix[k] = if gi < run.glyphs.len() {
+                run.glyphs[gi].x * size
+            } else {
+                end_pen
+            };
+        }
+        prefix[chars.len()] = end_pen;
+    }
+    Ok(CharMetrics { chars, prefix })
+}
+
 impl CharMetrics {
     fn n(&self) -> usize {
         self.chars.len()
@@ -425,18 +612,43 @@ fn greedy_break<'a>(
     opts: &LayoutOptions,
     overflow: &mut bool,
 ) -> Vec<(&'a str, std::ops::Range<usize>)> {
-    let mut out = Vec::new();
     if para.is_empty() {
         // 空段仍占一行（保持 \n\n 的空行语义）
-        out.push(("", 0..0));
-        return out;
+        return vec![("", 0..0)];
     }
     if opts.max_width.is_infinite() {
-        out.push((para, 0..para.len()));
-        return out;
+        return vec![(para, 0..para.len())];
     }
-
     let m = measure_chars(font, para, opts.size);
+    greedy_break_with_metrics(para, opts, &m, overflow)
+}
+
+/// 字体回退版 [`greedy_break`]：度量换成字体栈，**断行主循环完全共用**。
+fn greedy_break_with_stack<'a>(
+    stack: &FontStack,
+    para: &'a str,
+    opts: &LayoutOptions,
+    text_opts: &TextOptions,
+    overflow: &mut bool,
+) -> Result<Vec<(&'a str, std::ops::Range<usize>)>, LayoutError> {
+    if para.is_empty() {
+        return Ok(vec![("", 0..0)]);
+    }
+    if opts.max_width.is_infinite() {
+        return Ok(vec![(para, 0..para.len())]);
+    }
+    let m = measure_chars_with_stack(stack, para, opts.size, text_opts)?;
+    Ok(greedy_break_with_metrics(para, opts, &m, overflow))
+}
+
+/// 真正的贪心主循环（与字体无关，只看度量结果）。
+fn greedy_break_with_metrics<'a>(
+    para: &'a str,
+    opts: &LayoutOptions,
+    m: &CharMetrics,
+    overflow: &mut bool,
+) -> Vec<(&'a str, std::ops::Range<usize>)> {
+    let mut out = Vec::new();
     let n = m.n();
     let mut start = 0usize; // 当前行的起始字符下标
 
@@ -499,9 +711,9 @@ mod kinsoku_tests {
 
     /// 把字符串变成 `pick_break` 需要的 `(断点类型, 字符)` 数组。
     ///
-    /// 这里**不涉及字体** —— 禁则只与字符有关，所以能在没有 CJK 字体的
-    /// 仓库里被测到。端到端的中文排版验证仍需要一份 CJK 字体，
-    /// 那是 `assets/fonts/` 里目前缺的东西。
+    /// 这里**不涉及字体** —— 禁则只与字符有关，所以这一层能在不加载任何字体的情况下
+    /// 被测到；端到端的中文排版另有 `tests/layout.rs` 与 `tests/stack_layout.rs`
+    /// （用 `assets/fonts/NotoSansSC-Regular.ttf`）。
     fn kinds(text: &str) -> Vec<(BreakKind, char)> {
         let mut out = Vec::new();
         let mut prev_cjk = false;

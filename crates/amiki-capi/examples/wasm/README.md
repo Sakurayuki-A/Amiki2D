@@ -15,10 +15,11 @@ build.cmd
 ```
 [3/3] running the Node demo ...
 
-Amiki2D 0.6.1-alpha（wasm，965.9 KB）
+Amiki2D 0.7.0-alpha（wasm，987.9 KB）
 后端：GPU 不可用（BackendUnavailable），用 CPU
 后端：CPU（CPU）
 字体：..\..\..\..\assets\fonts\Inter-Regular.ttf
+字体：..\..\..\..\assets\fonts\NotoSansSC-Regular.ttf
 已写出 amiki_wasm_demo.bmp（640×400，1024000 字节）
 越界枚举被正确拒绝：invalid argument
 完成
@@ -35,18 +36,19 @@ cargo build -p amiki-capi --profile wasm-release \
 node minimal.js target/wasm32-unknown-unknown/wasm-release/amiki2d.wasm
 ```
 
-## 体积：**965.9 KB**
+## 体积：**987.9 KB**
 
 这是这一版最需要注意的数字。同一个模块：
 
 | 构建 | 体积 |
 |---|---|
 | `--profile release`（`debug = true`） | **11.7 MB** |
-| `--profile wasm-release`（`debug = false`） | **965.9 KB** |
+| `--profile wasm-release`（`debug = false`） | **987.9 KB** |
 
 > **历史**：0.5.0 首次落地时是 **950.7 KB**；0.6.0 把 mipmap 的链生成与
-> sRGB 查表加进 `amiki-scene`（wasm 构建包含它），模块 **+15 KB**。
-> 两个数字都对，只是属于不同版本 —— 引用时请带上版本号。
+> sRGB 查表加进 `amiki-scene`（wasm 构建包含它），模块 **+15 KB**；
+> 0.7.0 加字体回退（`FontStack` 与配套解析/缓存），模块 **+22 KB**。
+> 几个数字都对，只是属于不同版本 —— 引用时请带上版本号。
 
 **主导因素是 `debug = false`**，差 12 倍。仓库根 `Cargo.toml` 里的
 `[profile.release] debug = true` 是为**原生 profiling** 加的，在 wasm 里

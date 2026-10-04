@@ -235,8 +235,9 @@ fn layout_width_includes_kerning() {
 ///
 /// # 字体从哪来
 ///
-/// 仓库里目前**没有 CJK 字体**（只有 Inter，它不含汉字）。这里按优先级找：
-/// 1. `assets/fonts/` 下的常见 OFL 中文字体（将来入库后自动生效）
+/// 仓库里已经有 CJK 字体了（`assets/fonts/NotoSansSC-Regular.ttf`，OFL 1.1）。
+/// 这里仍按优先级找，兼容别的文件名：
+/// 1. `assets/fonts/` 下的常见 OFL 中文字体
 /// 2. 系统字体（Windows 的雅黑/黑体等）—— **仅用于本地验证，不入库**
 ///    （系统字体不是 OFL，不能进仓库）
 ///

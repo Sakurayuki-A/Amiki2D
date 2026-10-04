@@ -613,11 +613,69 @@ impl GlyphOutline {
     }
 }
 
+/// 字体的**内部稳定标识** —— 不是路径，也不是"栈里的下标"。
+///
+/// # 为什么必须是内部 ID
+///
+/// 它有两个用途：字形缓存的键（见 [`GlyphKey`]），以及"是不是同一个字体"的判定。
+/// 路径会变（换机器、换部署目录）、下标会变（栈顺序调整），拿它们做键会让缓存
+/// **悄悄命中错误的字形**（画出来是另一个字体的字）。所以这里用字体**自己声明的**
+/// 标识，按优先级取第一个可用的：
+///
+/// 1. PostScript 名（`name` 表 ID 6）—— 字体厂商给的标准唯一名
+/// 2. Unique ID（ID 3）
+/// 3. Full name（ID 4）
+/// 4. Family + Subfamily（ID 1 + 2）
+/// 5. 都没有时退到**字体字节的哈希**（同一份字节仍稳定，但两份"内容相同的不同文件"会撞成一个）
+///
+/// 计算是 FNV-1a 64，并带一个**来源标签前缀**（`ps:` / `uid:` / …），
+/// 因此不同来源不会互相碰撞。
+///
+/// 定义在 `amiki-scene` 而不是 `amiki-text`：`GlyphKey` 在这里，
+/// 而依赖方向是 `text → scene`（不能反过来）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct FontId(u64);
+
+impl FontId {
+    /// 未知/未指定字体：**旧单字体路径**的缓存键用它（那时调用方只给字形 id，
+    /// 拿不到字体身份）。真实字体 ID 永远不是 0。
+    pub const UNKNOWN: FontId = FontId(0);
+
+    pub const fn from_bits(bits: u64) -> FontId {
+        FontId(bits)
+    }
+
+    pub const fn bits(self) -> u64 {
+        self.0
+    }
+}
+
+impl std::fmt::Display for FontId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.0 == 0 {
+            write!(f, "FontId(unknown)")
+        } else {
+            write!(f, "FontId({:016x})", self.0)
+        }
+    }
+}
+
 /// 一个已就位的字形：id 用于缓存，位置以**em 单位**给出（基线原点向左为 0）。
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct PositionedGlyph {
     /// 字形标识（调用方定义：字体内 glyph id 即可），供缓存分键
     pub id: u32,
+    /// 该字形来自**字体栈里的第几个字体**。
+    ///
+    /// 单字体路径恒为 0（老代码仍用 [`TextRun::push_glyph`]，行为不变）。
+    /// 字体回退场景下，`expand` 必须靠它找到正确的字体取轮廓 ——
+    /// 同一个 `id` 在不同字体里是完全不同的字形。
+    pub font_index: usize,
+    /// 该字形在原文中的**字符字节偏移**（rustybuzz 的 cluster）。
+    ///
+    /// 连字会把多个字符映射到同一个 cluster —— 这正是断行需要的语义（连字不可拆）。
+    /// 旧单字体路径不填（0）。
+    pub cluster: u32,
     /// 基线原点（em 单位）
     pub x: f32,
     pub y: f32,
@@ -638,20 +696,37 @@ impl TextRun {
         TextRun { size, glyphs: Vec::new() }
     }
 
+    /// 追加一个字形（**旧入口**：字体下标 0、不带 cluster，行为与 0.6.1 一致）。
     pub fn push_glyph(&mut self, id: u32, x: f32, y: f32) -> &mut Self {
-        self.glyphs.push(PositionedGlyph { id, x, y });
+        self.push_glyph_in(0, id, x, y, 0)
+    }
+
+    /// 追加一个字形，并指明它来自哪个字体、对应原文的哪个字节偏移。
+    pub fn push_glyph_in(
+        &mut self,
+        font_index: usize,
+        id: u32,
+        x: f32,
+        y: f32,
+        cluster: u32,
+    ) -> &mut Self {
+        self.glyphs.push(PositionedGlyph { id, font_index, cluster, x, y });
         self
     }
 }
 
-/// 字形轮廓缓存键：`(glyph id, 量化后的字号)`。
+/// 字形轮廓缓存键：`(字体, glyph id, 量化后的字号)`。
 ///
 /// 为什么必须缓存：一个字形会被成百上千次复用（每个字符位置一次），
 /// 每次都重新构造 `Path` 会让 CPU 侧成为瓶颈。
 /// 为什么按**量化**字号分键：同一段文本常以若干离散字号出现，
 /// 量化后命中率远高于精确浮点相等，且误差只是一次查表偏移。
+/// 为什么带**字体 ID**：同一个 glyph id 在不同字体里是不同字形，
+/// 不带字体维度就会跨字体误命中（字体回退场景下必然发生）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct GlyphKey {
+    /// 字体内部 ID（旧路径为 [`FontId::UNKNOWN`]）
+    pub font_id: FontId,
     pub id: u32,
     /// 字号 × 16 后取整（1/16 px 粒度）
     pub size_q: u32,
@@ -659,8 +734,15 @@ pub struct GlyphKey {
 
 impl GlyphKey {
     pub const SIZE_QUANT: f32 = 16.0;
+
+    /// 旧入口：不带字体身份（等价于 0.6.1 的键）。
     pub fn new(id: u32, size: f32) -> GlyphKey {
-        GlyphKey { id, size_q: (size.max(0.0) * Self::SIZE_QUANT).round() as u32 }
+        GlyphKey::with_font(FontId::UNKNOWN, id, size)
+    }
+
+    /// 带字体身份的键（字体回退路径用它）。
+    pub fn with_font(font_id: FontId, id: u32, size: f32) -> GlyphKey {
+        GlyphKey { font_id, id, size_q: (size.max(0.0) * Self::SIZE_QUANT).round() as u32 }
     }
 }
 
@@ -676,9 +758,21 @@ pub fn expand_text_run(
     run: &TextRun,
     mut lookup: impl FnMut(u32) -> Option<GlyphOutline>,
 ) -> Vec<(Path, Affine)> {
+    expand_text_run_with(run, |_font_index, id| lookup(id))
+}
+
+/// 字体回退版 [`expand_text_run`]：`lookup` 同时收到**字体下标**与字形 id。
+///
+/// 多字体的一段文本里，同一个 `glyph id` 在不同字体中是**不同字形**，
+/// 因此取轮廓必须带上 [`PositionedGlyph::font_index`]；`lookup` 通常实现为
+/// `|fi, id| stack.get(fi)?.outline(id).ok()`。
+pub fn expand_text_run_with(
+    run: &TextRun,
+    mut lookup: impl FnMut(usize, u32) -> Option<GlyphOutline>,
+) -> Vec<(Path, Affine)> {
     let mut out = Vec::with_capacity(run.glyphs.len());
     for g in &run.glyphs {
-        let Some(o) = lookup(g.id) else { continue };
+        let Some(o) = lookup(g.font_index, g.id) else { continue };
         if o.els.is_empty() {
             continue;
         }
@@ -741,9 +835,27 @@ impl TextCache {
     where
         F: FnMut(u32) -> Option<GlyphOutline>,
     {
+        self.expand_with(run, |_| FontId::UNKNOWN, |_fi, id| outline(id))
+    }
+
+    /// 字体回退版 [`TextCache::expand`]：缓存键带**字体内部 ID**。
+    ///
+    /// 两个闭包分开是有意的：`font_of` 很便宜（`stack.get(i).map(Font::id)`），
+    /// 而键必须在查缓存**之前**算出来；`outline` 才是贵的那个，只在未命中时调用。
+    /// 若只给一个闭包，就得为了拿字体 ID 而先把轮廓提出来 —— 缓存也就白做了。
+    pub fn expand_with<FF, FO>(
+        &mut self,
+        run: &TextRun,
+        mut font_of: FF,
+        mut outline: FO,
+    ) -> Vec<(Path, Affine)>
+    where
+        FF: FnMut(usize) -> FontId,
+        FO: FnMut(usize, u32) -> Option<GlyphOutline>,
+    {
         let mut out = Vec::with_capacity(run.glyphs.len());
         for g in &run.glyphs {
-            let key = GlyphKey::new(g.id, run.size);
+            let key = GlyphKey::with_font(font_of(g.font_index), g.id, run.size);
             // 命中：线性查已缩放轮廓
             let idx = self.entries.iter().position(|(k, _)| *k == key);
             let path = match idx {
@@ -753,7 +865,7 @@ impl TextCache {
                 }
                 None => {
                     self.misses += 1;
-                    let Some(o) = outline(g.id) else { continue };
+                    let Some(o) = outline(g.font_index, g.id) else { continue };
                     if o.els.is_empty() {
                         continue;
                     }
@@ -1782,6 +1894,82 @@ mod tests {
             _ => None,
         });
         assert_eq!(paths.len(), 2, "缺失轮廓的字形应被跳过而不是 panic");
+    }
+
+    /// 字体回退（0.7.0）：展开时要按**字体下标**取轮廓 ——
+    /// 同一个 glyph id 在不同字体里是不同字形。
+    #[test]
+    fn expand_text_run_with_passes_font_index_to_lookup() {
+        let mut run = TextRun::new(20.0);
+        run.push_glyph_in(0, 1, 0.0, 0.0, 0); // 字体 0 的字形 1
+        run.push_glyph_in(1, 1, 1.0, 0.0, 3); // 字体 1 的**同一个**字形 id
+
+        let mut seen: Vec<(usize, u32)> = Vec::new();
+        let paths = expand_text_run_with(&run, |fi, id| {
+            seen.push((fi, id));
+            // 两个字体对同一个 id 给出**不同**轮廓
+            match fi {
+                0 => Some(bar_glyph()),
+                _ => Some(box_glyph()),
+            }
+        });
+        assert_eq!(seen, vec![(0, 1), (1, 1)], "lookup 必须收到 (字体下标, 字形 id)");
+        assert_eq!(paths.len(), 2);
+        assert_ne!(
+            paths[0].0.els, paths[1].0.els,
+            "同一 glyph id 在两个字体下必须得到不同轮廓（否则等于没做字体回退）"
+        );
+    }
+
+    /// 缓存必须按**字体**分键：同一个 glyph id 换了字体不能命中旧条目。
+    #[test]
+    fn text_cache_separates_fonts() {
+        let mut cache = TextCache::new();
+        let mut run = TextRun::new(20.0);
+        run.push_glyph_in(0, 1, 0.0, 0.0, 0);
+        run.push_glyph_in(1, 1, 1.0, 0.0, 0);
+
+        let fonts = [FontId::from_bits(0xAAAA), FontId::from_bits(0xBBBB)];
+        let mut lookups = 0;
+        let out = cache.expand_with(
+            &run,
+            |fi| fonts[fi],
+            |fi, _id| {
+                lookups += 1;
+                if fi == 0 {
+                    Some(bar_glyph())
+                } else {
+                    Some(box_glyph())
+                }
+            },
+        );
+        assert_eq!(out.len(), 2);
+        assert_eq!(lookups, 2, "不同字体必须各提取一次，不能共用缓存");
+        assert_eq!(cache.misses(), 2);
+        assert_eq!(cache.hits(), 0);
+        assert_ne!(out[0].0.els, out[1].0.els, "两次展开的轮廓必须不同");
+
+        // 同一个字体再展开一次：应当命中
+        let again = cache.expand_with(&run, |fi| fonts[fi], |_fi, _id| {
+            lookups += 1;
+            Some(bar_glyph())
+        });
+        assert_eq!(again.len(), 2);
+        assert_eq!(lookups, 2, "同一字体集合再展开不应重新提取");
+        assert_eq!(cache.hits(), 2);
+    }
+
+    /// **零破坏**：老入口 `GlyphKey::new` 不带字体身份，且量化规则不变。
+    #[test]
+    fn glyph_key_new_keeps_legacy_semantics() {
+        let k = GlyphKey::new(7, 10.0);
+        assert_eq!(k.font_id, FontId::UNKNOWN);
+        assert_eq!(k.id, 7);
+        assert_eq!(k.size_q, 160, "10.0 × 16 = 160");
+        // 带字体身份的键与老键**必须不同**，否则字体回退会跨字体误命中
+        let with = GlyphKey::with_font(FontId::from_bits(42), 7, 10.0);
+        assert_ne!(k, with);
+        assert_eq!(with.size_q, k.size_q);
     }
 
     #[test]

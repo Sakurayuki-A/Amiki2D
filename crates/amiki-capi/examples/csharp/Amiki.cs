@@ -41,6 +41,8 @@ public enum Result
     /// <summary>引擎内部 panic 被捕获 —— 这是引擎的 bug，请上报。</summary>
     Panic = 5,
     Unknown = 6,
+    /// <summary>0.7.0：找得到对象，但里面没有要找的东西（字体栈里没有该字符）。</summary>
+    NotFound = 7,
 }
 
 public enum BlendMode
@@ -270,6 +272,23 @@ internal static partial class Native
                                                          UIntPtr utf8Len,
                                                          float x, float y, float size, Paint paint);
 
+    // ---- 字体栈 / 字体回退（0.7.0）----
+    // `options` 传 NULL 即用 header 承诺的默认值，因此这里不必封送结构体。
+    [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+    internal static extern IntPtr amiki_font_stack_create();
+    [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+    internal static extern void amiki_font_stack_destroy(IntPtr stack);
+    [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+    internal static extern Result amiki_font_stack_push(IntPtr stack, IntPtr font);
+    [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+    internal static extern Result amiki_font_stack_resolve(IntPtr stack, uint codepoint, out uint index);
+    [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+    internal static extern Result amiki_canvas_draw_text_with_stack(IntPtr cv, IntPtr stack,
+                                                                    [MarshalAs(UnmanagedType.LPUTF8Str)] string utf8,
+                                                                    UIntPtr utf8Len,
+                                                                    float x, float y, float size,
+                                                                    Paint paint, IntPtr options);
+
     [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
     internal static extern Result amiki_canvas_begin_layer(IntPtr cv, LayerBounds b, Filter f, float opacity, BlendMode blend);
     [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
@@ -492,6 +511,18 @@ public sealed class Canvas : AmikiHandle
             "amiki_canvas_draw_text");
     }
 
+    /// <summary>
+    /// 用**字体栈**绘制一段文本（字体回退，0.7.0）：不同字符可以由不同字体渲染。
+    /// `options` 为 null 表示用 header 承诺的默认值（缺字则抛 <see cref="AmikiException"/>）。
+    /// </summary>
+    public void DrawTextWithStack(FontStack stack, string text, float x, float y, float size, Paint paint)
+    {
+        AmikiException.Check(
+            Native.amiki_canvas_draw_text_with_stack(DangerousGetHandle(), stack.DangerousGetHandle(),
+                                                     text, UIntPtr.Zero, x, y, size, paint, IntPtr.Zero),
+            "amiki_canvas_draw_text_with_stack");
+    }
+
     public void BeginLayer(LayerBounds b, Filter f, float opacity, BlendMode blend) =>
         AmikiException.Check(Native.amiki_canvas_begin_layer(DangerousGetHandle(), b, f, opacity, blend),
                              "amiki_canvas_begin_layer");
@@ -585,6 +616,46 @@ public sealed class Font : AmikiHandle
     }
 
     protected override void Destroy() => Native.amiki_font_destroy(Handle);
+}
+
+/// <summary>
+/// 有序字体栈（字体回退，0.7.0）：一段文本里不同字符由不同字体渲染。
+/// **顺序即优先级** —— 先 Push 的字体先被选中。
+/// </summary>
+public sealed class FontStack : AmikiHandle
+{
+    private FontStack(IntPtr h) : base(h) { }
+
+    public static FontStack Create()
+    {
+        var h = Native.amiki_font_stack_create();
+        if (h == IntPtr.Zero)
+        {
+            throw new AmikiException(Result.OutOfMemory, "amiki_font_stack_create");
+        }
+        return new FontStack(h);
+    }
+
+    /// <summary>追加一个字体（**拷贝**：Push 之后 Font 句柄仍归调用方）。</summary>
+    public void Push(Font font)
+    {
+        AmikiException.Check(Native.amiki_font_stack_push(DangerousGetHandle(), font.DangerousGetHandle()),
+                             "amiki_font_stack_push");
+    }
+
+    /// <summary>第一个含该码点的字体下标；都不含返回 null。</summary>
+    public uint? Resolve(char c)
+    {
+        var r = Native.amiki_font_stack_resolve(DangerousGetHandle(), c, out var idx);
+        if (r == Result.NotFound)
+        {
+            return null;
+        }
+        AmikiException.Check(r, "amiki_font_stack_resolve");
+        return idx;
+    }
+
+    protected override void Destroy() => Native.amiki_font_stack_destroy(Handle);
 }
 
 public sealed class Gradient : AmikiHandle

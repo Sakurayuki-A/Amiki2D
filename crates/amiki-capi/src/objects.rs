@@ -156,6 +156,22 @@ pub struct AmikiFont {
     pub(crate) poison: Poison,
 }
 
+/// **有序字体栈**（字体回退，0.7.0）。
+///
+/// 与 [`AmikiFont`] 的关系：`amiki_font_stack_push` 把字体**克隆进栈**，
+/// 而 `amiki_text::Font` 内部用 `Arc` 共享字节 —— 所以压栈不复制那几 MB 数据，
+/// 且**句柄仍归调用方**（`amiki_font_destroy` 该调还得调）。
+pub struct AmikiFontStack {
+    pub(crate) stack: amiki_text::FontStack,
+    pub(crate) poison: Poison,
+}
+
+impl AmikiFontStack {
+    pub(crate) fn new() -> AmikiFontStack {
+        AmikiFontStack { stack: amiki_text::FontStack::new(), poison: Poison::default() }
+    }
+}
+
 // ============================================================================
 // 从 `AmikiLayerBounds`（C 值类型）到内部用的转换
 // ============================================================================

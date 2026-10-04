@@ -18,7 +18,7 @@ SHA-256 应等于原生 CPU 参考的哈希（页面里写死）。
 </style>
 </head>
 <body>
-<h2>Amiki2D 0.6.0 WASM（纯 CPU）三浏览器验证</h2>
+<h2>Amiki2D 0.7.0 WASM（纯 CPU）浏览器验证</h2>
 <canvas id="cv" width="640" height="400"></canvas>
 <pre id="log">loading…</pre>
 <div id="result">RUNNING</div>
@@ -49,7 +49,7 @@ window.Buffer = BufferShim;
 <script src="amiki.js"></script>
 <script type="module">
 const { Amiki, Backend, LineCap, LineJoin, BlendMode } = window.module.exports;
-const expectedSha = 'd565cc36c4933865960d48f9ec25f181b7ecd0ddd7cb02ad0d48927f0cc90633';
+const expectedSha = 'fc9482ba147ffd075b06055c95141eee06bec710ce31767c65ce7de58adccb0d';
 const W = 640, H = 400;
 
 const logEl = document.getElementById('log');
@@ -116,17 +116,45 @@ try {
     amiki.drawCircle(cv, 480, 310, 40, amiki.paintSolid(amiki.colorRgb8(255, 210, 90)));
     amiki.endLayer(cv);
     {
-        // 字体走 HTTP 取（与 Node 的相对路径同一份文件）
-        const resp = await fetch('../../../../assets/fonts/Inter-Regular.ttf');
-        if (resp.ok) {
-            const fontBytes = new Uint8Array(await resp.arrayBuffer());
-            const font = amiki.fontCreateFromMemory(fontBytes);
-            amiki.drawText(cv, font, 'Amiki2D C ABI', 40, 120, 42,
-                amiki.paintSolid(amiki.colorRgb8(240, 244, 255)));
-            amiki.fontDestroy(font);
-            log('字体：Inter（HTTP 加载）');
-        } else {
-            log('字体：未找到，跳过文本（会与参考哈希不一致）');
+        // 字体：**内嵌数据优先**（独立版由 make_standalone.py 注入），否则走 HTTP 取。
+        // HTTP 版与独立版因此共用同一段代码，不会因为两边漂移而对不上哈希。
+        // 顺序与参数与 minimal.js 相同：Inter 管拉丁、Noto 管汉字（0.7.0 字体回退）。
+        const specs = [
+            ['Inter-Regular.ttf', typeof FONT_B64 !== 'undefined' ? FONT_B64 : ''],
+            ['NotoSansSC-Regular.ttf', typeof FONT_B64_CJK !== 'undefined' ? FONT_B64_CJK : ''],
+        ];
+        const fonts = [];
+        for (const [name, inlined] of specs) {
+            let bytes = null;
+            if (inlined) {
+                bytes = B64_U8(inlined);
+            } else {
+                const resp = await fetch(`../../../../assets/fonts/${name}`);
+                if (resp.ok) {
+                    bytes = new Uint8Array(await resp.arrayBuffer());
+                }
+            }
+            if (bytes) {
+                fonts.push(amiki.fontCreateFromMemory(bytes));
+                log(`字体：${name}（${inlined ? '内嵌' : 'HTTP 加载'}）`);
+            } else {
+                log(`字体：${name} 未找到（会与参考哈希不一致）`);
+            }
+        }
+        if (fonts.length > 0) {
+            const ink = amiki.paintSolid(amiki.colorRgb8(240, 244, 255));
+            const stack = amiki.fontStackCreate();
+            for (const font of fonts) {
+                amiki.fontStackPush(stack, font);
+            }
+            // 单字体路径：拉丁
+            amiki.drawText(cv, fonts[0], 'Amiki2D C ABI', 40, 120, 42, ink);
+            // 字体回退路径：中英混排（汉字由 Noto 渲染）
+            amiki.drawTextWithStack(cv, stack, '你好 Amiki2D 世界', 40, 180, 32, ink, 0);
+            amiki.fontStackDestroy(stack);
+            for (const font of fonts) {
+                amiki.fontDestroy(font);
+            }
         }
     }
 

@@ -355,6 +355,37 @@ class Amiki {
             this.free(p, bytes.length);
         }
     }
+
+    // ---- 字体栈 / 字体回退（0.7.0）----
+    // `options` 传 0 = NULL，即 header 承诺的默认值（缺字返回 NOT_FOUND）。
+    drawTextWithStack(cv, stack, text, x, y, size, paint, options = 0) {
+        const bytes = Buffer.from(text, 'utf8');
+        const p = this.write(bytes);
+        try {
+            return this._check(
+                this.ex.amiki_canvas_draw_text_with_stack(cv, stack, p, bytes.length, x, y, size,
+                    this._pack('Paint', paint), options),
+                'draw_text_with_stack');
+        } finally {
+            this.free(p, bytes.length);
+        }
+    }
+    fontStackCreate() { return this.ex.amiki_font_stack_create(); }
+    fontStackDestroy(stack) { this.ex.amiki_font_stack_destroy(stack); }
+    fontStackPush(stack, font) {
+        return this._check(this.ex.amiki_font_stack_push(stack, font), 'amiki_font_stack_push');
+    }
+    /** 第一个含该码点的字体下标；都不含返回 null（AMIKI_ERROR_NOT_FOUND）。 */
+    fontStackResolve(stack, codepoint) {
+        const out = this._sretSlot();
+        const r = this.ex.amiki_font_stack_resolve(stack, codepoint, out);
+        if (r === 7 /* AMIKI_ERROR_NOT_FOUND */) {
+            return null;
+        }
+        this._check(r, 'amiki_font_stack_resolve');
+        this._refresh();
+        return this._dv.getUint32(out, true);
+    }
     beginLayer(cv, bounds, filter, opacity, blend) {
         return this._check(
             this.ex.amiki_canvas_begin_layer(cv, this._pack('LayerBounds', bounds),

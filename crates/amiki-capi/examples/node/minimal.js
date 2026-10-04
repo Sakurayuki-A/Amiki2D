@@ -97,29 +97,47 @@ try {
     amiki.check(amiki.native.canvas_end_layer(cv.value), 'canvas_end_layer');
 
     // ---- 文本（字体找不到就跳过）----
-    const candidates = [
-        '../../../../assets/fonts/Inter-Regular.ttf',
-        '../../assets/fonts/Inter-Regular.ttf',
-        'assets/fonts/Inter-Regular.ttf',
-    ];
-    let font = null;
-    for (const p of candidates) {
-        const r = amiki.outCall(amiki.native.font_create_from_file, p);
-        if (r.r === amiki.Result.Ok) {
-            font = r.value;
-            console.log(`字体：${p}`);
-            break;
+    // 两个字体：Inter 管拉丁、Noto Sans SC 管汉字（0.7.0 的字体回退）。
+    // 加载顺序与绘制参数必须与 C / C# 两个示例完全一致 —— 三者输出要逐字节相同。
+    const names = ['Inter-Regular.ttf', 'NotoSansSC-Regular.ttf'];
+    const roots = ['../../../../', '../../', '', '../'];
+    const fonts = [];
+    for (const name of names) {
+        for (const root of roots) {
+            const p = `${root}assets/fonts/${name}`;
+            const r = amiki.outCall(amiki.native.font_create_from_file, p);
+            if (r.r === amiki.Result.Ok) {
+                fonts.push(r.value);
+                console.log(`字体：${p}`);
+                break;
+            }
         }
     }
-    if (font) {
+    if (fonts.length > 0) {
         const outA = [0], outD = [0], outG = [0];
-        amiki.check(amiki.native.font_metrics(font, outA, outD, outG), 'amiki_font_metrics');
+        amiki.check(amiki.native.font_metrics(fonts[0], outA, outD, outG), 'amiki_font_metrics');
         console.log(`字体度量（每 em）：ascent ${outA[0].toFixed(3)} / descent ${outD[0].toFixed(3)} / line_gap ${outG[0].toFixed(3)}`);
+
+        const ink = amiki.native.paint_solid(amiki.native.color_rgb8(240, 244, 255));
+        const stack = amiki.native.font_stack_create();
+        if (!stack) {
+            throw new Error('amiki_font_stack_create 返回 NULL');
+        }
+        for (const font of fonts) {
+            amiki.check(amiki.native.font_stack_push(stack, font), 'amiki_font_stack_push');
+        }
+        // 单字体路径：拉丁（三个示例都走这里，用于逐字节对拍）
         amiki.check(
-            amiki.native.canvas_draw_text(cv.value, font, 'Amiki2D C ABI', 0, 40, 120, 42,
-                amiki.native.paint_solid(amiki.native.color_rgb8(240, 244, 255))),
+            amiki.native.canvas_draw_text(cv.value, fonts[0], 'Amiki2D C ABI', 0, 40, 120, 42, ink),
             'canvas_draw_text');
-        amiki.native.font_destroy(font);
+        // 字体回退路径：中英混排 —— 汉字由 Noto 渲染，调用方不必自己挑字体
+        amiki.check(
+            amiki.native.canvas_draw_text_with_stack(cv.value, stack, '你好 Amiki2D 世界', 0, 40, 180, 32, ink, null),
+            'canvas_draw_text_with_stack');
+        amiki.native.font_stack_destroy(stack);
+        for (const font of fonts) {
+            amiki.native.font_destroy(font);
+        }
     } else {
         console.log('字体：未找到，跳过文本');
     }

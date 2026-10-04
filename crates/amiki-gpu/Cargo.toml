@@ -16,6 +16,9 @@ pollster = { workspace = true }
 [dev-dependencies]
 # 基准套件（§4.5 指标）；关掉 plotters/rayon 保持依赖轻量
 criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support"] }
+# 仅在测试里用：造 CJK 字形的场景（GPU↔CPU 对拍）。
+# 放进 dev-dependencies 是为了**不给渲染器本身引入字体依赖**。
+amiki-text = { path = "../amiki-text" }
 
 [[bench]]
 name = "render"

@@ -303,6 +303,38 @@ impl Canvas {
         }
         self
     }
+
+    /// 绘制一段**已 shaping** 的文本，字形可按**字体下标**取轮廓（字体回退）。
+    ///
+    /// 与 [`Canvas::text`] 的唯一区别：`outline` 同时收到字形所属的**字体下标**
+    /// （[`amiki_scene::PositionedGlyph::font_index`]）。多字体的一段文本里，
+    /// 同一个字形 id 在不同字体中是**不同字形**，取轮廓必须带上它：
+    ///
+    /// ```ignore
+    /// let run = amiki_text::shape_with_stack(&stack, "Hello 世界", 48.0, &opts)?;
+    /// canvas.text_with_stack(&run, origin, paint, |fi, id| stack.get(fi)?.outline(id).ok());
+    /// ```
+    pub fn text_with_stack<F>(
+        &mut self,
+        run: &amiki_scene::TextRun,
+        origin: Vec2,
+        paint: Paint,
+        outline: F,
+    ) -> &mut Self
+    where
+        F: FnMut(usize, u32) -> Option<amiki_scene::GlyphOutline>,
+    {
+        let base = self.transform.then(Affine::translate(origin));
+        let paths = amiki_scene::expand_text_run_with(run, outline);
+        for (path, glyph_t) in paths {
+            self.scene
+                .push_blend(base.then(glyph_t), path, paint.clone(), self.blend);
+            if !self.clip_stack.is_empty() {
+                self.scene.draws.last_mut().unwrap().clips = self.clip_stack.clone();
+            }
+        }
+        self
+    }
 }
 
 /// 便捷入口：GPU 渲染为 RGBA8，GPU 不可用时自动落到 CPU 引擎。

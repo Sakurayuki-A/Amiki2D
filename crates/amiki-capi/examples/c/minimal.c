@@ -200,26 +200,59 @@ int main(void) {
     {
         /* 示例在 crates/amiki-capi/examples/c/ 下运行，字体在仓库根的
          * assets/fonts/ —— 相对路径要往上四级。也试几个常见位置，
-         * 让从别处运行时不至于直接放弃。 */
-        const char *candidates[] = {"../../../../assets/fonts/Inter-Regular.ttf",
-                                    "../../assets/fonts/Inter-Regular.ttf",
-                                    "assets/fonts/Inter-Regular.ttf",
-                                    "../assets/fonts/Inter-Regular.ttf"};
-        amiki_font *font = NULL;
-        for (size_t i = 0; i < sizeof(candidates) / sizeof(candidates[0]); i++) {
-            if (amiki_font_create_from_file(candidates[i], &font) == AMIKI_OK) {
-                printf("字体：%s\n", candidates[i]);
-                break;
+         * 让从别处运行时不至于直接放弃。
+         *
+         * 两个字体：Inter 管拉丁、Noto Sans SC 管汉字（0.7.0 的字体回退）。
+         * 三个示例（C / C# / Node）加载顺序与绘制参数必须**完全一致**，
+         * 否则三份产物就不是逐字节相同的了。 */
+        const char *names[] = {"Inter-Regular.ttf", "NotoSansSC-Regular.ttf"};
+        const char *roots[] = {"../../../../", "../../", "", "../"};
+        const size_t n_names = sizeof(names) / sizeof(names[0]);
+        const size_t n_roots = sizeof(roots) / sizeof(roots[0]);
+
+        amiki_font *fonts[2] = {NULL, NULL};
+        size_t n_fonts = 0;
+        for (size_t i = 0; i < n_names; i++) {
+            for (size_t j = 0; j < n_roots; j++) {
+                char path[512];
+                snprintf(path, sizeof(path), "%sassets/fonts/%s", roots[j], names[i]);
+                if (amiki_font_create_from_file(path, &fonts[n_fonts]) == AMIKI_OK) {
+                    printf("字体：%s\n", path);
+                    n_fonts++;
+                    break;
+                }
             }
         }
-        if (font) {
+
+        if (n_fonts > 0) {
             float ascent = 0.0f, descent = 0.0f, gap = 0.0f;
-            CHECK(amiki_font_metrics(font, &ascent, &descent, &gap));
+            CHECK(amiki_font_metrics(fonts[0], &ascent, &descent, &gap));
             printf("字体度量（每 em）：ascent %.3f / descent %.3f / line_gap %.3f\n",
                    ascent, descent, gap);
-            CHECK(amiki_canvas_draw_text(cv, font, "Amiki2D C ABI", 0, 40.0f, 120.0f, 42.0f,
-                                         amiki_paint_solid(amiki_color_rgb8(240, 244, 255))));
-            amiki_font_destroy(font);
+
+            amiki_font_stack *stack = amiki_font_stack_create();
+            if (!stack) {
+                fprintf(stderr, "创建字体栈失败\n");
+                return 1;
+            }
+            const amiki_paint ink = amiki_paint_solid(amiki_color_rgb8(240, 244, 255));
+            for (size_t i = 0; i < n_fonts; i++) {
+                CHECK(amiki_font_stack_push(stack, fonts[i]));
+            }
+            /* 单字体路径：拉丁（三个示例都走这里，用于逐字节对拍） */
+            CHECK(amiki_canvas_draw_text(cv, fonts[0], "Amiki2D C ABI", 0, 40.0f, 120.0f, 42.0f, ink));
+            /* 字体回退路径：中英混排 —— 汉字由 Noto 渲染，调用方不必自己挑字体。
+             * options 传 NULL = header 承诺的默认值。 */
+            const amiki_result r = amiki_canvas_draw_text_with_stack(
+                cv, stack, "你好 Amiki2D 世界", 0, 40.0f, 180.0f, 32.0f, ink, NULL);
+            if (r != AMIKI_OK) {
+                fprintf(stderr, "字体回退绘制失败：%s\n", amiki_result_string(r));
+                return 1;
+            }
+            amiki_font_stack_destroy(stack);
+            for (size_t i = 0; i < n_fonts; i++) {
+                amiki_font_destroy(fonts[i]);
+            }
         } else {
             printf("字体：未找到，跳过文本（示例不假设机器上有哪个字体）\n");
         }

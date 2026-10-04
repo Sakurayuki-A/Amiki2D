@@ -9,6 +9,11 @@ use amiki_math::{Affine, CubicBez, QuadBez, Vec2};
 
 mod damage;
 pub use damage::{changed_bounds, draw_device_bounds, edit_damage};
+mod mipmap;
+pub use mipmap::{
+    compute_lod, generate_mip_chain, generate_padded_mip_levels, mip_level_count, MipChain,
+    MipLevel,
+};
 mod stroke;
 pub use stroke::{flatten_path, stroke_path, stroke_polyline, LineCap, LineJoin, StrokeStyle};
 mod tone;
@@ -344,10 +349,24 @@ pub struct Image {
     pub width: u32,
     pub height: u32,
     pub data: Vec<u8>,
+    /// mip 链（level 1 起，level 0 是 [`Image::data`] 自身）。
+    ///
+    /// `None` = 不用 mipmap：两侧都只走双线性，行为与 0.5.0 完全一致。
+    /// 由 [`Image::from_rgba8_with_mipmap`] 生成；mipmap 是**运行时派生物**，
+    /// 不进 AMK1 编码流（编码/解码都只碰原图）。
+    ///
+    /// # 注意：Rust 与 C ABI 的默认值**不同**（有意的，不是疏漏）
+    ///
+    /// [`Image::from_rgba8`] **不**生成链 —— 那是对 0.5.0 的硬兼容承诺
+    /// （1:1 与放大的绘制必须逐字节不变）；而 C ABI 的
+    /// `amiki_image_create_rgba8` **默认**生成 BOX 链，代价约 **+1/3 内存**，
+    /// 可用 `amiki_image_set_mipmap_mode` 关掉。两边的取舍都记在
+    /// `CHANGELOG.md` 的 0.6.0 条目里。
+    pub mip: Option<MipChain>,
 }
 
 impl Image {
-    /// 从 RGBA8 数据构造；长度不符时返回 `None`。
+    /// 从 RGBA8 数据构造；长度不符时返回 `None`。不生成 mip 链。
     pub fn from_rgba8(width: u32, height: u32, data: Vec<u8>) -> Option<Image> {
         if width == 0 || height == 0 {
             return None;
@@ -355,7 +374,17 @@ impl Image {
         if data.len() != (width as usize) * (height as usize) * 4 {
             return None;
         }
-        Some(Image { width, height, data })
+        Some(Image { width, height, data, mip: None })
+    }
+
+    /// 从 RGBA8 数据构造并**立即生成 mip 链**（B4）。
+    ///
+    /// 生成时机是构造时而非首次采样时：链是确定性的（见 `mipmap` 模块说明），
+    /// 早生成只多一次分配，晚生成会在采样路径里埋分支。
+    pub fn from_rgba8_with_mipmap(width: u32, height: u32, data: Vec<u8>) -> Option<Image> {
+        let mut img = Image::from_rgba8(width, height, data)?;
+        img.mip = Some(generate_mip_chain(width, height, &img.data));
+        Some(img)
     }
 
     /// 取某像素（越界返回透明）。
@@ -381,50 +410,110 @@ impl Image {
     ///
     /// `repeat` 为真时按 1 取模平铺，否则钳到边缘（clamp）。
     pub fn sample_bilinear(&self, uv: Vec2, repeat: bool) -> [f32; 4] {
-        let (mut u, mut v) = (uv.x, uv.y);
-        if repeat {
-            u -= u.floor();
-            v -= v.floor();
-        } else {
-            u = u.clamp(0.0, 1.0);
-            v = v.clamp(0.0, 1.0);
-        }
-        // 映射到纹素坐标（像素中心对齐：u=0.5/w 应对应第 0 个纹素中心）
-        let fx = u * self.width as f32 - 0.5;
-        let fy = v * self.height as f32 - 0.5;
-        let x0 = fx.floor();
-        let y0 = fy.floor();
-        let tx = fx - x0;
-        let ty = fy - y0;
+        sample_bilinear_buf(&self.data, self.width, self.height, uv, repeat)
+    }
 
-        let fetch = |x: i32, y: i32| -> [f32; 4] {
-            let (xx, yy) = if repeat {
-                // 平铺时按尺寸取模，保证负坐标也正确回绕
-                (
-                    x.rem_euclid(self.width as i32) as u32,
-                    y.rem_euclid(self.height as i32) as u32,
-                )
-            } else {
-                (
-                    x.clamp(0, self.width as i32 - 1) as u32,
-                    y.clamp(0, self.height as i32 - 1) as u32,
-                )
-            };
-            self.texel(xx, yy)
+    /// 三线性采样（B4）：层内双线性 + 层间按 LOD 小数部分插值。
+    ///
+    /// `lod ≤ 0`（1:1 或放大）时与 [`Image::sample_bilinear`] **完全同一路径**，
+    /// 行为不变。没有 mip 链时同样退回双线性 —— 调用方无需先行判断。
+    ///
+    /// 层的选取与 GPU 的 `textureSampleLevel`（`mipmap_filter: Linear`）同语义：
+    /// `floor(lod)` 层与 `floor(lod)+1` 层各做一次双线性，再按小数部分 lerp。
+    pub fn sample_mipmap(&self, uv: Vec2, repeat: bool, lod: f32) -> [f32; 4] {
+        let Some(chain) = &self.mip else {
+            return self.sample_bilinear(uv, repeat);
         };
-        let c00 = fetch(x0 as i32, y0 as i32);
-        let c10 = fetch(x0 as i32 + 1, y0 as i32);
-        let c01 = fetch(x0 as i32, y0 as i32 + 1);
-        let c11 = fetch(x0 as i32 + 1, y0 as i32 + 1);
-
+        let top = chain.levels.len() as u32; // 最深层级号（level 1..=top）
+        let lod = lod.clamp(0.0, top as f32);
+        let base = lod.floor() as u32;
+        let c0 = self.sample_level(chain, base, uv, repeat);
+        let f = lod - base as f32;
+        if base >= top || f <= 0.0 {
+            return c0;
+        }
+        let c1 = self.sample_level(chain, base + 1, uv, repeat);
         let mut out = [0.0f32; 4];
         for i in 0..4 {
-            let a = c00[i] + (c10[i] - c00[i]) * tx;
-            let b = c01[i] + (c11[i] - c01[i]) * tx;
-            out[i] = a + (b - a) * ty;
+            out[i] = c0[i] + (c1[i] - c0[i]) * f;
         }
         out
     }
+
+    /// 采某一 mip 层（level 0 = 原图）。层级超出链深时钳到最深层。
+    fn sample_level(&self, chain: &MipChain, level: u32, uv: Vec2, repeat: bool) -> [f32; 4] {
+        let idx = (level as usize).min(chain.levels.len());
+        if level == 0 || idx == 0 {
+            return sample_bilinear_buf(&self.data, self.width, self.height, uv, repeat);
+        }
+        let l = &chain.levels[idx - 1];
+        sample_bilinear_buf(&l.data, l.width, l.height, uv, repeat)
+    }
+}
+
+/// 对任意 RGBA8 缓冲做双线性采样（[`Image::sample_bilinear`] 与 mip 层共用）。
+///
+/// 数学与 0.5.0 的 `sample_bilinear` 完全一致 —— 只是把"缓冲+尺寸"参数化，
+/// 让 mip 层走同一条路径，避免两份实现漂移。
+fn sample_bilinear_buf(
+    data: &[u8],
+    width: u32,
+    height: u32,
+    uv: Vec2,
+    repeat: bool,
+) -> [f32; 4] {
+    let (mut u, mut v) = (uv.x, uv.y);
+    if repeat {
+        u -= u.floor();
+        v -= v.floor();
+    } else {
+        u = u.clamp(0.0, 1.0);
+        v = v.clamp(0.0, 1.0);
+    }
+    // 映射到纹素坐标（像素中心对齐：u=0.5/w 应对应第 0 个纹素中心）
+    let fx = u * width as f32 - 0.5;
+    let fy = v * height as f32 - 0.5;
+    let x0 = fx.floor();
+    let y0 = fy.floor();
+    let tx = fx - x0;
+    let ty = fy - y0;
+
+    let fetch = |x: i32, y: i32| -> [f32; 4] {
+        let (xx, yy) = if repeat {
+            // 平铺时按尺寸取模，保证负坐标也正确回绕
+            (
+                x.rem_euclid(width as i32) as u32,
+                y.rem_euclid(height as i32) as u32,
+            )
+        } else {
+            (
+                x.clamp(0, width as i32 - 1) as u32,
+                y.clamp(0, height as i32 - 1) as u32,
+            )
+        };
+        if xx >= width || yy >= height {
+            return [0.0; 4];
+        }
+        let o = ((yy * width + xx) * 4) as usize;
+        [
+            data[o] as f32 / 255.0,
+            data[o + 1] as f32 / 255.0,
+            data[o + 2] as f32 / 255.0,
+            data[o + 3] as f32 / 255.0,
+        ]
+    };
+    let c00 = fetch(x0 as i32, y0 as i32);
+    let c10 = fetch(x0 as i32 + 1, y0 as i32);
+    let c01 = fetch(x0 as i32, y0 as i32 + 1);
+    let c11 = fetch(x0 as i32 + 1, y0 as i32 + 1);
+
+    let mut out = [0.0f32; 4];
+    for i in 0..4 {
+        let a = c00[i] + (c10[i] - c00[i]) * tx;
+        let b = c01[i] + (c11[i] - c01[i]) * tx;
+        out[i] = a + (b - a) * ty;
+    }
+    out
 }
 
 /// 图像的放置方式：把源图 `[0,1]²` 线性映射到设备空间的一个平行四边形。

@@ -166,7 +166,7 @@ extern "C" {
  * ========================================================================== */
 
 #define AMIKI_VERSION_MAJOR 0
-#define AMIKI_VERSION_MINOR 5
+#define AMIKI_VERSION_MINOR 6
 #define AMIKI_VERSION_PATCH 0
 /** 预发布标签（正式版为空串）。**不参与数值比较**，只用于展示。 */
 #define AMIKI_VERSION_PRERELEASE "alpha"
@@ -444,6 +444,16 @@ AMIKI_API amiki_result amiki_canvas_set_tone_map(amiki_canvas* cv, amiki_tone_ma
 /** 读回当前设置。空画布返回 `AMIKI_TONEMAP_RAW`（不写 out 之外的东西）。 */
 AMIKI_API amiki_tone_map amiki_canvas_tone_map(const amiki_canvas* cv);
 
+/**
+ * 设置画布的 mip 采样偏移（0.6.0 新增）。默认 0。
+ *
+ * 正值取更糊的 mip 层，负值取更锐的层；采样层级会被钳到链范围内，
+ * 过大的偏移只是失效、不会出错。只影响**缩小**位图的采样，
+ * 不影响绘制本身，也不影响 1:1 与放大的绘制。
+ * 非有限值（NaN / inf）被拒绝，画布状态不变。
+ */
+AMIKI_API amiki_result amiki_canvas_set_mip_bias(amiki_canvas* cv, float bias);
+
 AMIKI_API uint8_t* amiki_alloc(size_t size);
 
 /** 释放 `amiki_alloc` 的返回值。传 NULL 是空操作。 */
@@ -651,6 +661,34 @@ AMIKI_API void amiki_image_destroy(amiki_image* image);
 
 AMIKI_API amiki_result amiki_image_size(const amiki_image* image, uint32_t* out_w,
                                         uint32_t* out_h);
+
+/**
+ * 位图的 mipmap 模式（0.6.0 新增）。
+ *
+ * 大幅**缩小**位图时，只靠双线性采样会走样（摩尔纹）；mip 链在 CPU 侧
+ * 预先算好各级的"缩小版"，采样时按缩小倍数取用。
+ *
+ * - `AMIKI_MIPMAP_BOX`（**默认**）：按 2×2 盒式滤波生成 mip 链（在线性光
+ *   空间、预乘 alpha 上平均，避免黑边与偏色）。代价是约 **+1/3** 的内存。
+ *   `amiki_image_create_rgba8` 创建时即已生效，无需调用本函数。
+ * - `AMIKI_MIPMAP_DISABLED`：丢弃 mip 链，永远双线性采样（0.5.0 的行为），
+ *   省回那 1/3 内存。
+ *
+ * 1:1 与放大的绘制**不受影响**（两种模式逐字节一致）。
+ */
+typedef enum amiki_mipmap_mode {
+    AMIKI_MIPMAP_DISABLED = 0, /**< 不生成 mip 链，永远双线性 */
+    AMIKI_MIPMAP_BOX = 1,      /**< 2×2 盒式滤波 mip 链（默认） */
+} amiki_mipmap_mode;
+
+/**
+ * 设置位图的 mipmap 模式。
+ *
+ * 重建图像的内部数据：**对后续的绘制生效**，已画进画布的引用保持原样。
+ * 越界的枚举值被拒绝（返回 `AMIKI_ERROR_INVALID_ARGUMENT`），状态不变。
+ */
+AMIKI_API amiki_result amiki_image_set_mipmap_mode(amiki_image* image,
+                                                   amiki_mipmap_mode mode);
 
 /**
  * 从文件加载字体。**字节被拷贝**，文件可立刻关闭。

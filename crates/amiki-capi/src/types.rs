@@ -197,6 +197,22 @@ pub(crate) fn tone_map_to_raw(t: amiki_scene::ToneMap) -> i32 {
     }
 }
 
+/// C 侧的 `amiki_mipmap_mode`（B4）。
+pub const AMIKI_MIPMAP_DISABLED: i32 = 0;
+pub const AMIKI_MIPMAP_BOX: i32 = 1;
+
+/// C 侧的 `amiki_mipmap_mode` → 是否生成 mip 链。
+///
+/// 与 tone map 同一约定：越界值返回 `None`，调用方显式报错且**不改动
+/// 已有设置** —— 静默退回默认会让"设错了"看起来像"设上了"。
+pub(crate) fn mipmap_mode_from_raw(v: i32) -> Option<bool> {
+    match v {
+        AMIKI_MIPMAP_DISABLED => Some(false),
+        AMIKI_MIPMAP_BOX => Some(true),
+        _ => None,
+    }
+}
+
 pub const AMIKI_BACKEND_AUTO: i32 = 0;
 pub const AMIKI_BACKEND_GPU: i32 = 1;
 pub const AMIKI_BACKEND_CPU: i32 = 2;

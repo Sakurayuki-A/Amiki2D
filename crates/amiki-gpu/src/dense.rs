@@ -343,7 +343,7 @@ impl GpuRenderer {
                 wgpu::BindGroupEntry { binding: 12, resource: wgpu::BindingResource::TextureView(views[2]) },
                 wgpu::BindGroupEntry { binding: 13, resource: wgpu::BindingResource::TextureView(views[3]) },
                 // M6：稠密路径不做图像着色，但 bind group layout 是共用的，
-                // 必须提供合法的 14/15/16（占位资源），否则创建绑定即校验失败。
+                // 必须提供合法的 14/15/16/17（占位资源），否则创建绑定即校验失败。
                 wgpu::BindGroupEntry { binding: 14, resource: self.dummy_img_place.as_entire_binding() },
                 wgpu::BindGroupEntry {
                     binding: 15,
@@ -351,6 +351,11 @@ impl GpuRenderer {
                 },
                 wgpu::BindGroupEntry {
                     binding: 16,
+                    resource: wgpu::BindingResource::Sampler(&self.dummy_img_sampler),
+                },
+                // B4：平铺采样器（binding 17），稠密路径同样只占位
+                wgpu::BindGroupEntry {
+                    binding: 17,
                     resource: wgpu::BindingResource::Sampler(&self.dummy_img_sampler),
                 },
             ],

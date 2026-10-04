@@ -117,6 +117,9 @@ pub struct GpuScene {
     pub total_segments: u32,
     /// emit/scatter 的 indirect dispatch 参数
     pub indirect: [u32; 3],
+    /// B4：mip 采样偏移。由 `prepare_into_with` 在提取后设置（默认 0），
+    /// `pack_image_place` 读取它算每个 draw 的 LOD。
+    pub mip_bias: f32,
     /// **复用用的 scratch**（每 draw 的图元计数），不属 `GpuScene` 的语义。
     ///
     /// 放在这里是为了**跨帧复用**：这三个数组原本每帧 `vec![0; n]` 新建，
@@ -166,6 +169,7 @@ impl GpuScene {
         self.n_quads.clear();
         self.n_cubics.clear();
         self.n_lines.clear();
+        self.mip_bias = 0.0;
         // 其余字段每帧都会被覆盖，无需重置
     }
 }

@@ -65,6 +65,15 @@ const TILE_SIZE: u32 = amiki_scene::DAMAGE_TILE;
 #[derive(Debug)]
 pub struct PersistentRenderer {
     flatten_eps: f32,
+    /// B4：mip 采样偏移（与全量路径的 `BinnedScene::mip_bias` 同语义；
+    /// damage 契约要求增量与全量逐字节一致，故增量路径也必须用同一 bias）。
+    ///
+    /// **可以直接改**：`update` 会与上一帧实际用过的值比较，一旦不同就整幅重建。
+    /// 缓存的像素与层缓冲都是按旧 bias 渲染的，只改字段而不重建会**静默**留下
+    /// 旧画面 —— 所以不需要、也不应该要求调用方自己记得调 [`Self::invalidate_all`]。
+    pub mip_bias: f32,
+    /// 上一帧**实际用过**的 bias，用于检测调用方改了 [`Self::mip_bias`]。
+    last_mip_bias: f32,
     width: u32,
     height: u32,
     /// 上一帧的场景（用于推导脏区）
@@ -176,6 +185,8 @@ impl PersistentRenderer {
     pub fn new(flatten_eps: f32) -> PersistentRenderer {
         PersistentRenderer {
             flatten_eps,
+            mip_bias: 0.0,
+            last_mip_bias: 0.0,
             width: 0,
             height: 0,
             prev_scene: None,
@@ -210,6 +221,7 @@ impl PersistentRenderer {
     /// 提交一帧场景，按需重算。
     ///
     /// - 画布尺寸变化 ⇒ 全量重建；
+    /// - [`Self::mip_bias`] 与上一帧不同 ⇒ 全量重建（缓存是按旧 bias 渲的）；
     /// - 场景与上一帧完全相同 ⇒ **零工作**；
     /// - 否则 ⇒ 重新分箱 + 只重算脏 tile（含层的作用范围）。
     pub fn update(&mut self, scene: &Scene) {
@@ -217,11 +229,18 @@ impl PersistentRenderer {
         let h = scene.height.max(1);
         let total = w.div_ceil(TILE_SIZE) * h.div_ceil(TILE_SIZE);
 
-        // 尺寸变化：整幅重建（分箱、像素、层缓存全部作废）
-        if w != self.width || h != self.height {
+        // 尺寸变化、或 bias 变化：整幅重建（分箱、像素、层缓存全部作废）
+        //
+        // bias 必须在这里判：缓存的像素与层缓冲都是按**旧 bias** 渲染的，
+        // 只改字段而不重建就会让"增量"与"全量"不一致（静默的旧画面）。
+        if w != self.width || h != self.height || self.mip_bias != self.last_mip_bias {
             self.width = w;
             self.height = h;
-            let binned = bin(scene, self.flatten_eps);
+            let mut binned = bin(scene, self.flatten_eps);
+            // 主画布的像素也必须用调用方的 bias。此前只有层内容用到了它
+            // （经 `render_inner_f32` 的入参），主画布一直是 0 —— 于是含位图的
+            // 场景下增量与全量静默不一致。
+            binned.mip_bias = self.mip_bias;
             self.base = render_tiles(&binned, None);
             self.layers.clear();
             let (tx_n, ty_n) = (binned.tiles_x as usize, binned.tiles_y as usize);
@@ -230,6 +249,7 @@ impl PersistentRenderer {
             self.recomposite_all();
             self.prev_binned = Some(binned);
             self.prev_scene = Some(scene.clone());
+            self.last_mip_bias = self.mip_bias;
             self.last = FrameStats {
                 skipped: false,
                 rebinned: true,
@@ -256,7 +276,8 @@ impl PersistentRenderer {
             Some(prev) => edit_damage(prev, scene),
             None => Damage::new(w, h),
         };
-        let binned = bin(scene, self.flatten_eps);
+        let mut binned = bin(scene, self.flatten_eps);
+        binned.mip_bias = self.mip_bias; // 主画布与层内容必须同一个 bias
         let (tx_n, ty_n) = (binned.tiles_x as usize, binned.tiles_y as usize);
         let mut dirty = vec![false; tx_n * ty_n];
 
@@ -335,7 +356,7 @@ impl PersistentRenderer {
                     // layer_incremental_matches_full_random_sequences 立刻就会红
                     // （改这一行之前它确实红了）。
                     let layer_img =
-                        render_inner_f32(self.width, self.height, &layer.scene, self.flatten_eps);
+                        render_inner_f32(self.width, self.height, &layer.scene, self.flatten_eps, self.mip_bias);
                     let new = layer_buffer_from_content_f32(&layer_img, self.width, self.height, layer)
                         .map(|(x, y, buf)| CachedLayer {
                             bounds: layer.bounds,
@@ -450,7 +471,10 @@ impl PersistentRenderer {
     /// 用已渲染的上一帧像素 + 脏区更新的等价入口，供测试对照
     /// （与 `update` 的内部路径保持一致，避免测试与实际实现漂移）。
     pub fn apply_damage_for_test(&mut self, scene: &Scene) {
-        let binned = bin(scene, self.flatten_eps);
+        let mut binned = bin(scene, self.flatten_eps);
+        // 与 `update` 的内部路径保持一致（含 bias）—— 否则测试与实际实现会漂移，
+        // 而这条测试的全部价值就在于"两条路径逐字节相同"。
+        binned.mip_bias = self.mip_bias;
         let damage = match &self.prev_scene {
             Some(prev) => edit_damage(prev, scene),
             None => Damage::new(scene.width, scene.height),

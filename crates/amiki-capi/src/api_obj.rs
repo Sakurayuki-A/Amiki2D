@@ -146,6 +146,7 @@ pub extern "C" fn amiki_canvas_create(
         }
         let cv = Box::new(AmikiCanvas {
             tone_map: amiki_scene::ToneMap::Raw,
+            mip_bias: 0.0,
             ctx,
             width,
             height,
@@ -649,16 +650,20 @@ pub extern "C" fn amiki_canvas_render_rgba8(
         if let Err(r) = ctx.poison.check() {
             return r;
         }
-        // 色调映射作用在**出口量化**这一步，两条后端路径都要用上它
+        // 色调映射作用在**出口量化**这一步，两条后端路径都要用上它；
+        // mip bias（B4）同理，两条路径共用同一设置
         let tone = c.tone_map;
+        let bias = c.mip_bias;
         let rendered: Result<Vec<u8>, String> = match &ctx.backend {
             #[cfg(feature = "gpu")]
             Backend::Gpu(r) => r
-                .render_blocking_with(scene, eps, tone)
+                .render_blocking_with(scene, eps, tone, bias)
                 .map_err(|e| e.to_string()),
             // CPU 路径与 GPU 无关 —— 这也是 WASM 构建下唯一的路径
             Backend::Cpu => {
-                Ok(amiki_raster::render_with_tone(&amiki_raster::bin(scene, eps), tone))
+                let mut binned = amiki_raster::bin(scene, eps);
+                binned.mip_bias = bias;
+                Ok(amiki_raster::render_with_tone(&binned, tone))
             }
         };
         match rendered {
@@ -906,7 +911,11 @@ pub extern "C" fn amiki_image_create_rgba8(
             let off = y * stride;
             data.extend_from_slice(&src[off..off + row]);
         }
-        let Some(img) = amiki_scene::Image::from_rgba8(width, height, data) else {
+        // B4：**默认生成 mip 链**（AMIKI_MIPMAP_BOX）。要省那 1/3 内存
+        // 或锁死"只双线性"的行为，加载后调
+        // `amiki_image_set_mipmap_mode(img, AMIKI_MIPMAP_DISABLED)`。
+        // 1:1 与放大的绘制不受影响（LOD < 0 钳回 level 0）。
+        let Some(img) = amiki_scene::Image::from_rgba8_with_mipmap(width, height, data) else {
             return AMIKI_ERROR_INVALID_ARGUMENT;
         };
         let h = Box::new(AmikiImage { image: Arc::new(img), poison: Poison::default() });
@@ -945,6 +954,50 @@ pub extern "C" fn amiki_image_size(
         write_out(out_h, h.image.height);
     }
     AMIKI_OK
+}
+
+/// 设置位图的 mipmap 模式（B4）。
+///
+/// - `AMIKI_MIPMAP_BOX`（**默认**，创建时即生效）：按 2×2 盒式滤波生成
+///   mip 链（线性光 + 预乘平均，见 `amiki_scene::mipmap`），缩小时三线性
+///   采样，消除摩尔纹。代价是约 +1/3 的内存。
+/// - `AMIKI_MIPMAP_DISABLED`：丢弃 mip 链，永远双线性采样（0.5.0 的行为）。
+///
+/// 本函数重建图像的内部数据：**对后续的绘制生效**，已画进画布的引用不变。
+/// 越界的枚举值被拒绝（返回 `AMIKI_ERROR_INVALID_ARGUMENT`），状态不变。
+#[no_mangle]
+pub extern "C" fn amiki_image_set_mipmap_mode(image: *mut AmikiImage, mode: i32) -> i32 {
+    ffi!(image, |h| {
+        let Some(gen) = crate::types::mipmap_mode_from_raw(mode) else {
+            return AMIKI_ERROR_INVALID_ARGUMENT;
+        };
+        // Image 是 Clone 的纯数据（RGBA8 + 可选链），克隆后换一个 Arc：
+        // 已被画布引用的旧数据保持不动，这是"对后续绘制生效"的语义
+        let mut img = (*h.image).clone();
+        img.mip = if gen {
+            Some(amiki_scene::generate_mip_chain(img.width, img.height, &img.data))
+        } else {
+            None
+        };
+        h.image = std::sync::Arc::new(img);
+        AMIKI_OK
+    })
+}
+
+/// 设置画布的 mip 采样偏移（B4）。默认 0。
+///
+/// 正值取更糊的层（适合先放大后缩小的场合），负值取更锐的层；
+/// 采样层级会被钳到 mip 链范围内，过大/过小的值只是失效、不会出错。
+/// 非有限值（NaN / inf）被拒绝。只影响**缩小**的位图采样，不影响绘制本身。
+#[no_mangle]
+pub extern "C" fn amiki_canvas_set_mip_bias(cv: *mut AmikiCanvas, bias: f32) -> i32 {
+    ffi!(cv, |c| {
+        if !bias.is_finite() {
+            return AMIKI_ERROR_INVALID_ARGUMENT;
+        }
+        c.mip_bias = bias;
+        AMIKI_OK
+    })
 }
 
 #[no_mangle]

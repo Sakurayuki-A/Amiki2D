@@ -209,7 +209,7 @@ impl GpuRenderer {
     fn mk_image_texture_array(
         &self,
         images: &[(std::sync::Arc<amiki_scene::Image>, amiki_scene::ImagePlacement)],
-    ) -> Result<(wgpu::TextureView, wgpu::Sampler), RenderError> {
+    ) -> Result<(wgpu::TextureView, wgpu::Sampler, wgpu::Sampler), RenderError> {
         // **GL 后端上禁用位图（显式报错）**。
         //
         // 实测：`Backends::GL` 下 `amiki-gpu` 的 20 条测试里 19 条通过，
@@ -243,10 +243,18 @@ impl GpuRenderer {
             ));
         }
 
+        // B4：任一图像带 mip 链 => 数组纹理开 mip 层。链在 CPU 生成（见
+        // `amiki_scene::mipmap`），这里只是上传 —— GPU 生成会引入第二份滤波
+        // 实现，与"双端逐像素一致"冲突。
+        // 层级数按**数组尺寸**取：所有层共享数组纹理，小于数组的图像
+        // 用补齐版链（`generate_padded_mip_levels`，同一套滤波数学）。
+        let any_mip = images.iter().any(|(i, _)| i.mip.is_some());
+        let mip_count = if any_mip { amiki_scene::mip_level_count(w, h) } else { 1 };
+
         let tex = self.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("amiki_image_array"),
             size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: layers },
-            mip_level_count: 1,
+            mip_level_count: mip_count,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format: wgpu::TextureFormat::Rgba8Unorm,
@@ -254,35 +262,66 @@ impl GpuRenderer {
             view_formats: &[],
         });
 
-        // 逐层上传（上层若比底图小，剩余部分保持透明）
+        // 逐层逐级上传（上层若比底图小，剩余部分保持透明）
         const BPP: usize = 4;
-        let row_bytes = (w as usize) * BPP;
-        let stride = row_bytes;
-        let mut layer_buf = vec![0u8; stride * h as usize];
         for (li, (img, _)) in images.iter().enumerate() {
-            layer_buf.fill(0);
-            let cw = img.width.min(w) as usize;
-            let ch = img.height.min(h) as usize;
-            for y in 0..ch {
-                let src = (y * img.width as usize) * BPP;
-                let dst = y * stride;
-                layer_buf[dst..dst + cw * BPP].copy_from_slice(&img.data[src..src + cw * BPP]);
+            // 该层的链：数组尺寸恰好等于图像尺寸时直接用图像自己的链；
+            // 否则现场生成补齐版链（确定性，与直接生成同一套滤波数学）
+            let padded;
+            let chain: &[amiki_scene::MipLevel] =
+                if img.mip.is_some() && (img.width, img.height) != (w, h) {
+                    padded = amiki_scene::generate_padded_mip_levels(
+                        img.width, img.height, &img.data, w, h,
+                    );
+                    &padded
+                } else {
+                    img.mip.as_ref().map(|c| &c.levels[..]).unwrap_or(&[])
+                };
+            for level in 0..mip_count {
+                let lw = (w >> level).max(1);
+                let lh = (h >> level).max(1);
+                // level 0 = 原图（补齐到数组尺寸）；更深 = 链级（同尺寸公式）
+                let level_bytes: Vec<u8> = if level == 0 {
+                    let mut buf = vec![0u8; (w * h * 4) as usize];
+                    let cw = img.width.min(w) as usize;
+                    let ch = img.height.min(h) as usize;
+                    let stride = (w as usize) * BPP;
+                    for y in 0..ch {
+                        let src = (y * img.width as usize) * BPP;
+                        let dst = y * stride;
+                        buf[dst..dst + cw * BPP].copy_from_slice(&img.data[src..src + cw * BPP]);
+                    }
+                    buf
+                } else {
+                    match chain.get(level as usize - 1) {
+                        Some(l) if (l.width, l.height) == (lw, lh) => l.data.clone(),
+                        Some(l) => {
+                            return err(format!(
+                                "图像 {li} 的 mip 层级 {level} 尺寸 {}×{} 与数组级 {lw}×{lh} 不符",
+                                l.width, l.height
+                            ))
+                        }
+                        // 链到此为止（图像比数组小、层级更深）：保持透明。
+                        // 该图像自己的 LOD 钳在链深处，采不到这些空层。
+                        None => vec![0u8; (lw * lh * 4) as usize],
+                    }
+                };
+                self.queue.write_texture(
+                    wgpu::TexelCopyTextureInfo {
+                        texture: &tex,
+                        mip_level: level,
+                        origin: wgpu::Origin3d { x: 0, y: 0, z: li as u32 },
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    &level_bytes,
+                    wgpu::TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(lw * 4),
+                        rows_per_image: Some(lh),
+                    },
+                    wgpu::Extent3d { width: lw, height: lh, depth_or_array_layers: 1 },
+                );
             }
-            self.queue.write_texture(
-                wgpu::TexelCopyTextureInfo {
-                    texture: &tex,
-                    mip_level: 0,
-                    origin: wgpu::Origin3d { x: 0, y: 0, z: li as u32 },
-                    aspect: wgpu::TextureAspect::All,
-                },
-                &layer_buf,
-                wgpu::TexelCopyBufferLayout {
-                    offset: 0,
-                    bytes_per_row: Some(stride as u32),
-                    rows_per_image: Some(h),
-                },
-                wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
-            );
         }
 
         let view = tex.create_view(&wgpu::TextureViewDescriptor {
@@ -290,9 +329,21 @@ impl GpuRenderer {
             dimension: Some(wgpu::TextureViewDimension::D2Array),
             ..Default::default()
         });
-        // 采样器：clamp-to-edge + 线性过滤。
-        // repeat 由 WGSL 侧取模实现（采样器同时服务 clip 纹理的钳制语义，
-        // 不能设成 repeat）。
+        // 采样器（binding 16）：clamp-to-edge + 线性过滤，供**非平铺**的图像采样。
+        // 平铺在接缝半纹素处必须真回绕（与 CPU 的 `rem_euclid` 取纹素一致），
+        // 那是另一个采样器的事 —— 见下方 `repeat_sampler` / binding 17。
+        // clip 覆盖率纹理走 `textureLoad`，不经采样器，与本处无关
+        // （0.6.0 之前只有一个采样器时，"它同时服务 clip 纹理"曾是它不能设
+        // repeat 的理由；现在这个理由已不成立，故拆成两个）。
+        //
+        // **LOD 钳制**（GL 完整性问题的历史：wgpu `default()` 的
+        // `lod_max_clamp` 是 32.0，GL 据 LOD 范围判纹理"不完整" ->
+        // 采样恒为 (0,0,0,1)，实测整张位图变纯黑）：
+        // - 无 mip：钳到 0（lod_max_clamp = 0.0），原因同上；
+        // - 有 mip：放开钳制（超出实际层级数的 LOD 由硬件钳到最深一级），
+        //   且 mip 过滤改 Linear —— `textureSampleLevel` 的显式 LOD
+        //   （CPU 算好打包进放置缓冲）才能做层间插值。
+        //   GL 后端有位图时本来就显式报错（本函数开头），不受影响。
         let sampler = self.device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("amiki_image_sampler"),
             address_mode_u: wgpu::AddressMode::ClampToEdge,
@@ -300,18 +351,40 @@ impl GpuRenderer {
             address_mode_w: wgpu::AddressMode::ClampToEdge,
             mag_filter: wgpu::FilterMode::Linear,
             min_filter: wgpu::FilterMode::Linear,
-            // **LOD 必须钳到 0**：图像纹理只有 1 级 mip，而 wgpu 的
-            // `SamplerDescriptor::default()` 里 `lod_max_clamp` 是 **32.0**。
-            // Vulkan/DX12 对此宽容，GL 则据 LOD 范围判定纹理**不完整** ——
-            // 不完整的纹理按 GL 规范采样为 `(0,0,0,1)`（不透明黑）。
-            // 症状就是整张位图在 GL 上变成纯黑（实测 768 个像素全错，
-            // 且值恰好是 (0,0,0,255)）。
             lod_min_clamp: 0.0,
-            lod_max_clamp: 0.0,
-            mipmap_filter: wgpu::FilterMode::Nearest,
+            lod_max_clamp: if any_mip { 100.0 } else { 0.0 },
+            mipmap_filter: if any_mip {
+                wgpu::FilterMode::Linear
+            } else {
+                wgpu::FilterMode::Nearest
+            },
             ..Default::default()
         });
-        Ok((view, sampler))
+        // 平铺专用：除地址模式外与 clamp 版逐字段一致（同样的 LOD 钳制策略）。
+        // GL 后端有位图时已在本函数开头显式报错，完整性问题与 clamp 版同。
+        //
+        // 为什么需要第二个采样器：WGSL 里的 `uv - floor(uv)` 只把 uv 归到 [0,1)，
+        // 而双线性在每个 mip 层的**取纹素**还会越出一次半纹素 —— 那一步由采样器
+        // 的地址模式决定。ClampToEdge 会钳到边缘，CPU 的 `rem_euclid` 会回绕到
+        // 另一侧，于是 uv 落在 [0,1] 边缘约 1.6% 带内时两端不一致（mipmap 对拍
+        // 首次暴露的潜伏 bug，此前平铺测试的像素中心恰好够不到那条带）。
+        let repeat_sampler = self.device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("amiki_image_sampler_repeat"),
+            address_mode_u: wgpu::AddressMode::Repeat,
+            address_mode_v: wgpu::AddressMode::Repeat,
+            address_mode_w: wgpu::AddressMode::Repeat,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            lod_min_clamp: 0.0,
+            lod_max_clamp: if any_mip { 100.0 } else { 0.0 },
+            mipmap_filter: if any_mip {
+                wgpu::FilterMode::Linear
+            } else {
+                wgpu::FilterMode::Nearest
+            },
+            ..Default::default()
+        });
+        Ok((view, sampler, repeat_sampler))
     }
 }
 
@@ -321,7 +394,7 @@ impl GpuRenderer {
 /// ```text
 /// [d*3+0] = (origin.x, origin.y, u_axis.x, u_axis.y)
 /// [d*3+1] = (v_axis.x, v_axis.y, tex_layer, 0)
-/// [d*3+2] = (bitcast<f32>(image_index), repeat, 0, 0)
+/// [d*3+2] = (bitcast<f32>(image_index), repeat, lod, 0)
 /// ```
 /// 把 `image_index` 放进放置数据自身，使该缓冲区**自描述**：
 /// "这个 draw 是不是图像"无需另占 `draw_meta` 分量，也不会与渐变下标争位置。
@@ -334,12 +407,27 @@ fn pack_image_place(gs: &GpuScene) -> Vec<[f32; 4]> {
             out[slot + 2][0] = f32::from_bits(u32::MAX);
             continue;
         }
-        let (_img, place) = &gs.images[*idx as usize];
+        let (img, place) = &gs.images[*idx as usize];
         out[slot] = [place.origin.x, place.origin.y, place.u_axis.x, place.u_axis.y];
         // 纹理层号 = 该图像在纹理数组中的层（与 gs.images 同序）
         out[slot + 1] = [place.v_axis.x, place.v_axis.y, *idx as f32, 0.0];
+        // B4：e2.z 是该 draw 的 LOD（含 bias）。**在 CPU 上算好打包**，
+        // WGSL 只读不算 —— `log2` 在 CPU libm 与 GPU 内建函数间可能差 1 ULP，
+        // 采样层级对它敏感，不在着色器里算就从根上消掉这个漂移源。
+        // 没有 mip 链的图像固定 0（采样器钳制 + 纹理只有 1 层，行为不变）。
+        let lod = if img.mip.is_some() {
+            amiki_scene::compute_lod(
+                place.u_axis,
+                place.v_axis,
+                img.width,
+                img.height,
+                gs.mip_bias,
+            )
+        } else {
+            0.0
+        };
         out[slot + 2] =
-            [f32::from_bits(*idx), if place.repeat { 1.0 } else { 0.0 }, 0.0, 0.0];
+            [f32::from_bits(*idx), if place.repeat { 1.0 } else { 0.0 }, lod, 0.0];
     }
     out
 }
@@ -960,6 +1048,18 @@ impl GpuRenderer {
         });
         fine_entries.push(wgpu::BindGroupLayoutEntry {
             binding: 16,
+            visibility: wgpu::ShaderStages::COMPUTE,
+            ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+            count: None,
+        });
+        // B4：平铺（repeat）专用的 Repeat 地址模式采样器。原来只靠 WGSL 里
+        // 的 `uv - floor(uv)` 预取模 + ClampToEdge 采样器，接缝的半纹素处
+        // （uv 极接近 0/1 时跨层的 +1 取纹素）会被钳到边缘，而 CPU 是按
+        // rem_euclid 真回绕 —— 双端在接缝带不一致（潜伏 bug，mipmap 对拍
+        // 首次暴露）。真回绕必须发生在**采样器**上，每个 mip 层的取纹素
+        // 才都会回绕。
+        fine_entries.push(wgpu::BindGroupLayoutEntry {
+            binding: 17,
             visibility: wgpu::ShaderStages::COMPUTE,
             ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
             count: None,
@@ -1596,6 +1696,13 @@ impl GpuRenderer {
         Ok(frame)
     }
 
+    /// [`Self::prepare`] 的带 mip bias 版本（B4）。
+    pub fn prepare_with(&self, scene: &Scene, eps: f32, mip_bias: f32) -> Result<Frame, RenderError> {
+        let mut frame = Frame::default();
+        self.prepare_into_with(scene, eps, mip_bias, &mut frame)?;
+        Ok(frame)
+    }
+
     /// 准备逐帧资源，**复用调用方持有的 `Frame` 的缓冲**。
     ///
     /// ```no_run
@@ -1614,12 +1721,28 @@ impl GpuRenderer {
         eps: f32,
         frame: &mut Frame,
     ) -> Result<(), RenderError> {
+        self.prepare_into_with(scene, eps, 0.0, frame)
+    }
+
+    /// [`Self::prepare_into`] 的带 mip bias 版本（B4）。
+    ///
+    /// bias 影响每个图像 draw 打包进放置缓冲的 LOD，从而影响采样层级。
+    /// 放在提取入口而不是渲染入口：LOD 是**打包期**常量（见
+    /// `pack_image_place`），WGSL 只读不算。
+    pub fn prepare_into_with(
+        &self,
+        scene: &Scene,
+        eps: f32,
+        mip_bias: f32,
+        frame: &mut Frame,
+    ) -> Result<(), RenderError> {
         use amiki_scene::{Color, Paint};
         // 注意：`prepare` 本身不拒绝层 —— `render` 会经它进来，而
         // `render_blocking` 才负责层合成。拒绝放在逐帧路径的两个入口
         // （`render_into` / `render_into_persistent`），它们才是真正会
         // 静默丢掉层的地方。
         build_gpu_scene_into(scene, eps, &mut frame.scene);
+        frame.scene.mip_bias = mip_bias;
         let mut clip_texs = Vec::new();
         let mut clip_views = Vec::new();
         for clip in &scene.clips {
@@ -1669,7 +1792,7 @@ impl GpuRenderer {
 
     /// 与 [`Self::render_blocking_with`] 相同，但用默认的 `ToneMap::Raw`。
     pub fn render_blocking(&self, scene: &Scene, eps: f32) -> Result<Vec<u8>, RenderError> {
-        self.render_blocking_with(scene, eps, amiki_scene::ToneMap::Raw)
+        self.render_blocking_with(scene, eps, amiki_scene::ToneMap::Raw, 0.0)
     }
 
     /// 渲染并读回 8 位，按 `tone` 把 HDR 压到显示范围。
@@ -1681,6 +1804,7 @@ impl GpuRenderer {
         scene: &Scene,
         eps: f32,
         tone: amiki_scene::ToneMap,
+        mip_bias: f32,
     ) -> Result<Vec<u8>, RenderError> {
         // 含层场景的参考实现：**层内容与模糊都在 GPU，合成在主机侧**。
         //
@@ -1694,7 +1818,7 @@ impl GpuRenderer {
         //
         // 直接走管线（不经过 `render_into` 的层合成路径），因为下面要拿未合成的
         // 根图像自己按层合成。
-        let frame = self.prepare(scene, eps)?;
+        let frame = self.prepare_with(scene, eps, mip_bias)?;
         let tex = self.create_output_texture(&frame.scene);
         self.run_pipeline(&frame.scene, &tex, false, &frame.clip_views, None)?;
         // 根图像保持 **f32 且不裁剪**：层之间要能累积 >1.0 的值，
@@ -1720,7 +1844,7 @@ impl GpuRenderer {
                 sc.clips = layer.scene.clips.clone();
                 sc
             };
-            let lframe = self.prepare(&sub, eps)?;
+            let lframe = self.prepare_with(&sub, eps, mip_bias)?;
             let ltex = self.create_output_texture(&lframe.scene);
             self.run_pipeline(&lframe.scene, &ltex, false, &lframe.clip_views, None)?;
             let mut limg = self.readback_f32(&ltex)?;

@@ -101,6 +101,9 @@ pub struct AmikiCanvas {
     /// 输出量化时用的色调映射（`amiki_canvas_set_tone_map`）。
     /// 只影响 `render_rgba8` 的**出口**，不影响绘制本身。
     pub(crate) tone_map: amiki_scene::ToneMap,
+    /// mip 采样偏移（`amiki_canvas_set_mip_bias`，B4）。
+    /// 影响缩小位图的采样层级；0 = 不偏移。
+    pub(crate) mip_bias: f32,
     pub(crate) poison: Poison,
 }
 
@@ -120,6 +123,7 @@ impl AmikiCanvas {
         self.layers.clear();
         self.clip_depth = 0;
         self.tone_map = amiki_scene::ToneMap::Raw;
+        self.mip_bias = 0.0;
         self.poison = Poison::default();
     }
 }

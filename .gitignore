@@ -18,3 +18,9 @@ Cargo.lock.orig
 # Noto Sans SC 发布包（约 107 MB）：不随仓库分发。
 # 只需从其中取出的 assets/fonts/NotoSansSC-Regular.ttf（约 10 MB）随仓库走。
 /Noto_*.zip
+crates/amiki-capi/examples/wasm/browser_test_standalone.html
+
+# 整目录备份的目的地（backup/0.6.x-damage-fix/ 等）。
+# 必须忽略：否则一份备份会给 git status 塞进上万个未跟踪文件，
+# 而且"备份里再放一份备份"会递归膨胀。
+/backup/

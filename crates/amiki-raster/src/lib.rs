@@ -96,6 +96,9 @@ pub struct BinnedScene {
     pub draw_clips: Vec<[u32; 4]>,
     /// 每 scene clip 的 CPU 覆盖率 alpha 图（GPU 侧为纹理，M2d）。
     pub clip_maps: Vec<Vec<u8>>,
+    /// B4：mip 采样偏移。不是 `bin()` 的参数 —— 现有调用方（大量测试）
+    /// 不该被波及；C ABI 画布在 bin 后设置。
+    pub mip_bias: f32,
 }
 
 /// (tile, 行) 成员项。
@@ -207,6 +210,9 @@ pub fn bin(scene: &Scene, flatten_eps: f32) -> BinnedScene {
         scene_layers: Vec::new(),
         source_scene: amiki_scene::Scene::default(),
         eps: flatten_eps,
+        // mip 采样偏移（B4）。`bin()` 固定为 0；要设 bias 的调用方
+        // （C ABI 画布）在 bin 之后、render 之前改这个字段。
+        mip_bias: 0.0,
         draw_clips: Vec::new(),
         clip_maps: Vec::new(),
     };
@@ -669,10 +675,25 @@ fn resolve_color(binned: &BinnedScene, draw: usize, x: f32, y: f32) -> [f32; 4] 
         return [c.r, c.g, c.b, c.a];
     }
     if let Some((img, place)) = image_of(binned, draw) {
-        // 设备坐标 → 图像空间 uv → 双线性采样。
+        // 设备坐标 → 图像空间 uv → 采样。
         // 仿射退化（行列式≈0）时返回透明：宁可该像素不画，也不要除零产出 NaN。
         return match place.uv_at(amiki_math::Vec2::new(x, y)) {
-            Some(uv) => img.sample_bilinear(uv, place.repeat),
+            Some(uv) => {
+                // B4：有 mip 链走三线性。LOD 用与 GPU 打包完全相同的
+                // `compute_lod`（同一份代码），且与放置一样是 draw 常量。
+                if img.mip.is_some() {
+                    let lod = amiki_scene::compute_lod(
+                        place.u_axis,
+                        place.v_axis,
+                        img.width,
+                        img.height,
+                        binned.mip_bias,
+                    );
+                    img.sample_mipmap(uv, place.repeat, lod)
+                } else {
+                    img.sample_bilinear(uv, place.repeat)
+                }
+            }
             None => [0.0; 4],
         };
     }
@@ -1005,6 +1026,7 @@ fn composite_layer(
     scene: &amiki_scene::Scene,
     layer: &amiki_scene::Layer,
     eps: f32,
+    mip_bias: f32,
 ) {
     if layer.bounds.is_empty() {
         return;
@@ -1015,7 +1037,7 @@ fn composite_layer(
     // 工作。此前这里用的是 8 位的 `render_inner`，>1.0 的高光源在模糊**之前**
     // 就被裁到 1.0 —— 发光效果直接消失（`hdr_values_survive_a_blurred_layer`
     // 测到的两个 level 能量完全相同，就是这个原因）。
-    let layer_img = render_inner_f32(scene.width, scene.height, &layer.scene, eps);
+    let layer_img = render_inner_f32(scene.width, scene.height, &layer.scene, eps, mip_bias);
     let Some((bx, by, buf)) = layer_buffer_from_content_f32(&layer_img, scene.width, scene.height, layer)
     else {
         return;
@@ -1066,8 +1088,15 @@ pub fn composite_premul(dst: [f32; 4], src: [f32; 4], mode: u32) -> [f32; 4] {
 /// 只用于层：主画布仍走 8 位（见 [`render`]），因为主画布的最终输出本来
 /// 就要落到 8 位显示范围。层不一样 —— 它的内容要先经过滤镜，
 /// 那一步之前必须保持 HDR。
-fn render_inner_f32(width: u32, height: u32, scene: &amiki_scene::Scene, eps: f32) -> Vec<[f32; 4]> {
-    let binned = bin(scene, eps);
+fn render_inner_f32(
+    width: u32,
+    height: u32,
+    scene: &amiki_scene::Scene,
+    eps: f32,
+    mip_bias: f32,
+) -> Vec<[f32; 4]> {
+    let mut binned = bin(scene, eps);
+    binned.mip_bias = mip_bias;
     let w = width as usize;
     let h = height as usize;
     // 新建即全零，等价于逐 tile clear（这里没有增量复用，不需要 clear_tile）。
@@ -1154,7 +1183,7 @@ pub fn render_f32(binned: &BinnedScene) -> Vec<[f32; 4]> {
     }
     // 层在 f32 上合成：>1.0 的高光源能穿过层边界存活
     for layer in &binned.scene_layers {
-        composite_layer_f32(&mut img, &binned.source_scene, layer, binned.eps);
+        composite_layer_f32(&mut img, &binned.source_scene, layer, binned.eps, binned.mip_bias);
     }
     img
 }
@@ -1178,12 +1207,13 @@ fn composite_layer_f32(
     scene: &amiki_scene::Scene,
     layer: &amiki_scene::Layer,
     eps: f32,
+    mip_bias: f32,
 ) {
     if layer.bounds.is_empty() {
         return;
     }
     // 层内容走 f32（>1.0 存活），滤镜在未裁剪的数据上做，合成也不裁剪
-    let content = render_inner_f32(scene.width, scene.height, &layer.scene, eps);
+    let content = render_inner_f32(scene.width, scene.height, &layer.scene, eps, mip_bias);
     let Some((bx, by, buf)) =
         layer_buffer_from_content_f32(&content, scene.width, scene.height, layer)
     else {
@@ -1205,7 +1235,7 @@ fn composite_layer_f32(
 pub fn render(binned: &BinnedScene) -> Vec<u8> {
     let mut img = render_tiles(binned, None);
     for layer in &binned.scene_layers {
-        composite_layer(&mut img, &binned.source_scene, layer, binned.eps);
+        composite_layer(&mut img, &binned.source_scene, layer, binned.eps, binned.mip_bias);
     }
     img
 }

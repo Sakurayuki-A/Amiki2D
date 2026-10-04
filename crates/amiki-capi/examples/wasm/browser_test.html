@@ -1,0 +1,200 @@
+<!DOCTYPE html>
+<!-- ============================================================================
+Amiki2D WASM 浏览器验证页（门 3：纯 CPU 构建三浏览器字节验证）
+场景与 `minimal.js`（Node）逐调用一致；输出为同一份 24 位 BMP，
+SHA-256 应等于原生 CPU 参考的哈希（页面里写死）。
+经由 HTTP 服务访问（wasm 不能用 file:// 直接取），结果写入
+#result（PASS/FAIL）与 document.title，供自动化读取。
+============================================================================ -->
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<title>amiki-wasm-testing</title>
+<style>
+  body { background: #181a20; color: #dfe3ea; font-family: Consolas, monospace; padding: 16px; }
+  .ok { color: #6de29a; } .bad { color: #ff7b72; }
+  canvas { border: 1px solid #3a3f4a; image-rendering: pixelated; }
+  pre { white-space: pre-wrap; }
+</style>
+</head>
+<body>
+<h2>Amiki2D 0.6.0 WASM（纯 CPU）三浏览器验证</h2>
+<canvas id="cv" width="640" height="400"></canvas>
+<pre id="log">loading…</pre>
+<div id="result">RUNNING</div>
+<script>
+// amiki.js 是 CommonJS（Node）模块：垫出 require/module，让它在浏览器里加载。
+// 只用它的 Amiki 类（实例化由本页自己做，不走 load() —— 那条路要 Node 的 fs）。
+window.module = { exports: {} };
+window.require = (name) => {
+    if (name === 'fs') {
+        return { readFileSync: () => { throw new Error('fs 在浏览器不可用（本页不经过 load()）'); },
+                 existsSync: () => false };
+    }
+    throw new Error('unexpected require: ' + name);
+};
+// amiki.js 用到 Node Buffer 的两个能力：Buffer.from(u8).toString('utf8') 与
+// Buffer.from(text, 'utf8')。TextDecoder/TextEncoder 语义一致。
+class BufferShim extends Uint8Array {
+    static from(src, enc) {
+        if (typeof src === 'string') return new TextEncoder().encode(src);
+        return new BufferShim(src);
+    }
+    toString(enc) {
+        return new TextDecoder('utf-8').decode(this);
+    }
+}
+window.Buffer = BufferShim;
+</script>
+<script src="amiki.js"></script>
+<script type="module">
+const { Amiki, Backend, LineCap, LineJoin, BlendMode } = window.module.exports;
+const expectedSha = 'd565cc36c4933865960d48f9ec25f181b7ecd0ddd7cb02ad0d48927f0cc90633';
+const W = 640, H = 400;
+
+const logEl = document.getElementById('log');
+const lines = [];
+function log(s) { lines.push(s); logEl.textContent = lines.join('\n'); }
+
+try {
+    // ── 加载（纯 CPU 构建的模块没有任何必需 import）──
+    const bytes = new Uint8Array(await (await fetch('amiki2d.wasm')).arrayBuffer());
+    const { instance } = await WebAssembly.instantiate(bytes, {});
+    const amiki = new Amiki(instance.exports);
+    log(`Amiki2D ${amiki.versionString()}（wasm ${(bytes.length / 1024).toFixed(1)} KB）`);
+
+    // ── 行为验证 1：GPU 后端必须显式拒绝，不静默降级 ──
+    try {
+        amiki.contextCreate(Backend.Gpu);
+        log('后端：GPU 可用（异常：纯 CPU 构建不应有 GPU）');
+    } catch (e) {
+        log(`后端：GPU 不可用（${e.code === 3 ? 'BackendUnavailable' : e.code}），用 CPU`);
+    }
+
+    const ctx = amiki.contextCreate(Backend.Cpu);
+    const cv = amiki.canvasCreate(ctx, W, H);
+    log(`后端：${amiki.contextBackend(ctx) === Backend.Cpu ? 'CPU' : 'GPU'}（${amiki.contextAdapterName(ctx)}）`);
+
+    // ── 场景：与 minimal.js 逐调用一致 ──
+    amiki.drawRect(cv, 0, 0, W, H, amiki.paintSolid(amiki.colorRgb8(24, 26, 32)));
+    {
+        const poly = amiki.pathCreate();
+        amiki.pathMoveTo(poly, 60, 300);
+        amiki.pathLineTo(poly, 160, 220);
+        amiki.pathLineTo(poly, 260, 320);
+        amiki.pathLineTo(poly, 360, 200);
+        const style = amiki.strokeStyleNew(8.0, LineCap.Round, LineJoin.Round);
+        amiki.strokePath(cv, poly, style, amiki.paintSolid(amiki.colorRgb8(90, 200, 250)));
+        amiki.pathDestroy(poly);
+    }
+    {
+        const grad = amiki.gradientCreateRadial(470, 150, 110, [
+            { t: 0.0, color: amiki.colorRgb8(255, 214, 102) },
+            { t: 0.5, color: amiki.colorRgb8(255, 122, 89) },
+            { t: 1.0, color: amiki.colorRgb8(160, 80, 200) },
+        ]);
+        amiki.drawCircle(cv, 470, 150, 100, amiki.paintGradient(grad));
+        amiki.gradientDestroy(grad);
+    }
+    {
+        const checker = new Uint8Array(8 * 8 * 4);
+        for (let y = 0; y < 8; y++) {
+            for (let x = 0; x < 8; x++) {
+                const on = ((x ^ y) & 1) !== 0;
+                const o = (y * 8 + x) * 4;
+                checker[o] = checker[o + 1] = checker[o + 2] = on ? 255 : 40;
+                checker[o + 3] = 255;
+            }
+        }
+        const img = amiki.imageCreateRgba8(checker, 8, 8);
+        amiki.drawImage(cv, img, 40, 40, 200, 160);
+        amiki.imageDestroy(img);
+    }
+    amiki.beginLayer(cv, { x: 300, y: 240, width: 300, height: 140 },
+        amiki.filterBlur(6.0), 1.0, BlendMode.Normal);
+    amiki.drawRect(cv, 330, 280, 430, 340, amiki.paintSolid(amiki.colorRgb8(120, 255, 170)));
+    amiki.drawCircle(cv, 480, 310, 40, amiki.paintSolid(amiki.colorRgb8(255, 210, 90)));
+    amiki.endLayer(cv);
+    {
+        // 字体走 HTTP 取（与 Node 的相对路径同一份文件）
+        const resp = await fetch('../../../../assets/fonts/Inter-Regular.ttf');
+        if (resp.ok) {
+            const fontBytes = new Uint8Array(await resp.arrayBuffer());
+            const font = amiki.fontCreateFromMemory(fontBytes);
+            amiki.drawText(cv, font, 'Amiki2D C ABI', 40, 120, 42,
+                amiki.paintSolid(amiki.colorRgb8(240, 244, 255)));
+            amiki.fontDestroy(font);
+            log('字体：Inter（HTTP 加载）');
+        } else {
+            log('字体：未找到，跳过文本（会与参考哈希不一致）');
+        }
+    }
+
+    // ── 渲染 + 24 位 BMP（与 writeBmp 同一份逻辑：自底向上 + 行对齐）──
+    const px = amiki.renderRgba8(cv);
+    const rowRaw = W * 3, pad = (4 - (rowRaw % 4)) % 4, row = rowRaw + pad;
+    const dataSize = row * H;
+    const bmp = new Uint8Array(54 + dataSize);
+    const dv = new DataView(bmp.buffer);
+    bmp.set([0x42, 0x4d], 0);                       // 'BM'
+    dv.setUint32(2, 54 + dataSize, true);
+    dv.setUint32(10, 54, true);
+    dv.setUint32(14, 40, true);
+    dv.setInt32(18, W, true);
+    dv.setInt32(22, H, true);
+    dv.setUint16(26, 1, true);
+    dv.setUint16(28, 24, true);
+    dv.setUint32(34, dataSize, true);
+    dv.setInt32(38, 2835, true);
+    dv.setInt32(42, 2835, true);
+    let o = 54;
+    for (let y = H - 1; y >= 0; y--) {
+        for (let x = 0; x < W; x++) {
+            const s = (y * W + x) * 4;
+            bmp[o + x * 3 + 0] = px[s + 2];
+            bmp[o + x * 3 + 1] = px[s + 1];
+            bmp[o + x * 3 + 2] = px[s + 0];
+        }
+        o += row;
+    }
+
+    // ── 行为验证 2：越界枚举显式拒绝 ──
+    const rc = amiki.ex.amiki_canvas_set_blend(cv, 9999);
+    log(`越界枚举被正确拒绝：rc=${rc}`);
+
+    // ── 哈希对比 ──
+    const digest = await crypto.subtle.digest('SHA-256', bmp);
+    const sha = [...new Uint8Array(digest)].map(b => b.toString(16).padStart(2, '0')).join('');
+    const pass = sha === expectedSha;
+    log(`BMP SHA-256 = ${sha}`);
+    log(`期望         = ${expectedSha}`);
+    log(pass ? '字节一致 ✅' : '字节不一致 ❌');
+
+    // 画面放到 canvas 上供人工目视
+    const imgData = new ImageData(new Uint8ClampedArray(px.slice()), W, H);
+    document.getElementById('cv').getContext('2d').putImageData(imgData, 0, 0);
+
+    const el = document.getElementById('result');
+    el.textContent = pass ? 'PASS' : 'FAIL';
+    el.className = pass ? 'ok' : 'bad';
+    document.title = pass ? 'amiki-wasm-pass' : 'amiki-wasm-fail';
+
+    // 回报给本地服务器（无头模式没有 DOM 读取通道，服务器日志即凭证）。
+    // 浏览器名由启动 URL 的 ?browser= 指定。
+    const who = new URLSearchParams(location.search).get('browser') || 'unknown';
+    fetch(`/record?browser=${encodeURIComponent(who)}&result=${pass ? 'PASS' : 'FAIL'}&sha=${sha}&ver=${amiki.versionString()}`)
+        .catch(() => {});
+
+    amiki.canvasDestroy(cv);
+    amiki.contextDestroy(ctx);
+} catch (e) {
+    log('异常：' + (e.stack || e.message));
+    document.getElementById('result').textContent = 'FAIL';
+    document.title = 'amiki-wasm-fail';
+    const who = new URLSearchParams(location.search).get('browser') || 'unknown';
+    fetch(`/record?browser=${encodeURIComponent(who)}&result=FAIL&err=${encodeURIComponent((e.message || '').slice(0, 120))}`)
+        .catch(() => {});
+}
+</script>
+</body>
+</html>

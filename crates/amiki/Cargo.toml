@@ -35,13 +35,22 @@ pollster = { workspace = true }
 amiki-text = { path = "../amiki-text" }
 amiki-layout = { path = "../amiki-layout" }
 
-# 两个示例都直接用了 GPU 后端，所以纯 CPU 构建（`--no-default-features`）下
-# 不该被编译。用 `required-features` 声明依赖，cargo 会自动跳过它们 ——
-# 比在示例里堆 `#[cfg]` 清楚得多。
+# 四个示例都用了 GPU 后端（`window_demo` / `headless_png` / `mipmap_perf` 直接调
+# `amiki_gpu`，`mipmap_demo` 走门面的 `render_to_rgba`），所以纯 CPU 构建
+# （`--no-default-features`）下不该被编译。用 `required-features` 声明依赖，
+# cargo 会自动跳过它们 —— 比在示例里堆 `#[cfg]` 清楚得多。
 [[example]]
 name = "headless_png"
 required-features = ["gpu"]
 
 [[example]]
 name = "window_demo"
+required-features = ["gpu"]
+
+[[example]]
+name = "mipmap_demo"
+required-features = ["gpu"]
+
+[[example]]
+name = "mipmap_perf"
 required-features = ["gpu"]

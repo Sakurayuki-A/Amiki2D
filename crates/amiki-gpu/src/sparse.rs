@@ -99,7 +99,8 @@ impl GpuRenderer {
         // M6：图像放置参数 + 位图纹理数组（每 draw 3 个 vec4，自描述）
         let place_vec = pack_image_place(gs);
         let place_buf = mk_init("amiki_sparse_imgplace", bytemuck::cast_slice(&place_vec));
-        let (img_tex_view, img_sampler) = self.mk_image_texture_array(&gs.images)?;
+        let (img_tex_view, img_sampler, img_sampler_repeat) =
+            self.mk_image_texture_array(&gs.images)?;
 
         let data_buf = mk_init("amiki_sparse_data", bytemuck::cast_slice(&data));
         let entry_draws_buf = mk_init("amiki_sparse_edraws", bytemuck::cast_slice(&entry_draws));
@@ -432,6 +433,7 @@ impl GpuRenderer {
                 (6, &cell_meta_buf),
             ],
         );
+        // 0.6.0：fine 参数（宽高 / tile 列数 / draw 数）
         let fine_params = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("amiki_sparse_fine_params"),
             contents: bytemuck::bytes_of(&FineParams {
@@ -474,6 +476,10 @@ impl GpuRenderer {
                 wgpu::BindGroupEntry {
                     binding: 16,
                     resource: wgpu::BindingResource::Sampler(&img_sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 17,
+                    resource: wgpu::BindingResource::Sampler(&img_sampler_repeat),
                 },
             ],
         });

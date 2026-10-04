@@ -106,17 +106,18 @@ fn grad_color(g: u32, p: vec2<f32>) -> vec4<f32> {
 /// ```text
 /// image_place[d*3+0] = (origin.x, origin.y, u_axis.x, u_axis.y)
 /// image_place[d*3+1] = (v_axis.x, v_axis.y, tex_layer, 0)
-/// image_place[d*3+2] = (image_index, repeat, 0, 0)
+/// image_place[d*3+2] = (image_index, repeat, lod, 0)
 /// ```
-/// 把 `image_index` 与 `repeat` 放进**放置数据自身**，于是"这个 draw 是不是图像"
+/// 把 `image_index` 与 `repeat` 放进放置数据自身，于是"这个 draw 是不是图像"
 /// 无需另占 draw_meta 分量 —— 放置缓冲区自描述，也不会与渐变下标争位置。
 /// （`0xFFFF_FFFF` 表示该 draw 不是图像。）
 ///
 /// 放置是仿射映射：解 `p = origin + u*u_axis + v*v_axis` 得 uv。
 /// 退化（行列式≈0）时返回透明 —— 宁可该像素不画，也不要产出 NaN 像素。
 ///
-/// 用 `textureSampleLevel` 而非 `textureSample`：后者要求一致控制流，
-/// 而这里在"逐 draw 循环 + 条件"内调用。本引擎位图无 mip 链，故 level 固定 0。
+/// **LOD（B4）由宿主在 CPU 上算好**放进 `e2.z`：`log2` 在 CPU libm 与 GPU
+/// 内建函数之间可能差 1 ULP，而采样层级对它敏感，宿主算好打包就让
+/// GPU↔CPU 对拍没有这个漂移源。无 mip 链的图像该值为 0（纹理也只有 1 层）。
 fn image_color(d: u32, p: vec2<f32>) -> vec4<f32> {
     let e0 = image_place[d * 3u];
     let e1 = image_place[d * 3u + 1u];
@@ -137,11 +138,13 @@ fn image_color(d: u32, p: vec2<f32>) -> vec4<f32> {
     );
     let repeat = e2.y > 0.5;
     if (repeat) {
+        // UV 预取模仍保留：把 uv 归到 [0,1)，Repeat 采样器再处理
+        // 每层取纹素时的半纹素回绕
         uv = uv - floor(uv);
     } else {
         uv = clamp(uv, vec2<f32>(0.0), vec2<f32>(1.0));
     }
-    return image_sample(uv, i32(layer));
+    return image_sample(uv, i32(layer), e2.z, repeat);
 }
 
 /// `i32` 的欧几里得取模（WGSL 的 `%` 取余数、符号随被除数，不等价）。
@@ -150,12 +153,18 @@ fn wrap_i(v: i32, n: i32) -> i32 {
     return select(m, m + n, m < 0);
 }
 
-/// 位图采样：经采样器做双线性。
+/// 位图采样：经采样器做双线性（无 mip）或三线性（宿主给了 mip 链时，
+/// 采样器 `mipmap_filter: Linear`，显式 LOD 的小数部分驱动层间插值）。
 ///
 /// 用 `textureSampleLevel` 而非 `textureSample`：后者要求一致控制流，
-/// 而这里在"逐 draw 循环 + 条件"内调用。本引擎位图无 mip 链，故 level 固定 0。
-fn image_sample(uv: vec2<f32>, layer: i32) -> vec4<f32> {
-    return textureSampleLevel(image_tex, image_smp, uv, layer, 0.0);
+/// 而这里在"逐 draw 循环 + 条件"内调用。LOD 是宿主打包的常量。
+fn image_sample(uv: vec2<f32>, layer: i32, lod: f32, repeat: bool) -> vec4<f32> {
+    // select 两侧都会求值（textureSampleLevel 无一致性要求），只取所需分支
+    return select(
+        textureSampleLevel(image_tex, image_smp, uv, layer, lod),
+        textureSampleLevel(image_tex, image_smp_repeat, uv, layer, lod),
+        repeat,
+    );
 }
 
 /// 该 draw 是否为图像（`image_place` 自描述）。
@@ -191,6 +200,9 @@ struct FineParams {
 @group(0) @binding(14) var<storage, read> image_place: array<vec4<f32>>;
 @group(0) @binding(15) var image_tex: texture_2d_array<f32>;
 @group(0) @binding(16) var image_smp: sampler;
+/// B4：平铺专用的 Repeat 地址模式采样器 —— 接缝半纹素处必须真回绕，
+/// 与 CPU 的 rem_euclid 取纹素一致（ClampToEdge 会在层边缘钳住）。
+@group(0) @binding(17) var image_smp_repeat: sampler;
 
 fn shade(gid: vec3<u32>, coverage_only: bool) -> vec4<f32> {
     let tile_x = gid.x / 16u;

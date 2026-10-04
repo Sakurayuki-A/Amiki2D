@@ -92,8 +92,8 @@
 |---|---|
 | **GL 后端不支持位图** | 引擎**显式报错**（该后端读不出 `texture_2d_array`），见 RELEASE_PLAN §5 |
 | **DX12 冷启动约 2.3 s** | FXC 运行期编译着色器；可用 `AMIKI_BACKENDS` 指定后端 |
-| **`assets/fonts/` 里没有 CJK 字体** | 端到端 CJK 测试在干净环境上会跳过（会打印原因） |
-| **不做的能力** | 双向文本、Knuth-Plass、HDR、C ABI/WASM、图像 mipmap、动画系统 —— 见 RELEASE_PLAN §6 |
+| **引擎不做字体回退（无 font stack）** | `shape` / `layout` 每次只吃一个 `Font`：**一段文本只能用一种字体**。CJK 需要调用方显式用 `assets/fonts/NotoSansSC-Regular.ttf`（已随仓库分发，OFL 1.1）；只加载 Inter 时中文会画成方框。**这是声称能力上的缺口，正在补** |
+| **不做的能力** | 双向文本、Knuth-Plass、宽色域、各向异性过滤、动画系统 —— 见 RELEASE_PLAN §6（HDR 与 mipmap 已于 0.5.0 / 0.6.0 落地） |
 
 ## 六、环境变量
 

@@ -157,7 +157,7 @@ crates\amiki-capi\verify.cmd
 > **这个脚本验证过有牙**：把 C 示例背景色的一个通道从 24 改成 25，
 > 第 5 项立刻失败并返回退出码 1（C 的哈希变了，C# / Node 没变）。
 
-它检查的符号数当前是 **header 声明 68 / 导出 68，无缺失**。
+它检查的符号数当前是 **header 声明 74 / 导出 74，无缺失**（0.6.0 新增 `amiki_image_set_mipmap_mode` / `amiki_canvas_set_mip_bias`）。
 
 手工核对（不用脚本时）：
 

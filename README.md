@@ -1,7 +1,10 @@
 # Amiki2D
 
-**版本 `0.5.0-alpha`** —— 第五个 Alpha：**新增 WASM**。
-C ABI（0.4.0）让引擎能被 Rust 之外的语言调用（C / C# / Node 三个示例输出**逐字节一致**）；
+**版本 `0.6.0-alpha`** —— 第六个 Alpha：**新增 mipmap**（大幅缩小的位图不再走样，
+CPU 生成 mip 链、双端三线性逐像素一致，见 [变更记录](CHANGELOG.md)）。
+上一版 `0.5.0-alpha` 交付了 WASM（纯 CPU 构建，模块 **950.7 KB**）与 HDR。
+C ABI（0.4.0）让引擎能被 Rust 之外的语言调用（C / C# / Node 三个示例输出**逐字节一致**；
+三者均为**原生 FFI**，Node 走 koffi 而非 WASM）；
 WASM（0.5.0）让它在**浏览器与任何 JS 运行时**里跑（模块 **950.7 KB**，
 与原生 CPU 后端输出**逐字节一致**）。`0.3.0-alpha` 的发布判据 6 条**全部满足**。
 核心渲染管线（M1–M3）、工程硬化（M3.5）、增量渲染（M4）、文本（M5）、
@@ -15,8 +18,9 @@ P1-1 性能（提取 **2.03 → 0.59 ms**）与 P3 工程成熟度六项。
 与 **CJK 禁则**）、渐变（线性/径向/扫描）、位图（旋转/缩放/平铺）、
 模糊与投影（CPU/GPU 两侧逐像素一致），且**只重画改动处** ——
 含离屏层的场景也有脏区收益（带投影的静态界面**省 96.5% tile**）。
-**尚未**：双向文本、Knuth-Plass 全局最优断行、HDR/宽色域、C ABI/WASM；
-**跨厂商硬件未验证**（三个后端都在同一块 GPU 上验证，见[发布报告](docs/RELEASE_0.3.0-alpha.md)）。
+**尚未**：双向文本、Knuth-Plass 全局最优断行、宽色域、各向异性过滤；
+**跨厂商硬件未验证**（三个后端都在同一块 GPU 上验证，见[发布报告](docs/RELEASE_0.3.0-alpha.md)），
+**WASM 的 WebGPU 构建也未验证**（当前是纯 CPU 构建，见 `docs/KNOWN_ISSUES.md` 的 A2）。
 
 下一代通用 2D 渲染引擎 —— 目标不是复刻 Skia / Direct2D / Blend2D，而是站在它们肩上，以
 **GPU 计算着色器 + 解析式覆盖率** 为主线，构建一个前沿、通用、强大的 2D 渲染底座。
@@ -70,9 +74,19 @@ P1-1 性能（提取 **2.03 → 0.59 ms**）与 P3 工程成熟度六项。
 - **CJK 断行 + 禁则（P2-1）**：收尾标点不在行首、起始括号不在行尾；
   **OFL 中文字体随仓库分发**（Noto Sans SC）
 - Canvas 立即模式 API（变换栈/混合/裁剪栈）+ headless PNG + winit 动画示例
-- **C ABI（0.4.0）**：手写 `amiki.h` 契约（68 个导出符号）+ 三个绑定示例。
+- **C ABI（0.4.0）**：手写 `amiki.h` 契约（**72 个导出符号**）+ 三个绑定示例
+  （C / C# / Node，输出逐字节一致）。**三个示例都走原生 FFI**：
+  Node 用的是 [koffi](https://koffi.dev/)（纯 FFI，`npm install` 即用，
+  **不需要构建期下载任何工具链**，也不改 Rust 侧一行代码）——
+  它不是 WASM，与下面这条是两件独立的交付。
   引擎**绝不 panic 跨 FFI 边界**；panic 后对象中毒并显式拒绝后续调用。
   详见 [`crates/amiki-capi/README.md`](crates/amiki-capi/README.md)
+- **WASM（0.5.0）**：`crates/amiki-capi/examples/wasm/` 下的独立交付——
+  纯 CPU 构建（`--no-default-features`，模块 **965.9 KB**；0.5.0 时为
+  950.7 KB，0.6.0 加入 mipmap 后 +15 KB），JS 加载器用
+  **原生 WebAssembly API** 直调同一份 C ABI（不依赖 wasm-bindgen），
+  与原生 CPU 后端输出**字节一致**。
+  注意：浏览器里走 WebGPU **未验证**（A2）
 
 **尚未实现**（明确的边界）：even-odd 填充；双向文本（阿拉伯/希伯来）；
 Knuth-Plass 全局最优断行；HDR / 宽色域；C ABI / WASM；
@@ -102,6 +116,7 @@ cargo bench -p amiki-gpu                              # 基准（含显存与逐
 ## 文档
 
 - [**现状总览**](docs/OVERVIEW.md) —— 一页看清"这是什么、现在到哪了、接下来做什么"
+- [发布快照 0.6.0-alpha](docs/RELEASE_0.6.0-alpha.md) —— mipmap 交付物、验证证据、性能口径、已知问题
 - [发布报告 0.3.0-alpha](docs/RELEASE_0.3.0-alpha.md) —— 门禁状态、能力清单、性能数据、已知问题
 - [**C ABI**](crates/amiki-capi/README.md) —— 手写 header 契约 + 三个绑定示例（C / C# / Node）
 - [**WASM 示例**](crates/amiki-capi/examples/wasm/README.md) —— 原生 WebAssembly API，不依赖 wasm-bindgen

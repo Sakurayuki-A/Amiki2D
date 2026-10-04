@@ -277,6 +277,96 @@ fn gpu_image_matches_cpu() {
     }
 }
 
+/// B4：**mip 采样下 GPU 与 CPU 逐像素一致**。
+///
+/// 用伪随机噪声图（各 mip 层内容真实不同，层级选错立刻暴露），
+/// 缩小到 **LOD 带小数部分**（≈1.68）——整数 LOD 只采一层，只有小数部分
+/// 才能验证"层间插值 + 层内双线性"的两端语义一致。
+/// 同时覆盖旋转（雅可比含切变，LOD 从轴向量算）与平铺（LOD 按单元算）。
+#[test]
+fn gpu_image_mipmap_matches_cpu() {
+    use amiki_math::{Affine, Vec2};
+    use amiki_scene::{Color, Image, ImagePlacement, Paint, PathBuilder, Scene};
+
+    let Ok(renderer) = pollster::block_on(GpuRenderer::new()) else {
+        eprintln!("跳过：无 GPU 适配器");
+        return;
+    };
+
+    // 64×64 噪声图，带 mip 链
+    let (iw, ih) = (64u32, 64u32);
+    let mut data = Vec::with_capacity((iw * ih * 4) as usize);
+    for i in 0..(iw * ih) {
+        let v = (i * 7 % 251) as u8;
+        let g = (v as u32 * 3 % 255) as u8;
+        let b = (v as u32 * 11 % 255) as u8;
+        data.extend([v, g, b, 255]);
+    }
+    let img = std::sync::Arc::new(Image::from_rgba8_with_mipmap(iw, ih, data).expect("图像数据合法"));
+
+    // 缩小 3.2×：LOD = log2(64/20) ≈ 1.68（带小数 → 驱动层间插值）
+    let cases: Vec<(&str, ImagePlacement)> = vec![
+        ("缩小", ImagePlacement::rect(4.0, 4.0, 24.0, 24.0)),
+        (
+            "缩小+旋转",
+            ImagePlacement {
+                origin: Vec2::new(30.0, 6.0),
+                u_axis: Vec2::new(14.0, 7.0), // |u_axis| = 15.6 → LOD ≈ 2.04 附近
+                v_axis: Vec2::new(-7.0, 14.0),
+                repeat: false,
+            },
+        ),
+        ("缩小+平铺", ImagePlacement { repeat: true, ..ImagePlacement::rect(0.0, 0.0, 40.0, 40.0) }),
+    ];
+
+    for (name, place) in cases {
+        let mut scene = Scene::new(72, 72);
+        let mut pb = PathBuilder::new();
+        let p = |u: f32, v: f32| place.origin + place.u_axis * u + place.v_axis * v;
+        let (mut x0, mut y0, mut x1, mut y1) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
+        for (u, v) in [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)] {
+            let q = p(u, v);
+            x0 = x0.min(q.x);
+            y0 = y0.min(q.y);
+            x1 = x1.max(q.x);
+            y1 = y1.max(q.y);
+        }
+        pb.rect(x0, y0, x1, y1);
+        scene.push(Affine::IDENTITY, pb.build(), Paint::Solid(Color::rgb8(250, 250, 250)));
+        scene.push(
+            Affine::IDENTITY,
+            pb.build(),
+            Paint::Image { image: img.clone(), placement: place },
+        );
+
+        // GL 后端读不出位图，引擎显式报错（同 gpu_image_matches_cpu 的处理）
+        let gpu = match renderer.render_blocking_with(&scene, 0.05, amiki_scene::ToneMap::Raw, 0.0) {
+            Ok(v) => v,
+            Err(e) if e.to_string().contains("GL 后端无法正确读取位图") => {
+                eprintln!("GL 后端：位图按预期显式拒绝");
+                return;
+            }
+            Err(e) => panic!("GPU 渲染失败：{e}"),
+        };
+        let cpu = amiki_raster::render(&amiki_raster::bin(&scene, 0.05));
+
+        let mut max_diff = 0u32;
+        let mut worst = 0usize;
+        for (i, (a, b)) in gpu.iter().zip(cpu.iter()).enumerate() {
+            let d = (*a as i32 - *b as i32).unsigned_abs();
+            if d > max_diff {
+                max_diff = d;
+                worst = i;
+            }
+        }
+        assert!(
+            max_diff <= 3,
+            "{name}放置（mip）：GPU 与 CPU 最大通道差 {max_diff}（字节偏移 {worst}）超出容差"
+        );
+        eprintln!("GPU 位图 mip（{name}放置）与 CPU 一致（最大通道差 {max_diff}）");
+    }
+}
+
 /// M6：**GPU 离屏层（滤镜）必须与 CPU 参考实现逐像素一致**。
 ///
 /// 这是"滤镜双端一致"的唯一依据。两端的模糊是独立的两份实现

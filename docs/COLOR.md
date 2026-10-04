@@ -79,17 +79,43 @@ alpha **不参与映射** —— 它是覆盖率，不是光。
 还原颜色（否则会偏色），但逐通道是通行简化（Narkowicz 原文也是这么用的）。
 需要严格做法时，那应当是一个独立的、明确的选择。
 
-### 5. 已知的不一致
+### 5. 三种映射接进了哪些路径（B13 已关闭）
 
-`ToneMap` 目前通过 GPU 侧的回读 API 使用：
+三种映射（`Raw` / `Reinhard` / `Aces`）在 **CPU 与 GPU 两条渲染路径都可用**，
+也能从 C ABI 设置：
 
-```rust
-let px = renderer.readback_f32(&tex)?;              // f32，不裁剪
-let out = rgba8_from_f32_with(&px, ToneMap::Aces);  // 降范围
-```
+- **CPU**：`amiki-raster` 的 `render_f32` / `render_with_tone`
+  （`Raw` 走快路径，不分配 f32 缓冲）
+- **GPU**：`amiki-gpu` 的 `render_blocking_with(scene, eps, tone)`；
+  逐像素手动降范围仍走 `readback_f32` + `rgba8_from_f32_with`
+- **C ABI**：`amiki_canvas_set_tone_map` / `amiki_canvas_tone_map`
+  （`AMIKI_TONEMAP_RAW` / `AMIKI_TONEMAP_REINHARD` / `AMIKI_TONEMAP_ACES`），
+  两条后端路径共用同一个设置
 
-**还没有接进 `render_blocking` / C ABI** —— 那两条路径固定用 `Raw`。
-这是待办，不是设计（见 `docs/KNOWN_ISSUES.md` 的 B13）。
+**越界的枚举值显式失败，且不改动已有设置** —— 静默退回默认会让
+"设错了"看起来像"设上了"。
+
+验证：`tone_map_changes_the_output_of_an_hdr_pixel`（ABI 层）与
+`render_with_tone_reaches_the_cpu_output`（光栅器层）断言三种映射给出
+**互不相同**的输出。
+
+### 6. mipmap：缩小滤波的平均空间（0.6.0）
+
+mip 链（B4）在**线性光空间、预乘 alpha** 上做 2×2 盒式平均，这与本文件的
+两条结论并不矛盾，而是它们的直接推论：
+
+- **平均是"面积运算"**：把 4 个纹素的光量加起来摊平，只有在线性空间里
+  才守恒。在 sRGB 编码空间直接平均，黑白棋盘的平均会得到编码中点 128，
+  而线性平均的正确答案是 sRGB 188 —— 明显偏暗。专项测试
+  `averaging_happens_in_linear_light_not_in_encoded_space` 钉住这个分界。
+- **层间/层内插值仍在编码值上进行**：三线性的"插值"与双线性一样，
+  是显示空间的混合（与其它 2D 库一致）。只有"生成层级内容"的那一步
+  平均是线性的。
+- **预乘只为平均**：透明像素的 RGB 无定义，不预乘直接平均会把 (0,0,0)
+  混进来（黑边）。平均完立刻反预乘，存储仍是直线色。
+  alpha 本身是覆盖率，不参与 sRGB 编解码，按普通标量平均。
+
+实现与测试：`crates/amiki-scene/src/mipmap.rs`。
 
 ## 关于 "HDR" 这个词
 
@@ -105,10 +131,13 @@ let out = rgba8_from_f32_with(&px, ToneMap::Aces);  // 降范围
 
 ## 参考
 
-- 实现：[`crates/amiki-gpu/src/readback.rs`](../crates/amiki-gpu/src/readback.rs)
-  的 `ToneMap` / `srgb_to_linear` / `linear_to_srgb` / `rgba8_from_f32_with`
-- 测试：同文件的 `tone_maps_are_monotone_and_land_in_range` /
+- 实现：[`crates/amiki-scene/src/tone.rs`](../crates/amiki-scene/src/tone.rs)
+  的 `ToneMap`（`Raw` / `Reinhard` / `Aces`）；sRGB 编解码与
+  `rgba8_from_f32_with` 在 `amiki-raster` / `amiki-gpu` 各自的实现里
+- 测试：`tone_maps_are_monotone_and_land_in_range` /
   `srgb_encode_decode_round_trips` /
   `tone_mapping_distinguishes_hdr_levels_instead_of_flattening_them`
-  （最后一条里写明了"4.0 是错的量级"这段经历）
-- 相关：`docs/KNOWN_ISSUES.md` 的 B13（色调映射还没接进 `render_blocking` / C ABI）
+  （最后一条里写明了"4.0 是错的量级"这段经历）；
+  ABI 层的 `tone_map_changes_the_output_of_an_hdr_pixel`
+- 历史：`docs/KNOWN_ISSUES.md` 的 B13（色调映射曾只挂在回读 API 上，
+  0.5.0 接进渲染路径与 C ABI 后关闭）

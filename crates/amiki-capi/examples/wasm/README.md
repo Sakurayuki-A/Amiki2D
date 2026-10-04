@@ -14,10 +14,14 @@ build.cmd
 
 ```
 [3/3] running the Node demo ...
-Amiki2D 0.4.0-alpha（wasm，950.7 KB）
+
+Amiki2D 0.6.0-alpha（wasm，965.9 KB）
 后端：GPU 不可用（BackendUnavailable），用 CPU
 后端：CPU（CPU）
+字体：..\..\..\..\assets\fonts\Inter-Regular.ttf
 已写出 amiki_wasm_demo.bmp（640×400，1024000 字节）
+越界枚举被正确拒绝：invalid argument
+完成
 
 [verify] building a native CPU reference and byte-comparing ...
 [OK]   native CPU and WASM outputs are BYTE-IDENTICAL
@@ -31,14 +35,18 @@ cargo build -p amiki-capi --profile wasm-release \
 node minimal.js target/wasm32-unknown-unknown/wasm-release/amiki2d.wasm
 ```
 
-## 体积：**950.7 KB**
+## 体积：**965.9 KB**
 
 这是这一版最需要注意的数字。同一个模块：
 
 | 构建 | 体积 |
 |---|---|
 | `--profile release`（`debug = true`） | **11.7 MB** |
-| `--profile wasm-release`（`debug = false`） | **950.7 KB** |
+| `--profile wasm-release`（`debug = false`） | **965.9 KB** |
+
+> **历史**：0.5.0 首次落地时是 **950.7 KB**；0.6.0 把 mipmap 的链生成与
+> sRGB 查表加进 `amiki-scene`（wasm 构建包含它），模块 **+15 KB**。
+> 两个数字都对，只是属于不同版本 —— 引用时请带上版本号。
 
 **主导因素是 `debug = false`**，差 12 倍。仓库根 `Cargo.toml` 里的
 `[profile.release] debug = true` 是为**原生 profiling** 加的，在 wasm 里
@@ -110,12 +118,19 @@ WASM 构建**关掉了 `gpu` feature**（否则 wgpu 会把模块推到 23 MB）
 ## ⚠️ 未验证：WebGPU 构建
 
 浏览器里 wgpu 可以走 **WebGPU** 后端，但**这一版没有验证过**：
+本机 **Node 24 的 `navigator.gpu` 是 `undefined`**（无 WebGPU），也没有可用的
+浏览器环境。所以「WebGPU 构建」是**已知未验证项**，不写成"已支持"。
 
-- 本机 **Node 24 的 `navigator.gpu` 是 `undefined`**（无 WebGPU）
-- 没有可用的浏览器环境
+**体积不是障碍**（0.6.0 实测）：带 `--features gpu` 的 wasm 模块 **2.5 MB**
+—— 远低于早先 23 MB 的预估 —— 经 wasm-bindgen CLI 胶水后 **1.43 MB**，
+C ABI 导出完整保留，CPU 路径可用。
 
-所以「WebGPU 构建」是**已知未验证项**，不写成"已支持"。
-要做它需要带上 `wgpu` 的 web 特性并把模块体积重新评估（当前 23 MB ✗）。
+真正的阻塞点是**架构的**：`amiki_context_create` 是同步的，而 WebGPU 初始化
+是异步的 —— 引擎用 `pollster::block_on` 同步等待，在无 WebGPU 的环境直接
+panic-abort（wasm 构建为 `panic = "abort"`），在真实浏览器主线程则会**死锁**
+（被阻塞的事件循环永远等不到异步请求完成）。解法需要 **C ABI 层的异步重构**
+（GPU 上下文异步创建或就绪轮询），是设计变更而非稳定性修复。
+详见 [`docs/KNOWN_ISSUES.md`](../../../../docs/KNOWN_ISSUES.md) 的 **A2**。
 
 ## 演示覆盖了什么
 

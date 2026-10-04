@@ -130,3 +130,69 @@ cargo doc --workspace --no-deps
 
 ⚠️ **这三行都来自同一块 GPU。** 判据要求的是**两个不同厂商** ——
 本文件的作用就是把"另一块"的验证变得可执行。
+
+---
+
+## 七、浏览器验证记录（WASM，纯 CPU）
+
+WASM 交付的强验证是"**浏览器里的输出与原生 CPU 参考逐字节相同**"。
+验证页 `crates/amiki-capi/examples/wasm/browser_test_standalone.html`
+（单文件、`file://` 直开）在**页内**自校验 SHA-256，所以只要拿得到
+`document.title`（`amiki-wasm-pass` / `amiki-wasm-fail`）或 `#result` 的文本，
+就等于拿到了结论 —— 不需要人去比像素。
+
+| 浏览器 | 版本 | 结果 | 期望哈希 | 记录时间 |
+|---|---|---|---|---|
+| Chrome | 无头模式，版本未记录 | ✅ **PASS** | `fc9482ba…` | 0.7.0-alpha |
+| **Firefox** | **157.0** | ✅ **PASS** | `fc9482ba…` | 0.7.0-alpha |
+| Edge | 未复验 | — | — | — |
+
+**Firefox 157.0 的完整证据**：
+
+```text
+browserVersion = 157.0        platformName = windows
+TITLE          = amiki-wasm-pass
+RESULT_TEXT    = PASS
+PAGE_LOG:
+  Amiki2D 0.7.0-alpha（wasm 987.9 KB）      ← 模块加载成功
+  后端：GPU 不可用（BackendUnavailable），用 CPU
+  后端：CPU（CPU）
+  字体：Inter-Regular.ttf（内嵌）            ← 两个字体都来自页内 base64
+  字体：NotoSansSC-Regular.ttf（内嵌）
+  越界枚举被正确拒绝：rc=1
+  BMP SHA-256 = fc9482ba147ffd075b06055c95141eee06bec710ce31767c65ce7de58adccb0d
+  期望         = fc9482ba147ffd075b06055c95141eee06bec710ce31767c65ce7de58adccb0d
+  字节一致 ✅
+PASS
+```
+
+画面（由 `WebDriver:TakeScreenshot` 取回）同时渲染了 `Amiki2D C ABI`（拉丁）
+与 `你好 Amiki2D 世界`（汉字走 Noto），**中文无方框**；
+截图存于 `out/wasm_firefox_pass.png`。
+
+### 怎么复跑（不用装 Playwright）
+
+Firefox **自带 Marionette**（WebDriver 协议），所以**零下载**即可做"等待式"验证：
+
+```bash
+# 1) 起一个独立 profile 的 Firefox：headless + 打开 Marionette 端口 2828
+"…/firefox.exe" --headless --marionette -no-remote -profile <临时目录> about:blank
+# 2) 连 127.0.0.1:2828：轮询 document.title，出现 amiki-wasm-pass / amiki-wasm-fail
+#    之后再取 #result / #log 文本与 WebDriver:TakeScreenshot
+node out/ff_marionette.js 2828 "file:///…/browser_test_standalone.html" out/wasm_firefox_pass.png
+```
+
+**四个坑（都实测踩过，照抄可省时间）**：
+
+1. **不要用 `--screenshot`**：Firefox 的截图发生在 `load` 事件附近，
+   而本页是"wasm 实例化 + 渲染"的异步流程 —— 定时/自动截图会抓到
+   `loading…/RUNNING` 的半成品。**那不是失败，是验证未完成。**
+2. **Marionette 协议 3 用数组帧**：命令 `[0, id, name, params]`、
+   响应 `[1, id, error, result]`；按对象帧（协议 2 的样子）发过去会**没有任何响应**
+   （表现为"连接建立了但命令永远超时"）。连接后还要先握手：
+   `{"applicationType":"gecko","marionetteProtocol":3}`（服务端通常会主动发）。
+3. **CDP 的 `/json/list` 在 Firefox 上不存在**（`/json`、`/json/version` 都是 404，
+   端口只在听裸 WebSocket），所以不要照搬 Chrome 的发现流程。
+4. **抓 Firefox 窗口不要用 `PrintWindow` / 屏幕拷贝**：Firefox 走 GPU 合成，
+   前者内容区是空白或启动画面，后者依赖 z 序（实测抓到过别的窗口）。
+   用 `WebDriver:TakeScreenshot` 才拿得到真实内容。

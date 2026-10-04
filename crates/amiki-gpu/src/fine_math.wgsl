@@ -116,6 +116,42 @@ fn seg_area(p0: vec2<f32>, p1: vec2<f32>, c: vec2<f32>) -> f32 {
     return s * (ic - xl * len - len);
 }
 
+// ============ 1D 派发：脏 tile 索引表 ============
+
+/// 单维 workgroup 上限（WebGPU 规范保证的下限）。
+/// 用 z 维分批，因此支持任意画布尺寸（8K 的 129 600 个 tile 也放得下）。
+const TILES_PER_DISPATCH_BATCH: u32 = 65535u;
+
+/// 本次 invocation 负责的 tile 与画布像素坐标。
+struct TileHit {
+    tile_x: u32,
+    tile_y: u32,
+    /// 画布像素坐标（**不是** invocation id）
+    px: u32,
+    py: u32,
+}
+
+/// 1D 派发的 tile 表下标：x 维 = `tile 序号 * 16 + tile 内列`，z 维 = 批次。
+///
+/// 调用方必须先拿它和 `params.n_tiles` 比较再读 `dirty_tiles` —— 末尾一批会
+/// 多出若干 invocation（分批不是整除），越界读虽然是良定义（返回 0），但那样
+/// 会让它们跑去重算 tile (0,0)，白白多做一遍工作。
+fn tile_index_of(gid: vec3<u32>) -> u32 {
+    return gid.x / 16u + gid.z * TILES_PER_DISPATCH_BATCH;
+}
+
+/// 把"脏 tile 索引表的表项"与 invocation 合成 tile/像素坐标。
+///
+/// `packed = tx | ty << 16`。**tile 坐标来自表，不来自 invocation** ——
+/// 这正是修复"派发起点被丢弃"的关键：wgpu 的 `dispatch_workgroups` 没有起点
+/// 偏移，若让内核从 gid 直接推坐标，就隐含"从 (0,0) 起步"的假设，
+/// 脏区不在左上角时会去重算错误的 tile（静默残影）。
+fn tile_hit(packed: u32, gid: vec3<u32>) -> TileHit {
+    let tx = packed & 0xFFFFu;
+    let ty = packed >> 16u;
+    return TileHit(tx, ty, tx * 16u + (gid.x % 16u), ty * 16u + gid.y);
+}
+
 // ============ 混合模式（W3C compositing）============
 
 fn hard_light(b: f32, s: f32) -> f32 {

@@ -433,7 +433,16 @@ impl GpuRenderer {
                 (6, &cell_meta_buf),
             ],
         );
-        // 0.6.0：fine 参数（宽高 / tile 列数 / draw 数）
+        // 0.6.1：fine 的**脏 tile 索引表**（1D 派发的输入）。
+        // 全量渲染时它就是整幅画布的 tile，因此只有一条代码路径。
+        // 空表（无脏区）时仍要绑一个合法缓冲 —— 但不会派发任何 workgroup。
+        let fine_tiles = dirty_tile_list(damage, tiles_x, tiles_y);
+        let n_fine_tiles = fine_tiles.len() as u32;
+        let fine_tiles_dummy = [0u32; 1];
+        let fine_tiles_slice: &[u32] =
+            if fine_tiles.is_empty() { &fine_tiles_dummy } else { &fine_tiles };
+        let dirty_tiles_buf =
+            mk_init("amiki_sparse_dirty_tiles", bytemuck::cast_slice(fine_tiles_slice));
         let fine_params = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("amiki_sparse_fine_params"),
             contents: bytemuck::bytes_of(&FineParams {
@@ -441,6 +450,8 @@ impl GpuRenderer {
                 height: gs.height,
                 tiles_x,
                 n_draws,
+                n_tiles: n_fine_tiles,
+                _pad: [0; 3],
             }),
             usage: wgpu::BufferUsages::UNIFORM,
         });
@@ -481,6 +492,11 @@ impl GpuRenderer {
                     binding: 17,
                     resource: wgpu::BindingResource::Sampler(&img_sampler_repeat),
                 },
+                // 0.6.1：脏 tile 索引表
+                wgpu::BindGroupEntry {
+                    binding: 18,
+                    resource: dirty_tiles_buf.as_entire_binding(),
+                },
             ],
         });
         let t_enc2 = Instant::now();
@@ -509,9 +525,13 @@ impl GpuRenderer {
                 pass.set_pipeline(&self.sparse_fine_pipeline);
             }
             pass.set_bind_group(0, &b_fine, &[]);
-            // M4：只派发脏 tile 子矩形（理由见 run_pipeline_impl 处注释）
-            let (_fx, fw, _fy, fh) = fine_dispatch_range(damage, tiles_x, tiles_y);
-            pass.dispatch_workgroups(fw, fh, 1);
+            // 0.6.1：**1D 派发** —— workgroup 数 = 要重算的 tile 数（脏 tile 表
+            // 长度），tile 坐标由内核查表得到。z 维分批规避单维 65535 上限。
+            // 这样"派发起点"不再是一个必须传递、又容易被丢掉的参数。
+            if n_fine_tiles > 0 {
+                let (fx, fz) = fine_dispatch_dims(n_fine_tiles);
+                pass.dispatch_workgroups(fx, 1, fz);
+            }
         }
         prof.encode2_ms = t_enc2.elapsed().as_secs_f64() * 1000.0;
         let t_sub2 = Instant::now();

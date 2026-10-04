@@ -177,6 +177,11 @@ struct FineParams {
     height: u32,
     tiles_x: u32,
     n_draws: u32,
+    /// 本次派发要重算的 tile 数（脏 tile 表长度）；末尾批次的尾巴靠它退出
+    n_tiles: u32,
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
 }
 
 @group(0) @binding(0) var<uniform> params: FineParams;
@@ -203,12 +208,15 @@ struct FineParams {
 /// B4：平铺专用的 Repeat 地址模式采样器 —— 接缝半纹素处必须真回绕，
 /// 与 CPU 的 rem_euclid 取纹素一致（ClampToEdge 会在层边缘钳住）。
 @group(0) @binding(17) var image_smp_repeat: sampler;
+/// 0.6.1：要重算的 tile 表（`tx | ty << 16`）。1D 派发 + 查表定位，
+/// 因此**没有"派发起点"这个概念** —— 也就不会丢掉起点。
+@group(0) @binding(18) var<storage, read> dirty_tiles: array<u32>;
 
-fn shade(gid: vec3<u32>, coverage_only: bool) -> vec4<f32> {
-    let tile_x = gid.x / 16u;
-    let tile = (gid.y / 16u) * params.tiles_x + tile_x;
-    let row = gid.y % 16u;
-    let center = vec2<f32>(f32(gid.x) + 0.5, f32(gid.y) + 0.5);
+fn shade(h: TileHit, coverage_only: bool) -> vec4<f32> {
+    let tile = h.tile_y * params.tiles_x + h.tile_x;
+    let row = h.py % 16u;
+    let center = vec2<f32>(f32(h.px) + 0.5, f32(h.py) + 0.5);
+    let pix = vec2<u32>(h.px, h.py);
     let start = tile_start[tile];
     let cnt = tile_count[tile];
 
@@ -221,7 +229,7 @@ fn shade(gid: vec3<u32>, coverage_only: bool) -> vec4<f32> {
             continue; // 该 draw 在本行带无内容
         }
         // cell = base' + row * w + tile_x（base' 已把 y0/w 与 lo 折入）
-        let cell = u32(i32(e.x) + i32(row) * i32(e.y) + i32(tile_x));
+        let cell = u32(i32(e.x) + i32(row) * i32(e.y) + i32(h.tile_x));
         let cm = cell_meta[cell];
         let base = cm.y;
         let n = cm.z;
@@ -240,7 +248,7 @@ fn shade(gid: vec3<u32>, coverage_only: bool) -> vec4<f32> {
             continue;
         }
         if (nclip > 0u && a > 0.0) {
-            a *= clip_mul(dm.y, nclip, dm, gid.xy, clip_tex0, clip_tex1, clip_tex2, clip_tex3);
+            a *= clip_mul(dm.y, nclip, dm, pix, clip_tex0, clip_tex1, clip_tex2, clip_tex3);
         }
         if (a > 0.0) {
             // M6：draw_meta 的 .w 是渐变下标，.z（见宿主）是图像下标，
@@ -264,16 +272,26 @@ fn shade(gid: vec3<u32>, coverage_only: bool) -> vec4<f32> {
 
 @compute @workgroup_size(16, 16, 1)
 fn sparse_main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    if (gid.x >= params.width || gid.y >= params.height) {
-        return;
+    let ti = tile_index_of(gid);
+    if (ti >= params.n_tiles) {
+        return; // z 维分批的尾巴
     }
-    textureStore(out_tex, vec2<u32>(gid.x, gid.y), shade(gid, false));
+    let h = tile_hit(dirty_tiles[ti], gid);
+    if (h.px >= params.width || h.py >= params.height) {
+        return; // 画布边缘的 tile 有一部分落在画布外
+    }
+    textureStore(out_tex, vec2<u32>(h.px, h.py), shade(h, false));
 }
 
 @compute @workgroup_size(16, 16, 1)
 fn sparse_coverage(@builtin(global_invocation_id) gid: vec3<u32>) {
-    if (gid.x >= params.width || gid.y >= params.height) {
+    let ti = tile_index_of(gid);
+    if (ti >= params.n_tiles) {
         return;
     }
-    textureStore(out_tex, vec2<u32>(gid.x, gid.y), shade(gid, true));
+    let h = tile_hit(dirty_tiles[ti], gid);
+    if (h.px >= params.width || h.py >= params.height) {
+        return;
+    }
+    textureStore(out_tex, vec2<u32>(h.px, h.py), shade(h, true));
 }

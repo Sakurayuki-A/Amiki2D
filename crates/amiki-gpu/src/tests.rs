@@ -7,6 +7,49 @@
 
 use super::*;
 
+// ───────────────────────── GPU 测试的串行闸门 ─────────────────────────
+//
+// 实测（RTX 3050 / Vulkan / Windows）：**多个测试线程同时**
+// `GpuRenderer::new()`（枚举适配器 + 创建 `wgpu::Device`）会让驱动层崩掉
+// 整个测试进程 —— 症状是 `test exited abnormally` + `0xC0000005`（访问违例），
+// **没有任何 panic 信息**。这与 `RELEASE_PLAN.md` §8.5 记的那次"不可复现的
+// 测试瞬时失败"是同一件事，现在有了可复现的触发条件（0.6.1）：
+//
+// | 运行方式 | 崩溃次数 |
+// |---|---|
+// | `cargo test -p amiki-gpu --lib`（默认线程，~16） | **4 / 6** |
+// | `--test-threads=4` | 0 / 4 |
+// | `--test-threads=2` | 0 / 4 |
+// | `--test-threads=1` | 0 / 12 |
+//
+// 因此所有需要 GPU 设备的测试都先领取这把锁：**同一时刻只有一个 GPU 设备**。
+// 代价是这台 crate 的测试串行跑（整套仍只有 ~8 s），换来的是**确定性** ——
+// 而"性能断言在并行环境里失真"这个老问题也一并消失（见 HANDOFF 纪律第 7 条）。
+//
+// 注意：`std::sync::Mutex` **不可重入**。一个测试若要创建/持有**多个**渲染器
+// （`startup_cost_stays_within_budget`、`dense_ceiling_reports_error_not_panic`
+// 都是），请自己用 [`gpu_lock`] 拿一次锁，其余渲染器直接
+// `pollster::block_on(GpuRenderer::new())` —— 反复调用 [`gpu`] 会自锁
+// （表现为测试进程 CPU 时间≈0、墙钟无限增长）。
+static GPU_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// 领取串行闸门（中毒也继续 —— 一个测试 panic 不该让后面全部失败）。
+fn gpu_lock() -> std::sync::MutexGuard<'static, ()> {
+    GPU_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// 领取闸门并创建渲染器。`None` = 无适配器（测试应当直接返回，即"跳过"）。
+fn gpu() -> Option<(GpuRenderer, std::sync::MutexGuard<'static, ()>)> {
+    let guard = gpu_lock();
+    match pollster::block_on(GpuRenderer::new()) {
+        Ok(r) => Some((r, guard)),
+        Err(_) => {
+            eprintln!("跳过：无 GPU 适配器");
+            None
+        }
+    }
+}
+
 /// GPU/CPU 渲染对拍（donut + 旋转）。
 /// M2f 已知问题：曲线边缘像素覆盖率偏差（圆极端点行约 -0.28，且不随 ε 变化，
 /// 怀疑 flatten 段端点或 seg_ends 数据链路），调查恢复后回归 tolerance 2。
@@ -15,10 +58,7 @@ fn gpu_matches_cpu() {
     use amiki_math::{Affine, Vec2};
     use amiki_scene::{Color, Paint, PathBuilder, Scene};
 
-    let Ok(renderer) = pollster::block_on(GpuRenderer::new()) else {
-        eprintln!("跳过：无 GPU 适配器");
-        return;
-    };
+    let Some((renderer, _gpu_guard)) = gpu() else { return };
 
     let mut pb = PathBuilder::new();
     pb.circle(Vec2::new(48.0, 48.0), 40.0, false);
@@ -44,10 +84,7 @@ fn gpu_matches_cpu() {
 fn gpu_rect_matches_cpu() {        use amiki_math::{Affine, Vec2};
     use amiki_scene::{BlendMode, Color, Paint, PathBuilder, Scene};
 
-    let Ok(renderer) = pollster::block_on(GpuRenderer::new()) else {
-        eprintln!("跳过：无 GPU 适配器");
-        return;
-    };
+    let Some((renderer, _gpu_guard)) = gpu() else { return };
     // 多 draw + 半透明 + 旋转矩形 + 跨 tile 边界
     let mut scene = Scene::new(72, 72);
     let mut pb = PathBuilder::new();
@@ -81,10 +118,7 @@ fn gpu_gradient_matches_cpu() {
     use amiki_math::{Affine, Vec2};
     use amiki_scene::{Color, Gradient, GradientStop, Paint, PathBuilder, Scene};
 
-    let Ok(renderer) = pollster::block_on(GpuRenderer::new()) else {
-        eprintln!("跳过：无 GPU 适配器");
-        return;
-    };
+    let Some((renderer, _gpu_guard)) = gpu() else { return };
 
     let stops = || {
         vec![
@@ -189,10 +223,7 @@ fn gpu_image_matches_cpu() {
     use amiki_math::{Affine, Vec2};
     use amiki_scene::{Color, Image, ImagePlacement, Paint, PathBuilder, Scene};
 
-    let Ok(renderer) = pollster::block_on(GpuRenderer::new()) else {
-        eprintln!("跳过：无 GPU 适配器");
-        return;
-    };
+    let Some((renderer, _gpu_guard)) = gpu() else { return };
 
     // 32×24 合成图：R/G 为渐变（检验坐标映射），B 为 4×4 棋盘（检验过滤）
     let (iw, ih) = (32u32, 24u32);
@@ -288,10 +319,7 @@ fn gpu_image_mipmap_matches_cpu() {
     use amiki_math::{Affine, Vec2};
     use amiki_scene::{Color, Image, ImagePlacement, Paint, PathBuilder, Scene};
 
-    let Ok(renderer) = pollster::block_on(GpuRenderer::new()) else {
-        eprintln!("跳过：无 GPU 适配器");
-        return;
-    };
+    let Some((renderer, _gpu_guard)) = gpu() else { return };
 
     // 64×64 噪声图，带 mip 链
     let (iw, ih) = (64u32, 64u32);
@@ -379,10 +407,7 @@ fn gpu_layer_matches_cpu() {
     use amiki_math::Affine;
     use amiki_scene::{BlendMode, Color, Filter, Layer, LayerBounds, Paint, PathBuilder, Scene};
 
-    let Ok(renderer) = pollster::block_on(GpuRenderer::new()) else {
-        eprintln!("跳过：无 GPU 适配器");
-        return;
-    };
+    let Some((renderer, _gpu_guard)) = gpu() else { return };
 
     let cases: Vec<(&str, Filter)> = vec![
         ("分组", Filter::None),
@@ -449,10 +474,7 @@ fn gpu_layer_matches_cpu() {
 /// M2f-1：通用 GPU 前缀和 vs CPU 对拍（随机长度/数值）。
 #[test]
 fn gpu_scan_matches_cpu() {
-    let Ok(renderer) = pollster::block_on(GpuRenderer::new()) else {
-        eprintln!("跳过：无 GPU 适配器");
-        return;
-    };
+    let Some((renderer, _gpu_guard)) = gpu() else { return };
     let mut s = 0xC0FF_EE12_3456_789Au64;
     let mut rnd = move || {
         s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
@@ -491,10 +513,7 @@ fn gpu_blend_matches_cpu() {
     use amiki_math::{Affine, Vec2};
     use amiki_scene::{BlendMode, Color, Paint, PathBuilder, Scene};
 
-    let Ok(renderer) = pollster::block_on(GpuRenderer::new()) else {
-        eprintln!("跳过：无 GPU 适配器");
-        return;
-    };
+    let Some((renderer, _gpu_guard)) = gpu() else { return };
 
     let modes = [
         BlendMode::Normal, BlendMode::Multiply, BlendMode::Screen, BlendMode::Overlay,
@@ -534,10 +553,7 @@ fn gpu_clip_matches_cpu() {
     use amiki_math::{Affine, Vec2};
     use amiki_scene::{Color, Paint, PathBuilder, Scene};
 
-    let Ok(renderer) = pollster::block_on(GpuRenderer::new()) else {
-        eprintln!("跳过：无 GPU 适配器");
-        return;
-    };
+    let Some((renderer, _gpu_guard)) = gpu() else { return };
 
     for nested in [false, true] {
         let mut scene = Scene::new(64, 64);
@@ -658,10 +674,7 @@ fn sparse_matches_dense() {
     use amiki_math::{Affine, Vec2};
     use amiki_scene::{BlendMode, Color, Paint, PathBuilder, Scene};
 
-    let Ok(mut renderer) = pollster::block_on(GpuRenderer::new()) else {
-        eprintln!("跳过：无 GPU 适配器");
-        return;
-    };
+    let Some((mut renderer, _gpu_guard)) = gpu() else { return };
     let mut scenes: Vec<(&str, Scene)> = Vec::new();
     {
         let mut scene = Scene::new(64, 64);
@@ -803,10 +816,7 @@ fn sparse_matches_dense() {
 fn sparse_scales_beyond_dense() {
     use amiki_math::Vec2;
     use amiki_scene::{Color, Paint, Scene};
-    let Ok(renderer) = pollster::block_on(GpuRenderer::new()) else {
-        eprintln!("跳过：无 GPU 适配器");
-        return;
-    };
+    let Some((renderer, _gpu_guard)) = gpu() else { return };
     let (w, h, n) = (1920u32, 1080u32, 2000usize);
     let mut scene = Scene::new(w, h);
     let mut s = 0x1234_5678_9ABC_DEF0u64;
@@ -868,10 +878,7 @@ fn sparse_capacity_is_learned_from_measured_usage() {
     use amiki_math::Vec2;
     use amiki_scene::{Color, Paint, PathBuilder, Scene};
 
-    let Ok(renderer) = pollster::block_on(GpuRenderer::new()) else {
-        eprintln!("跳过：无 GPU 适配器");
-        return;
-    };
+    let Some((renderer, _gpu_guard)) = gpu() else { return };
     assert_eq!(renderer.capacity_table_len(), 0, "首帧之前不应有任何容量表项");
 
     let mut scene = Scene::new(160, 160);
@@ -941,6 +948,9 @@ fn sparse_capacity_is_learned_from_measured_usage() {
 /// 的假设是**错的**，已按实测更正。
 #[test]
 fn startup_cost_stays_within_budget() {
+    // 本测试**连着创建 4 个渲染器**，所以只拿一次闸门（`std::sync::Mutex`
+    // 不可重入，反复调用 `gpu()` 会自锁）。
+    let _gpu_guard = gpu_lock();
     let Ok(first) = pollster::block_on(GpuRenderer::new()) else {
         eprintln!("跳过：无 GPU 适配器");
         return;
@@ -1007,10 +1017,7 @@ fn gpu_frame_path_composites_layers() {
     use amiki_math::Affine;
     use amiki_scene::{BlendMode, Color, Filter, Layer, LayerBounds, Paint, PathBuilder, Scene};
 
-    let Ok(renderer) = pollster::block_on(GpuRenderer::new()) else {
-        eprintln!("跳过：无 GPU 适配器");
-        return;
-    };
+    let Some((renderer, _gpu_guard)) = gpu() else { return };
 
     let build = |filter: Filter| -> Scene {
         let mut scene = Scene::new(160, 120);
@@ -1115,10 +1122,7 @@ fn strips_match_dense_rects() {
     use amiki_math::Affine;
     use amiki_scene::{BlendMode, Color, Paint, PathBuilder, Scene};
 
-    let Ok(renderer) = pollster::block_on(GpuRenderer::new()) else {
-        eprintln!("跳过：无 GPU 适配器");
-        return;
-    };
+    let Some((renderer, _gpu_guard)) = gpu() else { return };
     // 高 72 = 4.5 个 tile 行 → 末行带为部分带（验证高度钳制）
     let mut scene = Scene::new(72, 72);
     let mut pb = PathBuilder::new();
@@ -1146,10 +1150,7 @@ fn strips_match_dense_curves() {
     use amiki_math::{Affine, Vec2};
     use amiki_scene::{BlendMode, Color, Paint, PathBuilder, Scene};
 
-    let Ok(renderer) = pollster::block_on(GpuRenderer::new()) else {
-        eprintln!("跳过：无 GPU 适配器");
-        return;
-    };
+    let Some((renderer, _gpu_guard)) = gpu() else { return };
     let mut scene = Scene::new(96, 96);
     // 环形（曲线 + 反绕洞）+ 旋转（斜边跨带）
     let mut pb = PathBuilder::new();
@@ -1184,10 +1185,7 @@ fn strips_match_dense_curves() {
 /// `create_bind_group` 内部的 wgpu Validation Error panic（进程终止、无法降级）。
 #[test]
 fn dense_ceiling_reports_error_not_panic() {
-    let Ok(mut renderer) = pollster::block_on(GpuRenderer::new()) else {
-        eprintln!("跳过：无 GPU 适配器");
-        return;
-    };
+    let Some((mut renderer, _gpu_guard)) = gpu() else { return };
 
     // 1) 纯函数判定：默认限制下 720p × 500 draw 必须超限，且错误信息含关键数字
     let limits = wgpu::Limits::default();
@@ -1222,7 +1220,9 @@ fn dense_ceiling_reports_error_not_panic() {
         );
     }
 
-    let mut r = pollster::block_on(GpuRenderer::new()).expect("无 GPU");
+    // 第二个渲染器：本测试要**同时**持有稠密与稀疏两个渲染器，
+    // 而闸门已在手（`std::sync::Mutex` 不可重入）→ 直接创建，不再走 `gpu()`。
+    let Ok(mut r) = pollster::block_on(GpuRenderer::new()) else { return };
     r.path = RenderPath::Dense;
     let res = r.render_blocking(&scene, 0.1);
     assert!(
@@ -1344,10 +1344,7 @@ fn clone_dump(d: &PipelineDump) -> PipelineDump {
 /// 稀疏此前没有独立裁判。
 #[test]
 fn sparse_self_consistency() {
-    let Ok(renderer) = pollster::block_on(GpuRenderer::new()) else {
-        eprintln!("跳过：无 GPU 适配器");
-        return;
-    };
+    let Some((renderer, _gpu_guard)) = gpu() else { return };
     for (name, scene) in consistency_scenes() {
         let (gs, dump) = renderer.dump_sparse(&scene, 0.05).expect("稀疏管线失败");
         if let Err(e) = check_sparse_consistency(&gs, &dump) {
@@ -1369,10 +1366,7 @@ fn sparse_consistency_detects_corruption() {
     use amiki_math::{Affine, Vec2};
     use amiki_scene::{Color, Paint, PathBuilder};
 
-    let Ok(renderer) = pollster::block_on(GpuRenderer::new()) else {
-        eprintln!("跳过：无 GPU 适配器");
-        return;
-    };
+    let Some((renderer, _gpu_guard)) = gpu() else { return };
     let mut scene = Scene::new(96, 96);
     let mut pb = PathBuilder::new();
     pb.circle(Vec2::new(40.0, 40.0), 30.0, false);
@@ -1453,10 +1447,7 @@ fn sparse_consistency_at_scale() {
     use amiki_math::Vec2;
     use amiki_scene::{Color, Paint, PathBuilder};
 
-    let Ok(renderer) = pollster::block_on(GpuRenderer::new()) else {
-        eprintln!("跳过：无 GPU 适配器");
-        return;
-    };
+    let Some((renderer, _gpu_guard)) = gpu() else { return };
     let (w, h, n) = (1920u32, 1080u32, 600usize);
     let mut scene = Scene::new(w, h);
     let mut s = 0x1234_5678_9ABC_DEF0u64;
@@ -1493,89 +1484,258 @@ fn sparse_consistency_at_scale() {
     }
 }
 
-/// M4：**GPU 侧只派发脏 tile** 必须与全量派发**逐字节一致**。
+/// 0.6.1：脏 tile 索引表的构造（**纯函数**，不需要 GPU 适配器）。
 ///
-/// 这是 GPU 增量渲染的核心不变量：fine 内核由 `global_invocation_id` 推导
-/// 像素与 tile 坐标，未派发的 tile 不写入、保留纹理中的旧值。若派发范围算错
-/// （例如偏移没被正确处理、或脏区外被误写），本测试会立刻失败。
+/// 这张表是 fine 1D 派发的唯一输入，算错就等于画错 tile，因此把它的语义钉死：
+/// 全量 = 整幅画布 row-major；局部 = 脏矩形覆盖的 tile；空脏区 = 空表。
+#[test]
+fn dirty_tile_list_covers_exactly_the_dirty_rect() {
+    use amiki_scene::Damage;
+
+    // 打包 (tx, ty) → 表项（与 `dirty_tile_list` 的约定一致）
+    let p = |tx: u32, ty: u32| tx | (ty << 16);
+    let full = vec![p(0, 0), p(1, 0), p(2, 0), p(0, 1), p(1, 1), p(2, 1)];
+    // 全量（damage = None）：整幅画布，row-major
+    assert_eq!(dirty_tile_list(None, 3, 2), full);
+
+    // 全脏（`Damage::new` 的默认态）与 None 等价
+    let d_all = Damage::new(48, 32);
+    assert!(d_all.is_full());
+    assert_eq!(dirty_tile_list(Some(&d_all), 3, 2), full);
+
+    // 局部矩形 tile (1,0)..(3,1)：只有两项，且**起点不是 0**
+    let mut d = Damage::new(48, 32);
+    d.clear();
+    d.invalidate_rect(16.0, 0.0, 48.0, 16.0);
+    assert_eq!(d.tiles(), Some((1, 0, 3, 1)));
+    assert_eq!(dirty_tile_list(Some(&d), 3, 2), vec![1, 2]);
+
+    // 空脏区 → 空表（调用方据此**不派发**任何 workgroup）
+    let mut d0 = Damage::new(48, 32);
+    d0.clear();
+    assert!(dirty_tile_list(Some(&d0), 3, 2).is_empty());
+
+    // 越界脏区被钳到画布范围内（防御性：调用方已由 check_damage_bounds 拦过）
+    let mut d_out = Damage::new(48, 32);
+    d_out.clear();
+    d_out.invalidate_rect(-100.0, -100.0, 1000.0, 1000.0);
+    assert_eq!(dirty_tile_list(Some(&d_out), 3, 2).len(), 6);
+}
+
+/// 0.6.1：1D 派发维度 —— x 每批最多 65535 个 workgroup，超出用 z 维分批。
 ///
-/// 覆盖三类情形：全脏 / 局部脏 / 无脏区（跳过）。
+/// 这条路径在测试里跑不到 z > 1（需要 > 4096×4096 的画布），所以按纯函数钉住
+/// 算术：否则 8K 以上的画布会在**没有任何测试覆盖**的情况下静默少算一批。
+#[test]
+fn fine_dispatch_dims_batches_beyond_the_1d_workgroup_limit() {
+    assert_eq!(fine_dispatch_dims(1), (1, 1));
+    assert_eq!(fine_dispatch_dims(65535), (65535, 1));
+    assert_eq!(fine_dispatch_dims(65536), (65535, 2));
+    assert_eq!(fine_dispatch_dims(65535 * 2), (65535, 2));
+    assert_eq!(fine_dispatch_dims(65535 * 2 + 1), (65535, 3));
+    // 8K 画布：7680×4320 → 480×270 = 129 600 个 tile
+    assert_eq!(fine_dispatch_dims(480 * 270), (65535, 2));
+    // 0 也必须给出合法维度（workgroup 数不能为 0）
+    assert_eq!(fine_dispatch_dims(0), (1, 1));
+}
+
+/// M4：**GPU 侧只重算脏 tile** 必须与全量派发**逐字节一致**。
+///
+/// # 这个测试必须让纹理停在**上一帧**
+///
+/// 早先的版本先把纹理渲成"全量正确"的内容，再用脏区重算一批 tile，然后断言
+/// 等于全量 —— 那样**无论重算的是哪一批 tile 都会通过**，它检验的是"重算 tile
+/// 的结果与全量一致"，而不是"重算的确实是脏 tile"。结果是一个真 bug 藏了很久：
+/// 派发只用了脏区的**大小**、丢掉了**起点**，于是脏区不在左上角时，被重算的是
+/// `[0,fw) × [0,fh)`，真正的脏 tile 一个都没重算，画面静默保留上一帧像素。
+/// （0.6.1 已改为 1D 派发 + 脏 tile 索引表，从结构上消除"起点"这个参数。）
+///
+/// 因此本测试的结构是：
+/// 1. 纹理 `tex` 先渲成 **A 帧**的全量（= 上一帧）；
+/// 2. 参考 `tex_full` 渲成 **B 帧**的全量；
+/// 3. 用 `edit_damage(A, B)` 在 `tex` 上做增量（B 只改了**右下角**一个元素）；
+/// 4. 断言 `tex == tex_full` —— 脏 tile 若没被重算，旧像素会立刻暴露。
+///
+/// 并且断言脏区**不在原点起步**：否则这个测试就退化成恒真。
 #[test]
 fn gpu_damage_dispatch_matches_full() {
     use amiki_math::{Affine, Vec2};
-    use amiki_scene::{Color, Damage, Paint, PathBuilder};
+    use amiki_scene::{edit_damage, Color, Damage, Paint, PathBuilder};
 
-    let Ok(mut renderer) = pollster::block_on(GpuRenderer::new()) else {
-        eprintln!("跳过：无 GPU 适配器");
-        return;
-    };
+    let Some((mut renderer, _gpu_guard)) = gpu() else { return };
     renderer.path = RenderPath::Sparse;
 
-    let mut scene = Scene::new(128, 96);
-    for i in 0..6 {
+    // A：左上角固定红圆 + 右下角蓝圆；B：只把蓝圆上移 30px（改动**远离原点**）
+    let build = |blue_y: f32| -> Scene {
+        let mut s = Scene::new(128, 96);
         let mut pb = PathBuilder::new();
-        let x = 10.0 + (i % 3) as f32 * 38.0;
-        let y = 14.0 + (i / 3) as f32 * 44.0;
-        pb.circle(Vec2::new(x, y), 16.0, false);
-        scene.push(
-            Affine::IDENTITY,
-            pb.build(),
-            Paint::Solid(Color::rgba8(40 + i as u8 * 30, 120, 200 - i as u8 * 20, 210)),
-        );
-    }
+        pb.circle(Vec2::new(20.0, 20.0), 12.0, false);
+        s.push(Affine::IDENTITY, pb.build(), Paint::Solid(Color::rgba8(220, 40, 40, 255)));
+        let mut pb = PathBuilder::new();
+        pb.circle(Vec2::new(100.0, blue_y), 12.0, false);
+        s.push(Affine::IDENTITY, pb.build(), Paint::Solid(Color::rgba8(40, 90, 220, 210)));
+        s
+    };
+    let a = build(70.0);
+    let b = build(40.0);
 
-    let frame = renderer.prepare(&scene, 0.1).expect("prepare 失败");
-    let (tx, ty) = (frame.scene.tiles_x, frame.scene.tiles_y);
-    let tex = renderer.create_output_texture(&frame.scene);
-
-    // 参照：全量派发
+    // ① 上一帧：A 的全量
+    let frame_a = renderer.prepare(&a, 0.1).expect("prepare A 失败");
+    let tex = renderer.create_output_texture(&frame_a.scene);
     renderer
-        .render_into_persistent(&tex, &frame, None)
-        .expect("全量渲染失败");
-    let full = renderer.readback_rgba8(&tex).expect("读回失败");
+        .render_into_persistent(&tex, &frame_a, None)
+        .expect("A 全量渲染失败");
 
-    // 1) 局部脏区（含偏移，确保不是左上角起步）
-    let mut d = Damage::new(scene.width, scene.height);
-    d.clear();
-    d.invalidate_rect(42.0, 20.0, 100.0, 84.0);
+    // ② 参照：B 的全量（同时把 B 的容量表预热到稳态，避免首帧投机分配干扰）
+    let frame_b = renderer.prepare(&b, 0.1).expect("prepare B 失败");
+    let tex_full = renderer.create_output_texture(&frame_b.scene);
+    renderer
+        .render_into_persistent(&tex_full, &frame_b, None)
+        .expect("B 全量渲染失败");
+    let px_full = renderer.readback_rgba8(&tex_full).expect("读回 B 全量失败");
+
+    // ③ 增量：纹理此刻是 A，只重算 A→B 的脏 tile
+    let d = edit_damage(&a, &b);
+    let (tx0, ty0, tx1, ty1) = d.tiles().expect("A→B 应是有界脏区");
+    assert!(
+        tx0 > 0,
+        "本测试的脏区必须**不在原点起步**（否则派发起点被丢弃也照样通过）；tile 矩形 = {tx0},{ty0}..{tx1},{ty1}"
+    );
+    eprintln!(
+        "脏区 tile 矩形 = ({tx0}, {ty0})..({tx1}, {ty1})；画布 {}×{} tiles",
+        frame_b.scene.tiles_x, frame_b.scene.tiles_y
+    );
     let skipped = renderer
-        .render_into_persistent(&tex, &frame, Some(&d))
-        .expect("局部脏区渲染失败");
+        .render_into_persistent(&tex, &frame_b, Some(&d))
+        .expect("增量渲染失败");
     assert!(!skipped, "有脏区时不得跳过");
-    let after = renderer.readback_rgba8(&tex).expect("读回失败");
-    assert_eq!(after, full, "只派发脏 tile 后，画面与全量派发不一致");
 
-    // 2) 无脏区：必须完全跳过且不改变像素
-    let mut d2 = Damage::new(scene.width, scene.height);
+    let after = renderer.readback_rgba8(&tex).expect("读回增量失败");
+    let n_diff = after.iter().zip(px_full.iter()).filter(|(x, y)| x != y).count();
+    assert_eq!(
+        after, px_full,
+        "脏区不在原点时，增量结果必须等于 B 的全量（不同字节 = {n_diff}）—— \
+         若不等，说明被重算的不是脏 tile"
+    );
+
+    // ④ 无脏区：必须完全跳过且不改变像素
+    let mut d2 = Damage::new(b.width, b.height);
     d2.clear();
     assert!(d2.is_empty());
     let skipped = renderer
-        .render_into_persistent(&tex, &frame, Some(&d2))
+        .render_into_persistent(&tex, &frame_b, Some(&d2))
         .expect("空脏区渲染失败");
     assert!(skipped, "无脏区时必须跳过");
     let after2 = renderer.readback_rgba8(&tex).expect("读回失败");
-    assert_eq!(after2, full, "跳过的帧不得改变任何像素");
+    assert_eq!(after2, px_full, "跳过的帧不得改变任何像素");
 
-    // 3) 全脏：也必须等于全量
-    let d3 = Damage::new(scene.width, scene.height);
+    // ⑤ 全脏：也必须等于全量
+    let d3 = Damage::new(b.width, b.height);
     assert!(d3.is_full());
     renderer
-        .render_into_persistent(&tex, &frame, Some(&d3))
+        .render_into_persistent(&tex, &frame_b, Some(&d3))
         .expect("全脏渲染失败");
     let after3 = renderer.readback_rgba8(&tex).expect("读回失败");
-    assert_eq!(after3, full, "全脏渲染与全量派发不一致");
+    assert_eq!(after3, px_full, "全脏渲染与全量派发不一致");
 
-    // 4) 脏区 tile 数校验：尺寸不匹配的 damage 必须被断言拦下（防"全脏被误判为局部"）
-    let wrong = Damage::new(scene.width + 64, scene.height);
+    // ⑥ 脏区 tile 数校验：尺寸不匹配的 damage 必须被断言拦下（防"全脏被误判为局部"）
+    let wrong = Damage::new(b.width + 64, b.height);
     let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        renderer.render_into_persistent(&tex, &frame, Some(&wrong))
+        renderer.render_into_persistent(&tex, &frame_b, Some(&wrong))
     }))
     .is_err();
     assert!(caught, "画布尺寸不匹配的 damage 应被断言拦下");
 
-    eprintln!(
-        "GPU 脏区派发：全脏 / 局部脏 / 空脏区 三类均与全量逐字节一致（tiles={tx}x{ty}）"
-    );
+    eprintln!("GPU 脏区派发：A→B 增量 / 空脏区 / 全脏 / 尺寸校验 四类均正确");
+}
+
+/// GPU 帧持久路径的**多帧滚动序列**必须逐帧等于"从零全量重算"。
+///
+/// 这是 `window_demo` 用法的缩影：每帧 `edit_damage(上一帧, 本帧)` →
+/// `prepare_into` → `render_into_persistent`。
+///
+/// 与单帧的 `gpu_damage_dispatch_matches_full` 互补：单帧只能证明"一次改动落到
+/// 了正确位置"，本测试证明**连续多帧、脏区一路移动**时不会累积残影 ——
+/// 滚动时脏区从一个条带移到下一个条带，**起点每帧都不同**，正是"派发起点被
+/// 丢弃"这类 bug 最容易积累可见错误的情形。
+#[test]
+fn gpu_persistent_matches_full_across_scroll_like_frames() {
+    use amiki_math::Affine;
+    use amiki_scene::{edit_damage, Color, Paint, PathBuilder};
+
+    let Some((mut renderer, _gpu_guard)) = gpu() else { return };
+    renderer.path = RenderPath::Sparse;
+
+    const W: u32 = 160;
+    const H: u32 = 160;
+
+    // 不动的背景 + 一列会"滚动"的条目。条目 x 从 40 起（tile 列 2），
+    // 因此脏区**永远不会**从 tile 列 0 起步 —— 这是本测试的判别力所在。
+    let build = |offset: f32| -> Scene {
+        let mut s = Scene::new(W, H);
+        let mut pb = PathBuilder::new();
+        pb.rect(0.0, 0.0, W as f32, H as f32);
+        s.push(Affine::IDENTITY, pb.build(), Paint::Solid(Color::rgb8(248, 246, 242)));
+        for i in 0..5u8 {
+            let y = 16.0 + ((i as f32 * 30.0 + offset) % 130.0);
+            let mut pb = PathBuilder::new();
+            pb.rect(40.0, y, 140.0, y + 22.0);
+            s.push(
+                Affine::IDENTITY,
+                pb.build(),
+                Paint::Solid(Color::rgb8(60, 90 + i * 20, 200)),
+            );
+        }
+        s
+    };
+
+    // 两个复用的 Frame（真实帧路径的形态），一份输出纹理 + 一份全量参照纹理
+    let mut frame = Frame::default();
+    let mut frame_ref = Frame::default();
+    let mut prev = build(0.0);
+    renderer.prepare_into(&prev, 0.1, &mut frame).expect("prepare 失败");
+    let tex = renderer.create_output_texture(&frame.scene);
+    renderer
+        .render_into_persistent(&tex, &frame, None)
+        .expect("首帧全量失败");
+    let tex_ref = renderer.create_output_texture(&frame.scene);
+
+    for step in 1..=8 {
+        let cur = build(step as f32 * 26.0); // 每帧滚动 26px（非 tile 对齐）
+        let d = edit_damage(&prev, &cur);
+        let (tx0, ty0, tx1, ty1) = d.tiles().expect("滚动应产生有界脏区");
+        assert!(
+            tx0 > 0,
+            "第 {step} 帧：滚动条带必须不在 tile 列 0（否则本测试抓不到起点 bug）；\
+             实际 tile 矩形 ({tx0},{ty0})..({tx1},{ty1})"
+        );
+
+        // 增量：`tex` 里装的是上一帧
+        renderer.prepare_into(&cur, 0.1, &mut frame).expect("prepare 失败");
+        renderer
+            .render_into_persistent(&tex, &frame, Some(&d))
+            .expect("增量渲染失败");
+        let got = renderer.readback_rgba8(&tex).expect("读回失败");
+
+        // 参照：从零全量
+        renderer
+            .prepare_into(&cur, 0.1, &mut frame_ref)
+            .expect("prepare 失败");
+        renderer
+            .render_into_persistent(&tex_ref, &frame_ref, None)
+            .expect("全量渲染失败");
+        let want = renderer.readback_rgba8(&tex_ref).expect("读回失败");
+
+        let n_diff = got.iter().zip(want.iter()).filter(|(x, y)| x != y).count();
+        assert_eq!(
+            got, want,
+            "第 {step} 帧（滚动 {:.0}px，脏区 tile ({tx0},{ty0})..({tx1},{ty1})）\
+             增量结果与全量不一致，不同字节 = {n_diff} —— 残影",
+            step as f32 * 26.0
+        );
+        prev = cur;
+    }
+    eprintln!("GPU 帧持久路径：8 帧滚动序列逐帧等于全量（无残影）");
 }
 
 /// P1-1：精确测量**每帧起线程的固定开销** —— 这个数字决定了并行提取是否可行。
@@ -1774,10 +1934,7 @@ fn profile_extract_phases() {
 fn profile_frame_path_phases() {
     use std::hint::black_box;
     use std::time::Instant;
-    let Ok(renderer) = pollster::block_on(crate::GpuRenderer::new()) else {
-        eprintln!("跳过：无 GPU 适配器");
-        return;
-    };
+    let Some((renderer, _gpu_guard)) = gpu() else { return };
     // 与基准同规模、同形状的场景（圆：每条 4 条三次曲线）
     let scene = {
         use amiki_math::{Affine, Vec2};
@@ -2390,10 +2547,7 @@ fn gpu_hdr_layer_matches_cpu() {
     use amiki_math::Affine;
     use amiki_scene::{BlendMode, Color, Filter, Layer, LayerBounds, Paint, PathBuilder, Scene};
 
-    let Ok(renderer) = pollster::block_on(GpuRenderer::new()) else {
-        eprintln!("无可用 GPU，跳过");
-        return;
-    };
+    let Some((renderer, _gpu_guard)) = gpu() else { return };
 
     let mut scene = Scene::new(240, 180);
     {

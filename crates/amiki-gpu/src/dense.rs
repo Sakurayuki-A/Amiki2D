@@ -158,6 +158,15 @@ impl GpuRenderer {
             }),
             usage: wgpu::BufferUsages::UNIFORM,
         });
+        // 0.6.1：fine 的**脏 tile 索引表**（1D 派发的输入）；全量时是整幅画布的
+        // tile。空表（无脏区）时仍要绑一个合法缓冲，但不会派发 workgroup。
+        let fine_tiles = dirty_tile_list(damage, gs.tiles_x, gs.tiles_y);
+        let n_fine_tiles = fine_tiles.len() as u32;
+        let fine_tiles_dummy = [0u32; 1];
+        let fine_tiles_slice: &[u32] =
+            if fine_tiles.is_empty() { &fine_tiles_dummy } else { &fine_tiles };
+        let dirty_tiles_buf =
+            mk_init("amiki_dirty_tiles", bytemuck::cast_slice(fine_tiles_slice));
         let fine_params = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("amiki_fine_params"),
             contents: bytemuck::bytes_of(&FineParams {
@@ -165,6 +174,8 @@ impl GpuRenderer {
                 height: gs.height,
                 tiles_x: gs.tiles_x,
                 n_draws,
+                n_tiles: n_fine_tiles,
+                _pad: [0; 3],
             }),
             usage: wgpu::BufferUsages::UNIFORM,
         });
@@ -358,6 +369,11 @@ impl GpuRenderer {
                     binding: 17,
                     resource: wgpu::BindingResource::Sampler(&self.dummy_img_sampler),
                 },
+                // 0.6.1：脏 tile 索引表（本路径真实使用，不是占位）
+                wgpu::BindGroupEntry {
+                    binding: 18,
+                    resource: dirty_tiles_buf.as_entire_binding(),
+                },
             ],
         });
         {
@@ -377,11 +393,13 @@ impl GpuRenderer {
                 pass.set_pipeline(&self.fine_pipeline);
             }
             pass.set_bind_group(0, &fine_bind, &[]);
-            // M4：只派发脏 tile 子矩形。fine 内核用 global_invocation_id 推导
-            // 像素与 tile 坐标，因此 workgroup 数减少 = 只重写那些 tile 的像素，
-            // 未派发区域的纹理内容原样保留（这正是复用上一帧的机制）。
-            let (_fx, fw, _fy, fh) = fine_dispatch_range(damage, gs.tiles_x, gs.tiles_y);
-            pass.dispatch_workgroups(fw, fh, 1);
+            // 0.6.1：**1D 派发**（与稀疏路径同构）—— workgroup 数 = 要重算的
+            // tile 数，tile 坐标由内核查 `dirty_tiles` 得到。旧实现只把脏区换算
+            // 成"宽高"派发，丢掉了起点，脏区不在左上角时会重算错误的 tile。
+            if n_fine_tiles > 0 {
+                let (fx, fz) = fine_dispatch_dims(n_fine_tiles);
+                pass.dispatch_workgroups(fx, 1, fz);
+            }
         }
         self.queue.submit(Some(enc2.finish()));
 

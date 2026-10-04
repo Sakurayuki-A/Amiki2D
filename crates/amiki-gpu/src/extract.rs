@@ -43,6 +43,14 @@ pub(crate) struct FineParams {
     pub(crate) height: u32,
     pub(crate) tiles_x: u32,
     pub(crate) n_draws: u32,
+    /// 本次派发要重算的 tile 数（= 脏 tile 索引表的长度）。
+    ///
+    /// fine 现在是**1D 派发**（见 `dirty_tile_list`）：workgroup 数由"要重算的
+    /// tile 数"决定，而与画布尺寸无关。单维 workgroup 上限是 65535，故用 z 维
+    /// 分批，末尾一批会多出一些 invocation —— 它们靠 `n_tiles` 提前退出。
+    pub(crate) n_tiles: u32,
+    /// 补齐到 16 字节倍数：uniform 地址空间里结构体大小必须是 16 的整数倍。
+    pub(crate) _pad: [u32; 3],
 }
 
 #[repr(C)]

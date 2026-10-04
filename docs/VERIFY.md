@@ -112,7 +112,8 @@ cargo doc --workspace --no-deps
    - `X3511: forced to unroll loop` → 找常量次数的循环 + 动态下标，显式展开
    - `textureSize(sampler2D, uint)` → 把 `textureLoad` 的 mip 参数从 `0u` 写成 `0`
 2. **再看是不是 limits 不够**（`Too many bindings`）。
-   引擎需要 **9 个 storage buffer/阶段**；自行创建 `wgpu::Device` 必须用
+   引擎需要 **10 个 storage buffer/阶段**（0.6.1 起，fine 新增脏 tile 索引表）；
+   自行创建 `wgpu::Device` 必须用
    `amiki_gpu::required_limits()`。
 3. **若是结果不一致**（测试跑完但数值对不上），记录**具体的后端 + 驱动版本 +
    哪个测试 + 差多少**，那属于真正的跨厂商差异，需要单独调查。

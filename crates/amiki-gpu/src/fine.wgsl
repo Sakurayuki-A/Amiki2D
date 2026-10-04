@@ -3,12 +3,21 @@
 // 每 workgroup 一 tile、每线程一像素；逐 draw 稠密迭代（M3b 起主线走
 // sparse_fine.wgsl 的稀疏桶表；本入口保留为对拍基准与诊断路径）。
 // 数学部分在 fine_math.wgsl（宿主拼接），与 amiki-raster 逐式对应。
+//
+// 0.6.1：派发改成 **1D 脏 tile 表**（见 fine_math.wgsl 的 `tile_hit`）——
+// 要写哪些 tile 由 `dirty_tiles` 查表决定，不再从 `global_invocation_id`
+// 反推（那条路隐含"从 (0,0) 起步"，会漏掉偏移）。
 
 struct FineParams {
     width: u32,
     height: u32,
     tiles_x: u32,
     n_draws: u32,
+    /// 本次派发要重算的 tile 数（脏 tile 表长度）；末尾批次的尾巴靠它退出
+    n_tiles: u32,
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
 }
 
 @group(0) @binding(0) var<uniform> params: FineParams;
@@ -28,16 +37,23 @@ struct FineParams {
 @group(0) @binding(11) var clip_tex1: texture_2d<f32>;
 @group(0) @binding(12) var clip_tex2: texture_2d<f32>;
 @group(0) @binding(13) var clip_tex3: texture_2d<f32>;
+/// 0.6.1：要重算的 tile 表（`tx | ty << 16`）
+@group(0) @binding(18) var<storage, read> dirty_tiles: array<u32>;
 
 @compute @workgroup_size(16, 16, 1)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    if (gid.x >= params.width || gid.y >= params.height) {
-        return;
+    let ti = tile_index_of(gid);
+    if (ti >= params.n_tiles) {
+        return; // z 维分批的尾巴
     }
-    let tile = vec2<u32>(gid.x / 16u, gid.y / 16u);
-    let row = gid.y % 16u;
-    let center = vec2<f32>(f32(gid.x) + 0.5, f32(gid.y) + 0.5);
-    let tile_base = (tile.y * params.tiles_x + tile.x) * params.n_draws;
+    let h = tile_hit(dirty_tiles[ti], gid);
+    if (h.px >= params.width || h.py >= params.height) {
+        return; // 画布边缘的 tile 有一部分落在画布外
+    }
+    let row = h.py % 16u;
+    let center = vec2<f32>(f32(h.px) + 0.5, f32(h.py) + 0.5);
+    let tile_base = (h.tile_y * params.tiles_x + h.tile_x) * params.n_draws;
+    let pix = vec2<u32>(h.px, h.py);
 
     var col = vec4<f32>(0.0, 0.0, 0.0, 0.0);
     for (var d = 0u; d < params.n_draws; d++) {
@@ -55,15 +71,15 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         if (nclip > 0u && a > 0.0) {
             let ci = draw_clips[d];
             var cov = 1.0;
-            cov *= clip_sample(ci.x, gid.xy, clip_tex0, clip_tex1, clip_tex2, clip_tex3);
+            cov *= clip_sample(ci.x, pix, clip_tex0, clip_tex1, clip_tex2, clip_tex3);
             if (nclip > 1u) {
-                cov *= clip_sample(ci.y, gid.xy, clip_tex0, clip_tex1, clip_tex2, clip_tex3);
+                cov *= clip_sample(ci.y, pix, clip_tex0, clip_tex1, clip_tex2, clip_tex3);
             }
             if (nclip > 2u) {
-                cov *= clip_sample(ci.z, gid.xy, clip_tex0, clip_tex1, clip_tex2, clip_tex3);
+                cov *= clip_sample(ci.z, pix, clip_tex0, clip_tex1, clip_tex2, clip_tex3);
             }
             if (nclip > 3u) {
-                cov *= clip_sample(ci.w, gid.xy, clip_tex0, clip_tex1, clip_tex2, clip_tex3);
+                cov *= clip_sample(ci.w, pix, clip_tex0, clip_tex1, clip_tex2, clip_tex3);
             }
             a *= cov;
         }
@@ -71,19 +87,23 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             col = composite(col, colors[d], colors[d].a * a, flags & 0xFFu);
         }
     }
-    textureStore(out_tex, vec2<u32>(gid.x, gid.y), col);
+    textureStore(out_tex, pix, col);
 }
 
 /// 覆盖率入口：单 draw（clip 路径）解析覆盖率 → R 通道。
 @compute @workgroup_size(16, 16, 1)
 fn main_coverage(@builtin(global_invocation_id) gid: vec3<u32>) {
-    if (gid.x >= params.width || gid.y >= params.height) {
+    let ti = tile_index_of(gid);
+    if (ti >= params.n_tiles) {
         return;
     }
-    let tile = vec2<u32>(gid.x / 16u, gid.y / 16u);
-    let row = gid.y % 16u;
-    let center = vec2<f32>(f32(gid.x) + 0.5, f32(gid.y) + 0.5);
-    let tile_base = (tile.y * params.tiles_x + tile.x) * params.n_draws;
+    let h = tile_hit(dirty_tiles[ti], gid);
+    if (h.px >= params.width || h.py >= params.height) {
+        return;
+    }
+    let row = h.py % 16u;
+    let center = vec2<f32>(f32(h.px) + 0.5, f32(h.py) + 0.5);
+    let tile_base = (h.tile_y * params.tiles_x + h.tile_x) * params.n_draws;
 
     var a = 0.0;
     for (var d = 0u; d < params.n_draws; d++) {
@@ -97,5 +117,5 @@ fn main_coverage(@builtin(global_invocation_id) gid: vec3<u32>) {
         }
         a = max(a, min(abs(area), 1.0));
     }
-    textureStore(out_tex, vec2<u32>(gid.x, gid.y), vec4<f32>(a, 0.0, 0.0, 1.0));
+    textureStore(out_tex, vec2<u32>(h.px, h.py), vec4<f32>(a, 0.0, 0.0, 1.0));
 }

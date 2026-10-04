@@ -123,7 +123,9 @@ pub struct BlurResources {
     pub sampler: wgpu::Sampler,
 }
 
-/// 创建模糊管线。格式固定 `Rgba8Unorm`（与本项目输出纹理一致）。
+/// 创建模糊管线。目标格式 **`Rgba16Float`**（与层纹理、模糊纹理一致）：
+/// HDR 要求 >1.0 的高光源能穿过模糊存活，8 位格式会在写入时裁到 1.0。
+/// 8 位只出现在最终输出那一步（见 `docs/COLOR.md`）。
 pub fn create_resources(device: &wgpu::Device) -> BlurResources {
     let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some("amiki_blur"),

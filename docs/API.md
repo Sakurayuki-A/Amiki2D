@@ -92,6 +92,7 @@
 |---|---|
 | **GL 后端不支持位图** | 引擎**显式报错**（该后端读不出 `texture_2d_array`），见 RELEASE_PLAN §5 |
 | **DX12 冷启动约 2.3 s** | FXC 运行期编译着色器；可用 `AMIKI_BACKENDS` 指定后端 |
+| **并发创建 context 在启用 Vulkan 校验层时会崩** | 校验层在 debug 构建下由 wgpu 默认启用；**release 不受影响**。统一按"串行创建、并行使用"写。见 `KNOWN_ISSUES.md` **B14** 与 `amiki.h` 的「线程模型」 |
 | **引擎不做字体回退（无 font stack）** | `shape` / `layout` 每次只吃一个 `Font`：**一段文本只能用一种字体**。CJK 需要调用方显式用 `assets/fonts/NotoSansSC-Regular.ttf`（已随仓库分发，OFL 1.1）；只加载 Inter 时中文会画成方框。**这是声称能力上的缺口，正在补** |
 | **不做的能力** | 双向文本、Knuth-Plass、宽色域、各向异性过滤、动画系统 —— 见 RELEASE_PLAN §6（HDR 与 mipmap 已于 0.5.0 / 0.6.0 落地） |
 

@@ -110,7 +110,44 @@
  * ## 线程模型
  *
  * 引擎**不做内部同步**。一个 `amiki_context`（及其所有 `amiki_canvas`）
- * 必须在**同一个线程**上使用。不同 context 之间可以并行。
+ * 必须在**同一个线程**上使用。
+ *
+ * ### 并行**使用**不同 context：允许
+ *
+ * 每个 context 由自己所在的线程使用即可，**互不干扰**。
+ * 实测：16 线程各自渲染自己的 context，无异常。
+ *
+ * ### 并行**创建** context：不允许（见 `docs/KNOWN_ISSUES.md` B14）
+ *
+ * `amiki_context_create` 在 `AMIKI_BACKEND_GPU` / `AMIKI_BACKEND_AUTO` 下
+ * **会创建 wgpu 设备**（`AMIKI_BACKEND_CPU` 不创建）。多个线程**同时**创建时，
+ * 若 **Vulkan 校验层处于启用状态**（wgpu 在 `debug_assertions` 下**默认**启用），
+ * 会崩在 `VkLayer_khronos_validation.dll`：
+ *
+ * ```text
+ * 0xC0000005（访问违例）—— 不是 panic，没有任何可捕获的错误
+ * ```
+ *
+ * **根因不在引擎、也不在显卡驱动，而在校验层本身**（实测 A/B，同一份代码同一负载）：
+ *
+ * | 条件 | 结果 |
+ * |---|---|
+ * | 校验层**开**（debug 默认），16 线程并发创建 | **3 / 6 崩** |
+ * | 校验层**关**（`InstanceFlags::empty()`） | **0 / 6 崩** |
+ * | 校验层开，4 线程并发创建 | 0 / 6 |
+ * | 校验层开，串行创建 16 个 → 16 线程**并发使用** | **0 / 5 崩** |
+ *
+ * **release 构建默认不启用校验层，因此不受这条约束影响。** 但不要依赖构建类型 ——
+ * 统一按"串行创建"写：**先在单个线程里依次建好所需数量，再分发给各线程**。
+ *
+ *     amiki_context* pool[N];
+ *     for (int i = 0; i < N; i++) {
+ *         if (amiki_context_create(AMIKI_BACKEND_AUTO, &pool[i]) != AMIKI_OK) return 1;
+ *     }
+ *     // 之后各线程用 pool[i]：并行使用是安全的
+ *
+ * > 这一条**只是约束，不是错误**：引擎无法可靠地检测"别的线程正在创建"，
+ * > 因此它不会返回错误码，而是**可能直接崩掉进程**。把它当成硬性调用规则。
  *
  *
  * ## 典型用法
@@ -167,7 +204,7 @@ extern "C" {
 
 #define AMIKI_VERSION_MAJOR 0
 #define AMIKI_VERSION_MINOR 6
-#define AMIKI_VERSION_PATCH 0
+#define AMIKI_VERSION_PATCH 1
 /** 预发布标签（正式版为空串）。**不参与数值比较**，只用于展示。 */
 #define AMIKI_VERSION_PRERELEASE "alpha"
 

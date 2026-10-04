@@ -5,6 +5,112 @@
 
 ---
 
+## [0.6.1-alpha] —— GPU 增量渲染的脏区派发修复
+
+**修复一个**从 M4（0.3.0）起就存在**的静默错误**：GPU 帧持久路径只重算
+"**错误的那些 tile**"，脏区不在左上角时画面保留上一帧像素（残影）。
+
+### 缺陷：派发丢掉了脏区的**起点**
+
+`fine_dispatch_range` 把脏区换算成 `(x_start, x_count, y_start, y_count)`，
+调用方只用了后两个：
+
+```rust
+let (_fx, fw, _fy, fh) = fine_dispatch_range(damage, tiles_x, tiles_y);
+pass.dispatch_workgroups(fw, fh, 1);      // ← 起点被丢弃
+```
+
+fine 内核从 `global_invocation_id` 反推 tile 与像素坐标，于是**隐含**了
+"派发从 (0,0) 起步"的假设。wgpu 的 `dispatch_workgroups` **没有起点偏移**，
+所以脏区是 `(5,1)..(7,6)` 时，真正被重算的是 `(0,0)..(2,5)` —— 脏 tile 一个都
+没重算；而 `render_into_persistent` 的未派发区域按设计**不写入**（那正是复用
+上一帧的机制），画面于是停在上一帧。
+
+**为什么藏了这么久**：唯一的回归测试先把纹理渲成"全量正确"，再用脏区重算一批
+tile 后断言等于全量 —— **无论重算的是哪一批 tile 都会通过**。它检验的是"重算
+tile 的结果与全量一致"，而不是"重算的确实是脏 tile"。唯一会踩到它的是真实
+应用：`examples/window_demo.rs` 的滚动（脏区随内容一路下移，起点每帧都不同）。
+
+### 修法：1D 派发 + 脏 tile 索引表
+
+位置不再由 invocation 反推，而是**由宿主的表决定**：
+
+- 新绑定 **binding 18**：`dirty_tiles: array<u32>`，每项打包 `tx | ty << 16`
+- **1D 派发**：x 维 = `tile 序号 * 16 + tile 内列`，y 维 = tile 内行；
+  z 维分批（每批 65535 个 tile，规避单维 workgroup 上限 —— 8K 画布的
+  129 600 个 tile 因此仍在支持范围内）
+- `FineParams` 增加 `n_tiles`：末尾批次的尾巴据此提前退出
+  （否则会去重算 tile (0,0)，白做功）
+- 全量渲染时这张表就是整幅画布的 tile ⇒ **只有一条代码路径**
+- `sparse.rs` 与 `dense.rs` 同步；两个 fine 入口都用共享的 `tile_hit`
+  （`fine_math.wgsl`），**裁剪采样也改用真实画布像素坐标**而非 `gid.xy`
+  （这一处最容易漏：`clip_mul` 原本拿 `gid.xy` 当像素坐标）
+- **设备契约变更**：fine 的 storage buffer 从 9 个增到 **10** 个，
+  `amiki_gpu::REQUIRED_STORAGE_BUFFERS` 同步 9 → 10。自建 `wgpu::Device` 的
+  调用方必须继续用 `required_limits()`（`window_demo` 本来就是）
+
+### 测试：把"没有牙"的测试换成"有牙"的
+
+| 测试 | 之前 | 现在 |
+|---|---|---|
+| `gpu_damage_dispatch_matches_full` | 纹理先渲成全量正确 → 恒真 | 纹理停在**上一帧 A**，用 A→B 脏区做增量，与 B 全量**逐字节**对拍；并断言脏区**不在原点**（否则测试自身退化） |
+| `gpu_persistent_matches_full_across_scroll_like_frames` | 不存在 | **8 帧滚动序列**（脏区每帧移动、起点每帧不同）逐帧与全量对拍 —— 与 `window_demo` 同一条路径 |
+| `dirty_tile_list_covers_exactly_the_dirty_rect` | 不存在 | 纯函数：全量 / 局部 / 空脏区 / 越界钳制 |
+| `fine_dispatch_dims_batches_beyond_the_1d_workgroup_limit` | 不存在 | 纯函数：65535 边界与 z 维分批（8K 规模） |
+
+**验证有牙**（修复前分别红在这两处）：
+`不同字节 = 3872`（单帧 A→B，脏区 tile `(5,1)..(7,6)`）与
+`不同字节 = 8136`（滚动第 1 帧，脏区 tile `(2,1)..(9,10)`）。
+
+### 顺带查明：并发**创建 context** 会崩 —— 根因是 **Vulkan 校验层**
+
+见 `docs/RELEASE_PLAN.md` §8.5 与 `docs/KNOWN_ISSUES.md` 的 **B14**。
+
+`amiki_context_create` 在 GPU / AUTO 后端下会创建 `wgpu::Device`；多个线程
+**同时**创建时，整个进程异常退出（`0xC0000005`，**无 panic**，也没有任何可捕获的
+错误）。三列对照把范围逐层收窄（同一份代码、同一台机器、同一个负载）：
+
+| 场景 | 崩溃 |
+|---|---|
+| 16 线程**并发创建**（校验层开 = debug 默认） | **3 / 6** |
+| 校验层**关**（`InstanceFlags::empty()`），同一负载 | **0 / 6** |
+| 串行创建 16 个 → 16 线程**并发使用** | **0 / 5** |
+| 4 线程并发创建 / 并发使用 | 0 / 6 · 0 / 6 |
+
+**根因不在引擎、也不在显卡驱动**：wgpu 在 `debug_assertions` 下默认启用
+`InstanceFlags::VALIDATION`，Vulkan 后端据此加载校验层；Windows 事件日志把
+faulting module 直接写了出来 —— `VkLayer_khronos_validation.dll`，
+`Exception code: 0xc0000005`，与上表 3 次一一对应。
+
+**影响范围（关键）**：**release 构建默认不启用校验层 ⇒ 不受影响**；受影响的只有
+debug 构建或显式打开 wgpu 校验的运行（含 `cargo test` 默认配置）。这也解释了 §8.5
+那次"不可复现"：`docs/VERIFY.md` 的清单一直用 `cargo test --release`（校验层关），
+两次不是同一套条件。
+
+**ABI 侧的写法**：原句"不同 context 之间可以并行"说的是**使用**，这一半**成立**；
+缺的是"**创建要串行**"。已写进 `amiki.h` 的「线程模型」、
+`crates/amiki-capi/README.md` 与 `docs/API.md`（不依赖构建类型，统一按串行创建写）。
+
+> 这是本项目"不支持就**显式报错**"原则的**反例** —— 它既不报错也不 panic，
+> 而是直接崩进程。三种后续处置记在 B14：引擎内部串行化创建（推荐）/ ABI 层显式
+> 拒绝 / 保持现状，**尚未决策**（因发布构建不受影响，价值已变小）。
+
+**测试侧**：`amiki-gpu` 的 GPU 测试共用一个**串行闸门**（`tests.rs` 的
+`GPU_TEST_LOCK` / `gpu()`）—— 默认线程下 **6 / 6 全绿**（此前 **4 / 6** 崩），
+整套仍只要 ~7 s；顺带消除了"性能断言在并行环境里失真"这个反复出现的假失败
+（`HANDOFF.md` 纪律第 7 条）。
+
+### 其它
+
+- `blur.rs` 的注释仍写"格式固定 `Rgba8Unorm`" —— 实际管线目标与模糊纹理都是
+  `Rgba16Float`（0.5.0 HDR 改造漏改的一行注释），已更正
+- 端到端人工验证：`window_demo` 切到列表视图后 `脏 tile 0.0% · 0.00 ms/帧`
+  （静态界面零 GPU 工作），滚动到 680 时首行是被裁一半的第 22 行、之后 23→44
+  连续有序，**无残影**（截图见报告）
+- 测试：**224 passed / 0 failed**（`amiki-gpu` 34 → 37）
+
+---
+
 ## [0.6.0-alpha] —— mipmap
 
 **第六个 Alpha：大幅缩小的位图不再走样（B4 关闭）。**

@@ -15,7 +15,7 @@ build.cmd
 ```
 [3/3] running the Node demo ...
 
-Amiki2D 0.6.0-alpha（wasm，965.9 KB）
+Amiki2D 0.6.1-alpha（wasm，965.9 KB）
 后端：GPU 不可用（BackendUnavailable），用 CPU
 后端：CPU（CPU）
 字体：..\..\..\..\assets\fonts\Inter-Regular.ttf

@@ -558,34 +558,56 @@ fn check_damage_bounds(damage: Option<&amiki_scene::Damage>, tiles_x: u32, tiles
     }
 }
 
-/// 根据脏区算出 fine 阶段的 workgroup 派发范围 `(x_start, x_count, y_start, y_count)`。
+/// fine 阶段的**脏 tile 索引表**（1D 派发用）：每项打包成 `tx | ty << 16`。
 ///
-/// M4：fine 内核用 `global_invocation_id` 直接推导像素与 tile 坐标
-/// （`sparse_fine.wgsl` 里 `tile_x = gid.x / 16`），因此**只派发脏 tile 子矩形**
-/// 就会精确只重写那些 tile 的像素——不需要改任何 WGSL，也不需要改着色数学。
-/// 这是"脏区只重算"在 GPU 侧能零成本落地的根本原因。
+/// - `damage` 为 `None` 或全脏 ⇒ 整幅画布的 tile（row-major）
+/// - 否则 ⇒ 脏矩形覆盖的 tile（row-major；矩形是 `Damage` 目前唯一的表达）
 ///
-/// `None` / 全脏 ⇒ 整幅画布。返回的 count 均 ≥ 1，保证 dispatch 合法
-/// （workgroup 数不能为 0）。
-fn fine_dispatch_range(
+/// # 为什么把 (tx, ty) 放进缓冲，而不是让内核从 `global_invocation_id` 推
+///
+/// wgpu 的 `dispatch_workgroups` **没有起点偏移**。早先的实现把脏区换算成
+/// `(x_start, x_count, y_start, y_count)`，却只用了后两个 —— 于是脏区不在
+/// 左上角时，被重算的是 `[0,x_count) × [0,y_count)`，**真正的脏 tile 一个都没
+/// 重算**，画面静默保留上一帧像素（`window_demo` 的滚动就会踩到）。
+///
+/// 查表之后，派发只与"要重算的 tile 数"有关，与画布尺寸、与脏区起点都无关；
+/// 未来要支持非矩形脏区（多个小矩形）也只需要往这张表里多塞几项。
+pub(crate) fn dirty_tile_list(
     damage: Option<&amiki_scene::Damage>,
     tiles_x: u32,
     tiles_y: u32,
-) -> (u32, u32, u32, u32) {
-    let full = || (0u32, tiles_x.max(1), 0u32, tiles_y.max(1));
-    let Some(d) = damage else { return full() };
-    let Some((tx0, ty0, tx1, ty1)) = d.tiles() else {
-        return full(); // 全脏
+) -> Vec<u32> {
+    let (tx0, ty0, tx1, ty1) = match damage.and_then(|d| d.tiles()) {
+        Some(r) => r,
+        None => (0, 0, tiles_x, tiles_y),
     };
-    let x_start = tx0.min(tiles_x);
-    let y_start = ty0.min(tiles_y);
-    let x_end = tx1.min(tiles_x).max(x_start);
-    let y_end = ty1.min(tiles_y).max(y_start);
-    if x_end == x_start || y_end == y_start {
-        // 无脏区：派发一个最小合法范围（内核按画布裁剪，不会写入任何像素）
-        return (x_start, 1, y_start, 1);
+    let tx0 = tx0.min(tiles_x);
+    let tx1 = tx1.min(tiles_x).max(tx0);
+    let ty0 = ty0.min(tiles_y);
+    let ty1 = ty1.min(tiles_y).max(ty0);
+    debug_assert!(tx1 <= 0xFFFF && ty1 <= 0xFFFF, "tile 坐标超出一个 u16 的打包范围");
+    let mut out = Vec::with_capacity(((tx1 - tx0) as usize) * ((ty1 - ty0) as usize));
+    for ty in ty0..ty1 {
+        for tx in tx0..tx1 {
+            out.push(tx | (ty << 16));
+        }
     }
-    (x_start, x_end - x_start, y_start, y_end - y_start)
+    out
+}
+
+/// fine 的 1D 派发维度：`(x_workgroups, z_workgroups)`，`y` 恒为 1。
+///
+/// 每个 workgroup = 一个 tile（`workgroup_size(16,16)`）。单维 workgroup 上限
+/// 是 WebGPU 规范保证的 **65535**，所以用 z 维分批 —— 这样任意画布尺寸
+/// （含 8K：480×270 = 129 600 tile）都在一张表里放得下。
+pub(crate) fn fine_dispatch_dims(n_tiles: u32) -> (u32, u32) {
+    /// WebGPU 规范保证的 `maxComputeWorkgroupsPerDimension` 下限。
+    const MAX_PER_DIM: u32 = 65535;
+    // `clamp` 而非 `min().max()`：后者在 clippy 眼里是手写的 clamp。
+    // 下限 1 是因为 workgroup 数不能为 0（`n_tiles == 0` 时调用方本来就跳过派发）。
+    let x = n_tiles.clamp(1, MAX_PER_DIM);
+    let z = n_tiles.div_ceil(MAX_PER_DIM).max(1);
+    (x, z)
 }
 
 fn ts_writes(
@@ -776,7 +798,8 @@ pub fn dense_capacity(
 ///
 /// # 为什么需要这个函数（dogfooding 抓到的真问题）
 ///
-/// 引擎的 `amiki_fine_bgl` 有 **9 个 storage buffer**（第 9 个是图像放置参数），
+/// 引擎的 `amiki_fine_bgl` 有 **10 个 storage buffer**（0.6.1 起；第 10 个是
+/// 脏 tile 索引表，在此之前是 9 个、第 9 个是图像放置参数），
 /// 而 `wgpu::Limits::default()` 只保证 **8** 个（WebGPU 基线）。
 ///
 /// `GpuRenderer::new()` 会按适配器能力上调这个上限，但**自己建设备的调用方
@@ -784,7 +807,7 @@ pub fn dense_capacity(
 ///
 /// ```text
 /// In Device::create_bind_group_layout, label = 'amiki_fine_bgl'
-///   Too many bindings of type StorageBuffers in Stage COMPUTE, limit is 8, count was 9
+///   Too many bindings of type StorageBuffers in Stage COMPUTE, limit is 8, count was 10
 /// ```
 ///
 /// 这个错误**深在 wgpu 内部**，调用方几乎无法从消息定位到"我该改 limits"。
@@ -803,7 +826,11 @@ pub fn required_limits() -> wgpu::Limits {
 }
 
 /// 引擎在单个着色阶段里需要的 storage buffer 数量（见 [`required_limits`]）。
-pub const REQUIRED_STORAGE_BUFFERS: u32 = 9;
+///
+/// 0.6.1 起是 **10**：fine 新增了**脏 tile 索引表**（binding 18，`array<u32>`）。
+/// 这个数字是**对外契约**的一部分 —— 自行创建 `wgpu::Device` 的调用方必须用
+/// [`required_limits`] 请求，否则 `from_device` 会显式报错。
+pub const REQUIRED_STORAGE_BUFFERS: u32 = 10;
 
 impl GpuRenderer {
     /// 独立初始化（无窗口）。
@@ -922,15 +949,15 @@ impl GpuRenderer {
         let adapter =
             adapter.ok_or_else(|| RenderError("没有可用的 GPU 适配器".into()))?;
         let info = adapter.get_info();
-        // M6：图像放置参数是第 9 个 storage buffer，而 wgpu 的
-        // `Limits::default()` 只保证 8 个（WebGPU 基线）。
+        // fine 的 storage buffer 数（0.6.1 起 10 个：图像放置参数 + 脏 tile 表）
+        // 超过了 wgpu `Limits::default()` 保证的 8 个（WebGPU 基线）。
         // 因此**按适配器能力上调**该上限，并在适配器不支持时明确报错，
         // 而不是让 create_bind_group 在运行时抛出一句难以定位的校验失败。
         let adapter_limits = adapter.limits();
         let want_sb = REQUIRED_STORAGE_BUFFERS;
         if adapter_limits.max_storage_buffers_per_shader_stage < want_sb {
             return err(format!(
-                "适配器仅支持 {} 个 storage buffer/阶段，图像绘制需要 {want_sb} 个；请改用 CPU 引擎或不使用图像",
+                "适配器仅支持 {} 个 storage buffer/阶段，渲染管线需要 {want_sb} 个；请改用 CPU 引擎（amiki_raster）",
                 adapter_limits.max_storage_buffers_per_shader_stage
             ));
         }
@@ -1064,6 +1091,11 @@ impl GpuRenderer {
             ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
             count: None,
         });
+        // 0.6.1：**脏 tile 索引表**（1D 派发）。每项 `tx | ty << 16`，
+        // 内核按下标查表得到自己要重算的 tile —— 这样派发就不需要起点偏移
+        // （wgpu 没有），也不会再出现"起点被丢弃 → 重算错 tile"的静默残影。
+        // 全量渲染时这张表就是整幅画布的 tile（row-major），因此只有一条代码路径。
+        fine_entries.push(storage_bgl_entry(18, true));
         let fine_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("amiki_fine_bgl"),
             entries: &fine_entries,

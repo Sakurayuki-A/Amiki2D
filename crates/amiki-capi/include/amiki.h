@@ -208,7 +208,7 @@ extern "C" {
  * ========================================================================== */
 
 #define AMIKI_VERSION_MAJOR 0
-#define AMIKI_VERSION_MINOR 7
+#define AMIKI_VERSION_MINOR 8
 #define AMIKI_VERSION_PATCH 0
 /** 预发布标签（正式版为空串）。**不参与数值比较**，只用于展示。 */
 #define AMIKI_VERSION_PRERELEASE "alpha"
@@ -577,6 +577,40 @@ AMIKI_API const char* amiki_context_adapter_name(const amiki_context* ctx);
 /* ==========================================================================
  * 画布
  * ========================================================================== */
+
+/**
+ * **填充规则**（0.8.0）。默认 `AMIKI_FILL_NONZERO`。
+ *
+ * 两条规则的差别只在"区域被覆盖奇数次还是非零次"：
+ *
+ * - `NONZERO`：绕数非零即填充（同向重叠的环**填实**）
+ * - `EVENODD`：绕数为奇数才填充（同向重叠的环**互相抵消成洞**）
+ *
+ * 对不重叠的简单形状（方块、圆、字形轮廓）两者结果**完全相同**；
+ * 差别出现在自相交路径与同向嵌套环上。
+ */
+typedef enum amiki_fill_rule {
+    /** 非零绕数（默认） */
+    AMIKI_FILL_NONZERO = 0,
+    /** 奇偶（even-odd） */
+    AMIKI_FILL_EVENODD = 1
+} amiki_fill_rule;
+
+/**
+ * 设置**后续填充**的填充规则。状态式、粘性：设置后一直生效，直到再次设置。
+ *
+ * - 只作用于**填充**；描边是轮廓化，与填充规则无关。
+ * - 层次：之后新开的层会继承当前规则。
+ * - 越界枚举值被拒绝（`AMIKI_ERROR_INVALID_ARGUMENT`），状态不变。
+ * - 不调用本函数时行为与 0.7.0 **逐字节一致**（默认 NonZero）。
+ *
+ * 代价（写在明处）：even-odd 的填充要在 CPU 侧把路径分解成互不重叠的梯形
+ * （每次绘制都做，不缓存），因此比 NonZero 贵 —— 见 `docs/KNOWN_ISSUES.md` 的 B16。
+ */
+AMIKI_API amiki_result amiki_canvas_set_fill_rule(amiki_canvas* canvas, amiki_fill_rule rule);
+
+/** 当前填充规则（传 NULL 返回 `AMIKI_FILL_NONZERO`，不崩）。 */
+AMIKI_API amiki_fill_rule amiki_canvas_get_fill_rule(const amiki_canvas* canvas);
 
 /**
  * 创建画布。`ctx` **必须比画布活得久**（画布只借用它）。

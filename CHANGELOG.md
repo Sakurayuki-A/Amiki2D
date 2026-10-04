@@ -5,6 +5,98 @@
 
 ---
 
+## [0.8.0-alpha] —— even-odd 填充规则
+
+**新能力**：`FillRule::EvenOdd`（奇偶填充）与既有的 `NonZero` 并存。
+默认仍是 `NonZero` —— **不调用新 API 的代码逐字节不变**（278 测试全绿，
+既有 256 条一条没改）。
+
+### ⚠️ 实现方式与计划不同：改的是**几何**，不是累加符号
+
+计划 §2.1 设想"复用 `seg_area`、只改累加符号、取 Σ 的奇偶性"。**这条前提被实验反证**：
+
+引擎的覆盖率是 `min(|Σ seg_area|, 1)`，几何上等于该像素的**绕数加权面积** `∬ W dA`；
+而 even-odd 要的是**奇偶区域**，那是绕数的**非线性**函数（`W mod 2`）——
+从 `∬ W dA` 无论怎么改符号都取不到。实测（`crates/amiki-raster/tests/fill_rule_semantics.rs`，
+参照是独立的 32× 超采样逐点绕数裁判）：
+
+| 形状 | "取 Σ 奇偶"的偏差 | 说明 |
+|---|---|---|
+| 普通方块 | **0.7207**（≈184/255） | 边界覆盖率被压成 0/1，**解析抗锯齿全丢** |
+| 同向双环 | **0.8477**（≈216/255） | 同上 |
+
+**改用的做法**：把 even-odd 的形状**预处理成等价的 NonZero 几何** ——
+按 y 扫描成带、带内按 x 排序、**两两配对**成互不重叠的梯形，
+每个梯形只输出两条竖边（水平段对 `seg_area` 贡献恒为 0；一对竖边的贡献之和
+正好是 `∫(clamp(x_r) − clamp(x_l))dy`，即该梯形的精确裁剪覆盖面积，
+`−s·len` 常数项自动相消）。之后走**原有**的 NonZero 分箱/着色路径。
+
+- **覆盖率数学一行未改**，`fine_math.wgsl` / `sparse_fine.wgsl` / `fine.wgsl` **一行未改**，
+  绑定号未动 —— 计划里"给 WGSL 加 fill_rule 分支"的阶段**不再需要**
+  （顺带消掉计划风险表里的 FXC 展开风险）。
+- 同一份预处理在 **CPU 侧**被两端共用：`amiki-raster` 的分箱与 `amiki-gpu` 的提取
+  都调用 `amiki_raster::even_odd_spans` ⇒ 双端一致是**构造性**的。
+- 代价：even-odd 的 draw 每帧多做一趟 CPU 侧压平 + 分解（不缓存），
+  上传线段数也明显多于原曲线数。已写进 header 与 KNOWN_ISSUES 的 B5 关闭说明。
+
+### 另外三处与计划不同（都实测）
+
+1. **判别用例写错了**：计划里的"外圈顺时针 + 内圈**逆时针**"环在两条规则下都是环
+   （中心都给 0）—— **没有判别力**。真正能区分的是**同向**双环
+   （NonZero 中心 1.000 / EvenOdd 0.000）。
+2. **§2.2 的边界约定不能按计划改**：现有分箱是"行表偏包含（`floor` 两端）+ carry 严格
+   `<` 排除"这一对**互补**约定；把前缀排除改成 `<=` 会让正好结束在 tile 左边界上的段
+   被计两次。已把**现有**约定写成可执行断言（`tests/fill_rule_boundary.rs`），并说明
+   为什么不能"顺手统一"。
+3. **AMK1 没有 `flags` 字段**：真实布局是 `transform | color | blend u32 | n_refs | refs | path`。
+   按计划"零布局变更 + bit 12"的**意图**，落点取 **`blend` 那个 u32 的 bit 12**
+   （blend 只占 0..3）—— 布局一字未改，bit 号与计划一致。
+
+### AMK1 v2（只解不编）
+
+- `STREAM_VERSION` 1 → **2**；**v1 与 v2 布局完全相同**，唯一差别是 bit 12 是否定义为
+  `fill_rule`。编码器统一写 v2（没有 v1 编码器可删，避免死代码漂移）；
+  解码器同时接受 v1 与 v2，**未知版本（≥3）显式报错**。
+- 测试：v2 混排往返（4 条 draw 含 2 条 EvenOdd，顺序与 blend 都不变）、
+  v1 字节（bit 12 仍为 1）解码必得 `NonZero`、版本 3 被拒绝。
+
+### C ABI（符号 80 → 82）
+
+| 新增 | 说明 |
+|---|---|
+| `amiki_fill_rule` 枚举 | `AMIKI_FILL_NONZERO = 0`（默认）/ `AMIKI_FILL_EVENODD = 1` |
+| `amiki_canvas_set_fill_rule` | 状态式、粘性；只作用于填充；越界值被拒绝；之后新开的层会继承 |
+| `amiki_canvas_get_fill_rule` | 传 NULL 返回默认值（不崩） |
+
+`fill_path` / `fill_path_with` / `stroke_path` 的签名**一字未动**。
+
+### 门面与场景
+
+- `amiki::Canvas::set_fill_rule` / `fill_rule`（状态式，与 `set_blend` 一致）；
+  三个绘制落点（`fill_path_with`、两处文本）统一 `stamp_fill_rule`，
+  避免"某个入口静默失效"。
+- `amiki_scene::FillRule` 增加 `EvenOdd` + `Default`（`NonZero`）+ `bit()` / `from_bit()`。
+
+### 测试（256 → 278）
+
+| 位置 | 新增 | 覆盖 |
+|---|---|---|
+| `amiki-raster/tests/fill_rule_semantics.rs` | 5 | 设计决策**证据**：装置自检、"取奇偶"被反证、判别用例必须是同向双环、等价几何能复现 even-odd |
+| `amiki-raster/tests/fill_rule_boundary.rs` | 1 | 段与 tile 的归属约定（6 条断言）+ 为什么不能改 |
+| `amiki-raster/tests/fill_rule_even_odd.rs` | 7 | 简单形状/同向双环判别/反向环无判别力/**自相交五角星**/三层嵌套/两条规则一致/退化路径 |
+| `amiki-scene`（内联） | 3 | AMK1 v2 往返、v1 字节解成 NonZero、未知版本拒绝 |
+| `amiki-capi`（内联） | 3 | 默认值 + 往返、越界拒绝且不改状态、**经 ABI 的端到端镂空** |
+| `amiki-gpu`（内联） | 2 | **GPU↔CPU 最大通道差 1**、**稀疏↔稠密逐字节一致** |
+
+### 顺带查到的一条**既有**精度限制（已登记 B16）
+
+追 even-odd 精度时发现：`min(|Σ|, 1)` 在 **`|W| ≥ 2` 区域的边缘会饱和** ——
+自相交五角星上 NonZero 与 32× 裁判的偏差达 **0.1387**（≈35/255），
+而它**不是本次改动引入的**（nonzero 路径一行未改，且 even-odd 走的是互不重叠的梯形、
+不触发饱和：同一张图 even-odd 偏差只有 **0.0027**）。已登记为 **B16**。
+
+---
+
 ## [0.7.0-alpha] —— 字体回退（一段文本里多个字体）
 
 **新能力**：一段文本里的不同字符可以由**不同字体**渲染 —— 拉丁走 Inter、

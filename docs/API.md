@@ -33,6 +33,7 @@
 | `Canvas::text_with_stack` | 文字 + **字体回退**（0.7.0） |
 | `Canvas::set_transform` / `translate` / `rotate` / `scale` / `reset` | 变换 |
 | `Canvas::set_blend` | 混合模式 |
+| `Canvas::set_fill_rule` / `fill_rule` | **填充规则**：`NonZero`（默认）/ `EvenOdd`（0.8.0，状态式） |
 | `Canvas::push_clip` / `pop_clip` | 裁剪 |
 | `Canvas::scene` | 产出场景（字段） |
 | `amiki::color` | 调色板常量 |

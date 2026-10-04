@@ -2684,3 +2684,94 @@ fn gpu_renders_cjk_glyphs_identically_to_cpu() {
         run.glyphs.len()
     );
 }
+
+// ============================================================ even-odd（0.8.0）
+
+/// 造一个 even-odd 场景：同向双环（NonZero 实心 / EvenOdd 镂空）+ 自相交五角星。
+fn even_odd_scene(w: u32, h: u32) -> Scene {
+    use amiki_math::{Affine, Vec2};
+    use amiki_scene::{Color, FillRule, Paint, PathBuilder};
+
+    let mut scene = Scene::new(w, h);
+    let mut pb = PathBuilder::new();
+    pb.rect(0.0, 0.0, w as f32, h as f32);
+    scene.push(
+        Affine::IDENTITY,
+        pb.build(),
+        Paint::Solid(Color::rgb8(255, 255, 255)),
+    );
+
+    // 同向双环（非整数对齐，保证有部分覆盖像素）
+    let mut pb = PathBuilder::new();
+    pb.rect(3.3, 3.1, 28.7, 28.9);
+    pb.rect(11.2, 11.3, 21.8, 20.7);
+    scene.push(
+        Affine::IDENTITY,
+        pb.build(),
+        Paint::Solid(Color::rgb8(0, 0, 0)),
+    );
+    scene.draws.last_mut().unwrap().fill_rule = FillRule::EvenOdd;
+
+    // `{5/2}` 五角星（真自相交：中心区绕数为 2）
+    let mut pb = PathBuilder::new();
+    let (cx, cy, r) = (44.0f32, 44.0f32, 17.3f32);
+    for i in 0..5 {
+        let a = 2.0 * std::f32::consts::PI * (i as f32) * 2.0 / 5.0 - std::f32::consts::FRAC_PI_2;
+        let p = Vec2::new(cx + r * a.cos(), cy + r * a.sin());
+        if i == 0 {
+            pb.move_to(p);
+        } else {
+            pb.line_to(p);
+        }
+    }
+    pb.close();
+    scene.push(
+        Affine::IDENTITY,
+        pb.build(),
+        Paint::Solid(Color::rgb8(20, 60, 200)),
+    );
+    scene.draws.last_mut().unwrap().fill_rule = FillRule::EvenOdd;
+    scene
+}
+
+/// even-odd：**GPU 与 CPU 逐像素一致**（判据 ≤2/255），且确实画出了东西。
+#[test]
+fn gpu_even_odd_matches_cpu() {
+    let Some((renderer, _gpu_guard)) = gpu() else { return };
+    let scene = even_odd_scene(64, 64);
+
+    let gpu = renderer.render_blocking(&scene, 0.05).expect("GPU 渲染失败");
+    let cpu = amiki_raster::render(&amiki_raster::bin(&scene, 0.05));
+
+    let mut max_diff = 0u32;
+    let mut ink = 0usize;
+    for (a, b) in gpu.iter().zip(cpu.iter()) {
+        max_diff = max_diff.max((*a as i32 - *b as i32).unsigned_abs());
+        if *a < 250 {
+            ink += 1;
+        }
+    }
+    assert!(ink > 2000, "必须真的画出 even-odd 内容，实际非白通道 {ink}");
+    assert!(max_diff <= 2, "even-odd：GPU 与 CPU 最大通道差 {max_diff} 超出容差");
+    eprintln!("even-odd 对拍：最大通道差 {max_diff}，非白通道 {ink}");
+}
+
+/// even-odd：**稀疏与稠密两条分箱路径逐字节一致**。
+#[test]
+fn sparse_and_dense_agree_on_even_odd() {
+    let Some((mut renderer, _gpu_guard)) = gpu() else { return };
+    let scene = even_odd_scene(64, 64);
+
+    renderer.path = RenderPath::Sparse;
+    let sparse = renderer.render_blocking(&scene, 0.05).expect("稀疏渲染失败");
+    renderer.path = RenderPath::Dense;
+    let dense = renderer.render_blocking(&scene, 0.05).expect("稠密渲染失败");
+
+    let diff = sparse.iter().zip(dense.iter()).filter(|(a, b)| a != b).count();
+    assert_eq!(
+        diff, 0,
+        "even-odd 在稀疏/稠密两条路径下必须逐字节一致，实际不同字节 {diff}"
+    );
+    eprintln!("even-odd：稀疏 ⇄ 稠密逐字节一致（{} 字节）", sparse.len());
+}
+

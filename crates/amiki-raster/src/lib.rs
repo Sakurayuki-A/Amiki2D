@@ -41,6 +41,9 @@ pub use persist::{FrameStats, PersistentRenderer};
 mod filter;
 pub use filter::{apply as apply_filter, blur as blur_layer, inflated_bounds, LayerBuffer};
 
+mod even_odd;
+pub use even_odd::even_odd_spans;
+
 /// tile 边长（像素）。
 pub const TILE: u32 = 16;
 const TILE_USIZE: usize = TILE as usize;
@@ -244,7 +247,13 @@ pub fn bin(scene: &Scene, flatten_eps: f32) -> BinnedScene {
         carry_tiles.clear();
 
         let seg_base = out.segments.len() as u32;
-        let segs = flatten_draw(&draw.transform, &draw.path.els, flatten_eps);
+        let mut segs = flatten_draw(&draw.transform, &draw.path.els, flatten_eps);
+        // even-odd（0.8.0）：把奇偶区域分解成**互不重叠**的梯形（只输出竖边），
+        // 之后走的仍是同一条 NonZero 路径 —— 覆盖率数学与 WGSL 一行未改。
+        // 为什么要这么做（而不是改累加符号）见 `even_odd.rs` 的模块文档。
+        if draw.fill_rule.is_even_odd() {
+            segs = even_odd::even_odd_spans(&segs);
+        }
         if segs.is_empty() {
             continue;
         }

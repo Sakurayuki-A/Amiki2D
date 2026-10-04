@@ -147,6 +147,7 @@ pub extern "C" fn amiki_canvas_create(
         let cv = Box::new(AmikiCanvas {
             tone_map: amiki_scene::ToneMap::Raw,
             mip_bias: 0.0,
+            fill_rule: amiki_scene::FillRule::NonZero,
             ctx,
             width,
             height,
@@ -652,6 +653,9 @@ pub extern "C" fn amiki_canvas_begin_layer(
         let (w, h) = (c.width, c.height);
         let mut sub = amiki::Canvas::new(w, h);
         sub.set_blend(blend);
+        // 填充规则是画布级状态：新开的层要继承当前规则，
+        // 否则"设了 even-odd 再开层"会在这层里静默退回 NonZero。
+        sub.set_fill_rule(c.fill_rule);
         c.layers.push(PendingLayer {
             canvas: sub,
             bounds: layer_bounds_from_raw(bounds),
@@ -1067,6 +1071,38 @@ pub extern "C" fn amiki_canvas_set_mip_bias(cv: *mut AmikiCanvas, bias: f32) -> 
         c.mip_bias = bias;
         AMIKI_OK
     })
+}
+
+// ---- 填充规则（even-odd，0.8.0）----
+
+/// 设置**后续填充**的填充规则。状态式、粘性；默认 `AMIKI_FILL_NONZERO`。
+///
+/// 越界枚举值被拒绝（返回 `AMIKI_ERROR_INVALID_ARGUMENT`），状态不变。
+/// 只作用于填充，不影响描边（描边是轮廓化，与填充规则无关）。
+#[no_mangle]
+pub extern "C" fn amiki_canvas_set_fill_rule(cv: *mut AmikiCanvas, rule: i32) -> i32 {
+    let Some(rule) = fill_rule_from_i32(rule) else {
+        return AMIKI_ERROR_INVALID_ARGUMENT;
+    };
+    ffi!(cv, |c| {
+        c.fill_rule = rule;
+        // 立刻写进当前绘制目标（根画布或最内层打开中的层）。
+        // 层是**之后**才打开的，所以在 `begin_layer` 里也要把规则传下去。
+        c.target().set_fill_rule(rule);
+        AMIKI_OK
+    })
+}
+
+/// 当前填充规则。传 NULL 返回 `AMIKI_FILL_NONZERO`（与 `amiki_context_backend`
+/// 对 NULL 的处理一致：不崩、给默认值）。
+#[no_mangle]
+pub extern "C" fn amiki_canvas_get_fill_rule(cv: *const AmikiCanvas) -> i32 {
+    if cv.is_null() {
+        return AMIKI_FILL_NONZERO;
+    }
+    // SAFETY: 已判空
+    let c = unsafe { &*cv };
+    fill_rule_to_i32(c.fill_rule)
 }
 
 #[no_mangle]

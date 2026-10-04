@@ -59,6 +59,27 @@ pub const AMIKI_MISSING_GLYPH_ERROR: i32 = 0;
 pub const AMIKI_MISSING_GLYPH_NOTDEF: i32 = 1;
 pub const AMIKI_MISSING_GLYPH_SKIP: i32 = 2;
 
+/// 填充规则：与 header 的 `amiki_fill_rule` 一一对应（0.8.0）。
+pub const AMIKI_FILL_NONZERO: i32 = 0;
+pub const AMIKI_FILL_EVENODD: i32 = 1;
+
+/// C 的 `amiki_fill_rule` → 引擎枚举。越界值返回 `None`（调用方显式报错）。
+pub(crate) fn fill_rule_from_i32(v: i32) -> Option<amiki_scene::FillRule> {
+    match v {
+        AMIKI_FILL_NONZERO => Some(amiki_scene::FillRule::NonZero),
+        AMIKI_FILL_EVENODD => Some(amiki_scene::FillRule::EvenOdd),
+        _ => None,
+    }
+}
+
+/// 引擎枚举 → C 的 `amiki_fill_rule`。
+pub(crate) fn fill_rule_to_i32(r: amiki_scene::FillRule) -> i32 {
+    match r {
+        amiki_scene::FillRule::NonZero => AMIKI_FILL_NONZERO,
+        amiki_scene::FillRule::EvenOdd => AMIKI_FILL_EVENODD,
+    }
+}
+
 /// shaping 选项的 C 镜像（header 的 `amiki_text_options`）。
 ///
 /// `bool` 在 C 里是 1 字节、Rust 里也是 1 字节，`_pad` 显式补齐到 4 字节对齐 ——

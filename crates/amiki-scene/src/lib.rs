@@ -157,10 +157,51 @@ impl PathBuilder {
     }
 }
 
-/// 填充规则。**当前只有 nonzero**；even-odd 未实现（见 `docs/KNOWN_ISSUES.md`）。
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// 填充规则。
+///
+/// # even-odd 是怎么实现的（0.8.0）
+///
+/// 引擎的覆盖率是 `min(|Σ seg_area|, 1)`，几何上等于该像素的**绕数加权面积**
+/// `∬ W dA`。even-odd 要的是**奇偶区域**，那是绕数的非线性函数（`W mod 2`）——
+/// 从 `∬ W dA` 无论如何改符号都取不到（实测偏差 0.72~0.85，见
+/// `crates/amiki-raster/tests/fill_rule_semantics.rs`）。
+///
+/// 所以实现方式是**几何**上的：把 even-odd 的路径用扫描线跨度分解成一组
+/// **互不重叠的梯形**（`amiki_raster::even_odd_spans`，CPU 侧、两端共用），
+/// 再交给原有的 NonZero 路径。覆盖率数学、WGSL、绑定号一个都没动。
+///
+/// 代价：even-odd 的 draw 多一趟 CPU 侧预处理（每次绘制都要跑，不缓存）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum FillRule {
+    /// 非零绕数（默认）。
+    #[default]
     NonZero,
+    /// 奇偶（even-odd）。
+    EvenOdd,
+}
+
+impl FillRule {
+    /// 是否 even-odd。分箱/提取用它决定要不要做跨度分解。
+    pub fn is_even_odd(self) -> bool {
+        matches!(self, FillRule::EvenOdd)
+    }
+
+    /// AMK1 `flags` bit 12 的取值：`0 = NonZero`、`1 = EvenOdd`。
+    pub fn bit(self) -> u32 {
+        match self {
+            FillRule::NonZero => 0,
+            FillRule::EvenOdd => 1,
+        }
+    }
+
+    /// 从 AMK1 `flags` bit 12 还原（**只解不编的 v1 场景恒为 NonZero**）。
+    pub fn from_bit(b: u32) -> FillRule {
+        if b & 1 == 0 {
+            FillRule::NonZero
+        } else {
+            FillRule::EvenOdd
+        }
+    }
 }
 
 /// 混合模式（W3C compositing 全集）。id 与 WGSL/CPU 镜像逐一对齐。
@@ -1160,12 +1201,31 @@ pub fn cubic_of(p0: Vec2, el: &PathEl) -> Option<CubicBez> {
 // 布局（小端）：
 //   "AMK1" | version u32 | width u32 | height u32 | n_clips u32 | n_draws u32
 //   每 clip：transform 6×f32 | path
-//   每 draw：transform 6×f32 | color 4×f32 | blend u32 | n_refs u32 | refs | path
+//   每 draw：transform 6×f32 | color 4×f32 | blend/flags u32 | n_refs u32 | refs | path
 //   path = count u32 | count × (tag u8 + 坐标 f32)
 //   tag：0 MoveTo, 1 LineTo, 2 QuadTo, 3 CubicTo, 4 Close
+//
+// v2（0.8.0）：draw 的那个 u32 从"纯 blend id"升级为**标志字** ——
+// bit 0..3 = blend id，bit 12 = fill_rule（0 = NonZero，1 = EvenOdd）。
+// 布局**没有变化**（不加字段、不扩宽）；v1 流里 bit 12 恒为 0，解码即 NonZero。
+// v1 只解不编：编码器统一写 v2。
 
 pub const STREAM_MAGIC: &[u8; 4] = b"AMK1";
-pub const STREAM_VERSION: u32 = 1;
+/// 当前编码版本。
+///
+/// # v1 → v2（0.8.0）
+///
+/// v2 与 v1 的**布局完全相同**，唯一差别是每个 draw 的 blend 字里
+/// **bit 12 被定义为 `fill_rule`**（v1 该位恒为 0 ⇒ 解码为 `NonZero`）。
+///
+/// - **只解不编**：编码器统一写 v2（v1 编码器已不存在，避免死代码漂移）；
+///   解码器同时接受 v1 与 v2。
+/// - 未知版本（≥3）**显式报错**，不静默错解。
+pub const STREAM_VERSION: u32 = 2;
+/// v1 的版本号（只解不编）。
+pub const STREAM_VERSION_V1: u32 = 1;
+/// blend 字里 `fill_rule` 占的位（与计划的 bit 12 一致）。
+pub const FILL_RULE_BIT: u32 = 12;
 
 fn put_u32(buf: &mut Vec<u8>, v: u32) {
     buf.extend_from_slice(&v.to_le_bytes());
@@ -1351,7 +1411,10 @@ pub fn encode_scene(scene: &Scene) -> Vec<u8> {
                 put_u32(&mut buf, u32::from(placement.repeat));
             }
         }
-        put_u32(&mut buf, draw.blend.id());
+        // v2：这个 u32 从"纯 blend id"升级为**标志字** —— bit 0..3 仍是 blend，
+        // bit 12 是 fill_rule（0 = NonZero 默认，1 = EvenOdd）。
+        // 布局**一字未改**（没有加字段、没有扩宽），v1 流里这一位恒为 0。
+        put_u32(&mut buf, draw.blend.id() | (draw.fill_rule.bit() << FILL_RULE_BIT));
         put_u32(&mut buf, draw.clips.len() as u32);
         for &c in &draw.clips {
             put_u32(&mut buf, c);
@@ -1368,9 +1431,11 @@ pub fn decode_scene(bytes: &[u8]) -> Result<Scene, String> {
         return Err("编码流 magic 不符（需要 AMK1）".into());
     }
     let version = r.u32()?;
-    if version != STREAM_VERSION {
+    // v1 与 v2 都接受；差别只在 blend 字的 bit 12 是否**定义**为 fill_rule。
+    if version != STREAM_VERSION && version != STREAM_VERSION_V1 {
         return Err(format!("编码流版本不支持: {version}"));
     }
+    let v2 = version >= 2;
     let width = r.u32()?;
     let height = r.u32()?;
     let n_clips = r.u32()?;
@@ -1426,7 +1491,15 @@ pub fn decode_scene(bytes: &[u8]) -> Result<Scene, String> {
                 ));
             }
             other => return Err(format!("paint 类型不支持: {other}")),
-        };        let blend_id = r.u32()?;
+        };        let flags = r.u32()?;
+        // v2：bit 12 是 fill_rule；v1：该位保留，恒为 NonZero。
+        let fill_rule = if v2 {
+            FillRule::from_bit(flags >> FILL_RULE_BIT)
+        } else {
+            FillRule::NonZero
+        };
+        // blend id 只占低 4 位（0..15），掩掉标志位再查表。
+        let blend_id = flags & 0x0FFF;
         let n_refs = r.u32()? as usize;
         let mut clips = Vec::with_capacity(n_refs);
         for _ in 0..n_refs {
@@ -1456,7 +1529,7 @@ pub fn decode_scene(bytes: &[u8]) -> Result<Scene, String> {
             transform: t,
             path,
             paint,
-            fill_rule: FillRule::NonZero,
+            fill_rule,
             blend,
             clips,
         });
@@ -1831,6 +1904,80 @@ mod tests {
         let mut bytes = encode_scene(&Scene::new(10, 10));
         bytes[4] = 99; // 版本破坏
         assert!(decode_scene(&bytes).is_err());
+    }
+
+    /// AMK1 v2（0.8.0）：`fill_rule` 必须往返，且**混排顺序**不变。
+    #[test]
+    fn stream_v2_round_trip_keeps_fill_rule() {
+        let mut scene = Scene::new(64, 64);
+        for (i, rule) in [FillRule::NonZero, FillRule::EvenOdd, FillRule::NonZero, FillRule::EvenOdd]
+            .into_iter()
+            .enumerate()
+        {
+            let mut pb = PathBuilder::new();
+            pb.rect(i as f32 * 8.0, 2.1, i as f32 * 8.0 + 6.0, 8.3);
+            scene.push(
+                Affine::IDENTITY,
+                pb.build(),
+                Paint::Solid(Color::rgb8(0, 0, 0)),
+            );
+            scene.draws.last_mut().unwrap().fill_rule = rule;
+        }
+        // 顺带放一条非 Normal 的混合模式，验证标志位没污染 blend
+        scene.draws[1].blend = BlendMode::Multiply;
+
+        let bytes = encode_scene(&scene);
+        assert_eq!(&bytes[0..4], STREAM_MAGIC);
+        assert_eq!(
+            u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]),
+            STREAM_VERSION,
+            "编码器必须写 v2"
+        );
+
+        let back = decode_scene(&bytes).expect("v2 解码失败");
+        assert_eq!(back.draws.len(), 4);
+        for (i, r) in [FillRule::NonZero, FillRule::EvenOdd, FillRule::NonZero, FillRule::EvenOdd]
+            .into_iter()
+            .enumerate()
+        {
+            assert_eq!(back.draws[i].fill_rule, r, "第 {i} 条 draw 的填充规则应往返一致");
+        }
+        assert_eq!(back.draws[1].blend, BlendMode::Multiply, "blend 不应被标志位污染");
+        assert_eq!(back.draws[0].blend, BlendMode::Normal);
+        eprintln!("AMK1 v2：4 条 draw（含 2 条 EvenOdd）往返一致，blend 未被污染");
+    }
+
+    /// **v1 只解不编**：把版本改回 1 后，即使字节里 bit 12 是 1，也必须解成 NonZero。
+    #[test]
+    fn stream_v1_bytes_decode_as_nonzero() {
+        let mut scene = Scene::new(32, 32);
+        let mut pb = PathBuilder::new();
+        pb.rect(2.3, 2.1, 28.7, 28.9);
+        pb.rect(11.2, 11.3, 21.8, 20.7);
+        scene.push(Affine::IDENTITY, pb.build(), Paint::Solid(Color::rgb8(0, 0, 0)));
+        scene.draws.last_mut().unwrap().fill_rule = FillRule::EvenOdd;
+
+        let mut bytes = encode_scene(&scene);
+        // 版本字段改回 1（布局相同，所以这就是一份合法的 v1 流）；
+        // bit 12 仍然留着 1 —— v1 里它是保留位，必须被忽略。
+        bytes[4..8].copy_from_slice(&STREAM_VERSION_V1.to_le_bytes());
+        let back = decode_scene(&bytes).expect("v1 必须能解");
+        assert_eq!(
+            back.draws[0].fill_rule,
+            FillRule::NonZero,
+            "v1 的 bit 12 是保留位 ⇒ 必须解成 NonZero（不静默错解）"
+        );
+        eprintln!("AMK1 v1：同一份字节按 v1 解出 NonZero（保留位被忽略）");
+    }
+
+    /// 未知版本必须**显式报错**，而不是静默按某个版本解读。
+    #[test]
+    fn stream_rejects_unknown_version() {
+        let mut bytes = encode_scene(&Scene::new(8, 8));
+        bytes[4..8].copy_from_slice(&3u32.to_le_bytes());
+        let e = decode_scene(&bytes).expect_err("版本 3 必须被拒绝");
+        assert!(e.contains("版本"), "错误信息应说明版本问题：{e}");
+        eprintln!("AMK1：未知版本被显式拒绝（{e}）");
     }
 
     // ===================== M5：文本（字形轮廓即路径） =====================

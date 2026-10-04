@@ -200,9 +200,39 @@ fn fill_draws_into(counts: &[u32], total: usize, out: &mut Vec<u32>) {
 ///
 /// 与光栅化无关的部分不在这里：**不压平、不分箱** —— 曲线保持为曲线上传，
 /// 压平由 GPU 并行完成（这正是本函数便宜的原因）。
-fn extract_prims_into(draw: &amiki_scene::Draw, di: u32, gs: &mut GpuScene) {
+fn extract_prims_into(draw: &amiki_scene::Draw, di: u32, eps: f32, gs: &mut GpuScene) {
     use amiki_math::Vec2;
     use amiki_scene::PathEl;
+
+    // even-odd（0.8.0）：**在 CPU 侧**把奇偶区域分解成互不重叠的梯形，只上传竖边，
+    // 然后**直接返回**（不经过下面的曲线收集）。之后 GPU 走的仍是同一条 NonZero
+    // 覆盖管线 —— WGSL 一行未改、绑定号未动。
+    //
+    // 为什么必须在 CPU 做：GPU 的压平是并行着色器，而奇偶配对需要**按 x 排序**，
+    // 并行内核里做不了。分解结果已经是设备空间线段，所以这里不走 `t`（变换在
+    // CPU 侧已经应用过），也不要再让 flatten pass 处理曲线。
+    //
+    // 代价写在明处：even-odd 的 draw 会在 CPU 侧压平 + 分解（不缓存），
+    // 上传的线段数也明显多于原路径的曲线数。
+    //
+    // ⚠️ 这一段**必须在主循环之前** early-return。第一版把它放在函数末尾，
+    // 结果主循环已经把曲线图元推完、计数又被清零，GPU 侧实际仍按 NonZero 渲染
+    // （中心不镂空）—— 被 `gpu_even_odd_matches_cpu` 抓出（差 255）。
+    if draw.fill_rule.is_even_odd() {
+        let segs = amiki_raster::flatten_draw(&draw.transform, &draw.path.els, eps);
+        let mut nl = 0u32;
+        for s in amiki_raster::even_odd_spans(&segs) {
+            if (s[2] - s[0]).hypot(s[3] - s[1]) > 1e-9 {
+                gs.lines.push(s);
+                nl += 1;
+            }
+        }
+        gs.n_quads[di as usize] = 0;
+        gs.n_cubics[di as usize] = 0;
+        gs.n_lines[di as usize] = nl;
+        return;
+    }
+
     let t = &draw.transform;
     let mut cur: Option<Vec2> = None;
     let mut sub_start: Option<Vec2> = None;
@@ -283,7 +313,7 @@ fn extract_prims_into(draw: &amiki_scene::Draw, di: u32, gs: &mut GpuScene) {
 /// 一条 draw 可能贡献多个图元（一个圆是 4 条三次曲线，一条矩形是 4~5 条线段）。
 /// 原先按 `n_draws` 预留，于是实际要 4 万条曲线却只留了 1 万个位置，
 /// 仍然反复扩容、反复拷贝。这里按"路径元素数 + 1"求和预留。
-fn extract_all_prims_into(scene: &Scene, gs: &mut GpuScene) {
+fn extract_all_prims_into(scene: &Scene, eps: f32, gs: &mut GpuScene) {
     let cap: usize = scene.draws.iter().map(|d| d.path.els.len() + 1).sum();
     // `reserve` 在复用缓冲上容量够时是**空操作** —— 这正是复用有意义的原因
     gs.quads.reserve(cap);
@@ -298,7 +328,7 @@ fn extract_all_prims_into(scene: &Scene, gs: &mut GpuScene) {
     gs.n_cubics.resize(n, 0);
     gs.n_lines.resize(n, 0);
     for (d, draw) in scene.draws.iter().enumerate() {
-        extract_prims_into(draw, d as u32, gs);
+        extract_prims_into(draw, d as u32, eps, gs);
     }
     // 末尾一次性生成"图元 → draw"映射（见 `fill_draws_into`）
     // 不相交字段借用：`&gs.n_quads`（读）与 `&mut gs.quad_draws`（写）互不冲突
@@ -389,7 +419,7 @@ pub fn build_gpu_scene_into(scene: &Scene, eps: f32, gs: &mut GpuScene) {
 
     // P1-1：路径提取是**串行**的 —— 并行的尝试已被线程数曲线否定，
     // 见本文件模块文档与 `extract_all_prims` 的说明。
-    extract_all_prims_into(scene, gs);
+    extract_all_prims_into(scene, eps, gs);
 
     // counts 按【数据布局顺序】（quads | cubics | lines）重算 —— 与 data/entry_draws
     // 的入口顺序严格一致。此前的遍历顺序 counts 与类型分块布局错位，

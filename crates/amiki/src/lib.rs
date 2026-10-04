@@ -21,13 +21,16 @@ pub use amiki_raster as raster;
 pub use amiki_scene as scene;
 
 use amiki_math::{Affine, Vec2};
-use amiki_scene::{BlendMode, Paint, Path, PathBuilder, Scene};
+use amiki_scene::{BlendMode, FillRule, Paint, Path, PathBuilder, Scene};
 
 /// 立即模式画布：记录绘制指令，产出场景。
 pub struct Canvas {
     pub scene: Scene,
     transform: Affine,
     blend: BlendMode,
+    /// 当前填充规则（0.8.0）。状态式、粘性：设置后影响**后续**填充，
+    /// 直到再次设置。只作用于填充，不影响描边（描边是轮廓化）。
+    fill_rule: FillRule,
     clip_stack: Vec<u32>,
 }
 
@@ -37,7 +40,38 @@ impl Canvas {
             scene: Scene::new(width, height),
             transform: Affine::IDENTITY,
             blend: BlendMode::Normal,
+            fill_rule: FillRule::NonZero,
             clip_stack: Vec::new(),
+        }
+    }
+
+    /// 设置**后续填充**的填充规则（0.8.0）。
+    ///
+    /// 状态式，与 [`Canvas::set_blend`] 一致：设置后一直生效，直到再次设置。
+    /// 默认 [`FillRule::NonZero`] —— 不调用本方法的代码行为**逐字节不变**。
+    ///
+    /// ```ignore
+    /// canvas.set_fill_rule(FillRule::EvenOdd);
+    /// canvas.fill_path(&star, paint);   // 这条按奇偶填充
+    /// canvas.set_fill_rule(FillRule::NonZero);
+    /// ```
+    pub fn set_fill_rule(&mut self, rule: FillRule) -> &mut Self {
+        self.fill_rule = rule;
+        self
+    }
+
+    /// 当前填充规则。
+    pub fn fill_rule(&self) -> FillRule {
+        self.fill_rule
+    }
+
+    /// 把当前填充规则写进**刚记录的那条** draw。
+    ///
+    /// 单独抽出来是因为填充有三个落点（`fill_path_with` 与两处文本），
+    /// 漏掉任何一处都会表现为"某个入口的 even-odd 静默失效"。
+    fn stamp_fill_rule(&mut self) {
+        if let Some(d) = self.scene.draws.last_mut() {
+            d.fill_rule = self.fill_rule;
         }
     }
 
@@ -91,6 +125,7 @@ impl Canvas {
     /// `Paint::Image` 携带放置信息，不能由路径自身推导。
     pub fn fill_path_with(&mut self, path: &Path, paint: Paint) -> &mut Self {
         self.scene.push_blend(self.transform, path.clone(), paint, self.blend);
+        self.stamp_fill_rule();
         if !self.clip_stack.is_empty() {
             self.scene.draws.last_mut().unwrap().clips = self.clip_stack.clone();
         }
@@ -297,6 +332,7 @@ impl Canvas {
             // `Paint` 非 Copy（渐变经 Arc 共享）；clone 只做一次原子加，可忽略。
             self.scene
                 .push_blend(base.then(glyph_t), path, paint.clone(), self.blend);
+            self.stamp_fill_rule();
             if !self.clip_stack.is_empty() {
                 self.scene.draws.last_mut().unwrap().clips = self.clip_stack.clone();
             }
@@ -329,6 +365,7 @@ impl Canvas {
         for (path, glyph_t) in paths {
             self.scene
                 .push_blend(base.then(glyph_t), path, paint.clone(), self.blend);
+            self.stamp_fill_rule();
             if !self.clip_stack.is_empty() {
                 self.scene.draws.last_mut().unwrap().clips = self.clip_stack.clone();
             }

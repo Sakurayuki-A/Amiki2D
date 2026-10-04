@@ -104,6 +104,9 @@ pub struct AmikiCanvas {
     /// mip 采样偏移（`amiki_canvas_set_mip_bias`，B4）。
     /// 影响缩小位图的采样层级；0 = 不偏移。
     pub(crate) mip_bias: f32,
+    /// 填充规则（`amiki_canvas_set_fill_rule`，0.8.0）。状态式、粘性：
+    /// 影响**后续**填充，直到再次设置。默认 `NonZero`。
+    pub(crate) fill_rule: amiki_scene::FillRule,
     pub(crate) poison: Poison,
 }
 
@@ -124,6 +127,8 @@ impl AmikiCanvas {
         self.clip_depth = 0;
         self.tone_map = amiki_scene::ToneMap::Raw;
         self.mip_bias = 0.0;
+        self.fill_rule = amiki_scene::FillRule::NonZero;
+        self.root.set_fill_rule(amiki_scene::FillRule::NonZero);
         self.poison = Poison::default();
     }
 }

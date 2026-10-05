@@ -1105,6 +1105,46 @@ pub extern "C" fn amiki_canvas_get_fill_rule(cv: *const AmikiCanvas) -> i32 {
     fill_rule_to_i32(c.fill_rule)
 }
 
+// ---- 状态栈（0.9.0）----
+
+/// 保存当前状态（变换 / 混合模式 / 裁剪栈 / 填充规则）到状态栈。
+///
+/// 已存 32 层时返回 `AMIKI_ERROR_STACK_OVERFLOW`，栈不变。
+#[no_mangle]
+pub extern "C" fn amiki_canvas_save(cv: *mut AmikiCanvas) -> i32 {
+    ffi!(cv, |c| {
+        match c.target().save() {
+            Ok(()) => AMIKI_OK,
+            Err(e) => canvas_error_to_i32(e),
+        }
+    })
+}
+
+/// 从状态栈恢复：四项状态**整体覆盖**为最近一次 save 时的值。
+///
+/// 栈空返回 `AMIKI_ERROR_STACK_UNDERFLOW`（状态不变）。
+///
+/// ⚠️ **两侧镜像都要重新同步**。C 侧独立维护着两份门面状态的镜像：
+/// `clip_depth`（`push_clip` 加、`pop_clip` 减）与 `fill_rule`
+/// （`amiki_canvas_set_fill_rule` 写）。恢复会把门面的这两项一起回退，
+/// 但**不会**动 C 侧的镜像 —— 不同步的话：
+/// - `clip_depth` 停在旧值 ⇒ 下一次 `amiki_canvas_pop_clip` 误判；
+/// - `fill_rule` 停在旧值 ⇒ `amiki_canvas_get_fill_rule` 报出一个
+///   与实际绘制不一致的规则（本测试抓到的就是这个：恢复后仍报 EvenOdd）。
+#[no_mangle]
+pub extern "C" fn amiki_canvas_restore(cv: *mut AmikiCanvas) -> i32 {
+    ffi!(cv, |c| {
+        match c.target().restore() {
+            Ok(()) => {
+                c.clip_depth = c.target().clip_depth();
+                c.fill_rule = c.target().fill_rule();
+                AMIKI_OK
+            }
+            Err(e) => canvas_error_to_i32(e),
+        }
+    })
+}
+
 #[no_mangle]
 pub extern "C" fn amiki_font_create_from_file(
     utf8_path: *const std::ffi::c_char,

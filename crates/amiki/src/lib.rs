@@ -23,46 +23,141 @@ pub use amiki_scene as scene;
 use amiki_math::{Affine, Vec2};
 use amiki_scene::{BlendMode, FillRule, Paint, Path, PathBuilder, Scene};
 
+/// 状态栈的最大深度（0.9.0）。
+///
+/// # 为什么是 32
+///
+/// UI 框架的典型嵌套深度是 5–10 层（窗口 → 面板 → 分组 → 控件 → 文本），
+/// 32 是 3–5 倍余量。**超过 32 说明调用方有 bug**（多半是漏了 `restore`）——
+/// 这时显式报错比静默截断好：静默截断会让"少 restore 一次"这种 bug
+/// 一直潜伏到某次重构之后才以别的方式爆出来。
+pub const MAX_STACK_DEPTH: usize = 32;
+
+/// 状态栈的错误。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CanvasError {
+    /// [`Canvas::save`] 时栈已满（≥ [`MAX_STACK_DEPTH`]）。
+    StackOverflow,
+    /// [`Canvas::restore`] 时栈空 —— 说明多 restore 了一次。
+    StackUnderflow,
+}
+
+impl std::fmt::Display for CanvasError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CanvasError::StackOverflow => {
+                write!(f, "状态栈已满（{MAX_STACK_DEPTH} 层）—— 多半是漏了 restore")
+            }
+            CanvasError::StackUnderflow => write!(f, "状态栈为空 —— restore 多于 save"),
+        }
+    }
+}
+
+impl std::error::Error for CanvasError {}
+
+/// 一次 [`Canvas::save`] 记录下来的状态快照。
+///
+/// 四项：**变换、混合模式、裁剪栈、填充规则**。`restore` 用整份快照
+/// **完全覆盖**当前状态（不是叠加）—— 这是 canvas 语义的标准定义。
+#[derive(Clone, Debug)]
+pub struct CanvasState {
+    transform: Affine,
+    blend: BlendMode,
+    /// 裁剪栈的克隆（引用 `Scene::clips` 的下标）。
+    clips: Vec<u32>,
+    fill_rule: FillRule,
+}
+
 /// 立即模式画布：记录绘制指令，产出场景。
 pub struct Canvas {
     pub scene: Scene,
-    transform: Affine,
-    blend: BlendMode,
-    /// 当前填充规则（0.8.0）。状态式、粘性：设置后影响**后续**填充，
-    /// 直到再次设置。只作用于填充，不影响描边（描边是轮廓化）。
-    fill_rule: FillRule,
-    clip_stack: Vec<u32>,
+    /// 当前状态的**唯一来源**：所有 setter 都改这里，`restore` 整体写回这里。
+    state: CanvasState,
+    /// 状态栈。`save` 压入当前状态，`restore` 弹出并覆盖。
+    ///
+    /// **不进 AMK1**：栈是录制期的概念。编码时 Draw 已带完整状态、栈已展开。
+    state_stack: Vec<CanvasState>,
 }
 
 impl Canvas {
     pub fn new(width: u32, height: u32) -> Canvas {
         Canvas {
             scene: Scene::new(width, height),
-            transform: Affine::IDENTITY,
-            blend: BlendMode::Normal,
-            fill_rule: FillRule::NonZero,
-            clip_stack: Vec::new(),
+            state: CanvasState {
+                transform: Affine::IDENTITY,
+                blend: BlendMode::Normal,
+                clips: Vec::new(),
+                fill_rule: FillRule::NonZero,
+            },
+            state_stack: Vec::new(),
         }
+    }
+
+    // ---------------------------------------------------------------- 状态栈
+
+    /// 保存当前状态（变换 / 混合模式 / 裁剪栈 / 填充规则）到栈上。
+    ///
+    /// 与 [`Canvas::restore`] 配对使用，是 UI 框架的基本假设：
+    /// 每个控件在自己的局部状态里画完就收回去，不必手工记账。
+    ///
+    /// 栈已满（≥ [`MAX_STACK_DEPTH`]）返回 [`CanvasError::StackOverflow`]，
+    /// **不静默丢弃**。
+    ///
+    /// ```ignore
+    /// canvas.save()?;
+    /// canvas.set_transform(局部变换).set_blend(BlendMode::Multiply);
+    /// canvas.fill_path(&path, paint);
+    /// canvas.restore()?;          // 四项一起回到保存点
+    /// ```
+    pub fn save(&mut self) -> Result<(), CanvasError> {
+        if self.state_stack.len() >= MAX_STACK_DEPTH {
+            return Err(CanvasError::StackOverflow);
+        }
+        self.state_stack.push(self.state.clone());
+        Ok(())
+    }
+
+    /// 恢复最近一次 [`Canvas::save`] 的状态。
+    ///
+    /// **整体覆盖**（不是叠加）：四项一起回到保存点。栈空返回
+    /// [`CanvasError::StackUnderflow`]，**不静默 no-op** ——
+    /// 多 restore 一次是实实在在的 bug，吞掉它只会让问题延后爆发。
+    pub fn restore(&mut self) -> Result<(), CanvasError> {
+        match self.state_stack.pop() {
+            Some(saved) => {
+                self.state = saved;
+                Ok(())
+            }
+            None => Err(CanvasError::StackUnderflow),
+        }
+    }
+
+    /// 当前状态栈深度（已 save 未 restore 的层数）。
+    pub fn save_depth(&self) -> usize {
+        self.state_stack.len()
+    }
+
+    /// 当前裁剪栈深度。
+    ///
+    /// C ABI 需要它：`restore` 会把裁剪栈一起回退，C 侧那本"clip 深度"账
+    /// 必须跟着同步，否则 `amiki_canvas_pop_clip` 会误判下溢。
+    pub fn clip_depth(&self) -> usize {
+        self.state.clips.len()
     }
 
     /// 设置**后续填充**的填充规则（0.8.0）。
     ///
-    /// 状态式，与 [`Canvas::set_blend`] 一致：设置后一直生效，直到再次设置。
-    /// 默认 [`FillRule::NonZero`] —— 不调用本方法的代码行为**逐字节不变**。
-    ///
-    /// ```ignore
-    /// canvas.set_fill_rule(FillRule::EvenOdd);
-    /// canvas.fill_path(&star, paint);   // 这条按奇偶填充
-    /// canvas.set_fill_rule(FillRule::NonZero);
-    /// ```
+    /// 状态式，与 [`Canvas::set_blend`] 一致：设置后一直生效，直到再次设置
+    /// 或被 [`Canvas::restore`] 回退。默认 [`FillRule::NonZero`] ——
+    /// 不调用本方法的代码行为**逐字节不变**。
     pub fn set_fill_rule(&mut self, rule: FillRule) -> &mut Self {
-        self.fill_rule = rule;
+        self.state.fill_rule = rule;
         self
     }
 
     /// 当前填充规则。
     pub fn fill_rule(&self) -> FillRule {
-        self.fill_rule
+        self.state.fill_rule
     }
 
     /// 把当前填充规则写进**刚记录的那条** draw。
@@ -70,52 +165,53 @@ impl Canvas {
     /// 单独抽出来是因为填充有三个落点（`fill_path_with` 与两处文本），
     /// 漏掉任何一处都会表现为"某个入口的 even-odd 静默失效"。
     fn stamp_fill_rule(&mut self) {
+        let rule = self.state.fill_rule;
         if let Some(d) = self.scene.draws.last_mut() {
-            d.fill_rule = self.fill_rule;
+            d.fill_rule = rule;
         }
     }
 
     /// 设置后续绘制的混合模式。
     pub fn set_blend(&mut self, blend: BlendMode) -> &mut Self {
-        self.blend = blend;
+        self.state.blend = blend;
         self
     }
 
     /// 压入裁剪层：后续绘制被其裁剪（叠加到已有裁剪上，取交集）。
     pub fn push_clip(&mut self, path: &Path) -> &mut Self {
-        let idx = self.scene.push_clip(self.transform, path.clone());
-        self.clip_stack.push(idx);
+        let idx = self.scene.push_clip(self.state.transform, path.clone());
+        self.state.clips.push(idx);
         self
     }
 
     /// 弹出最近压入的裁剪层。
     pub fn pop_clip(&mut self) -> &mut Self {
-        self.clip_stack.pop();
+        self.state.clips.pop();
         self
     }
 
     pub fn set_transform(&mut self, t: Affine) -> &mut Self {
-        self.transform = t;
+        self.state.transform = t;
         self
     }
 
     pub fn reset(&mut self) -> &mut Self {
-        self.transform = Affine::IDENTITY;
+        self.state.transform = Affine::IDENTITY;
         self
     }
 
     pub fn translate(&mut self, v: Vec2) -> &mut Self {
-        self.transform = self.transform.then(Affine::translate(v));
+        self.state.transform = self.state.transform.then(Affine::translate(v));
         self
     }
 
     pub fn rotate(&mut self, theta: f32) -> &mut Self {
-        self.transform = self.transform.then(Affine::rotate(theta));
+        self.state.transform = self.state.transform.then(Affine::rotate(theta));
         self
     }
 
     pub fn scale(&mut self, s: f32) -> &mut Self {
-        self.transform = self.transform.then(Affine::scale(s));
+        self.state.transform = self.state.transform.then(Affine::scale(s));
         self
     }
 
@@ -124,10 +220,10 @@ impl Canvas {
     /// `fill_path` 是它的实心便捷形式。图像等样式需要它，因为
     /// `Paint::Image` 携带放置信息，不能由路径自身推导。
     pub fn fill_path_with(&mut self, path: &Path, paint: Paint) -> &mut Self {
-        self.scene.push_blend(self.transform, path.clone(), paint, self.blend);
+        self.scene.push_blend(self.state.transform, path.clone(), paint, self.state.blend);
         self.stamp_fill_rule();
-        if !self.clip_stack.is_empty() {
-            self.scene.draws.last_mut().unwrap().clips = self.clip_stack.clone();
+        if !self.state.clips.is_empty() {
+            self.scene.draws.last_mut().unwrap().clips = self.state.clips.clone();
         }
         self
     }
@@ -160,7 +256,7 @@ impl Canvas {
         paint: Paint,
     ) -> &mut Self {
         const EPS_DEVICE: f32 = 0.1;
-        let scale = self.transform.max_scale().max(1e-6);
+        let scale = self.state.transform.max_scale().max(1e-6);
         let outline = amiki_scene::stroke_path(path, &style, EPS_DEVICE / scale);
         self.fill_path_with(&outline, paint)
     }
@@ -202,7 +298,7 @@ impl Canvas {
         image: std::sync::Arc<amiki_scene::Image>,
         place: amiki_scene::ImagePlacement,
     ) -> &mut Self {
-        let t = self.transform;
+        let t = self.state.transform;
         let transformed = amiki_scene::ImagePlacement {
             origin: t.map_point(place.origin),
             u_axis: t.map_vec(place.u_axis),
@@ -263,7 +359,15 @@ impl Canvas {
         // 层内的画布从"单位变换"开始：层的 bounds 已是设备空间，
         // 层内绘制用设备坐标即可（与父场景同一套坐标，减少一类坐标错误）。
         let mut sub = Canvas::new(self.scene.width, self.scene.height);
-        sub.blend = blend;
+        sub.state.blend = blend;
+        // **初始状态继承**：子画布继承父画布的**填充规则**（与 C ABI 的
+        // `amiki_canvas_begin_layer` 一致 —— 0.8.0 只改了 ABI 那侧，门面漏了，
+        // 于是"门面 + EvenOdd + 层"会静默退回 NonZero，本轮补齐）。
+        //
+        // 不继承的是：变换（层内一律从单位变换开始，见上）、裁剪栈
+        // （层内容的裁剪由合成侧决定）、以及**状态栈本身** ——
+        // 子画布的栈是空的，层内的 save/restore 只影响层内。
+        sub.state.fill_rule = self.state.fill_rule;
         build(&mut sub);
         self.scene.push_layer(
             amiki_scene::Layer {
@@ -326,15 +430,15 @@ impl Canvas {
         F: FnMut(u32) -> Option<amiki_scene::GlyphOutline>,
     {
         // 文本自身的变换 = 画布当前变换 ∘ 基线平移
-        let base = self.transform.then(Affine::translate(origin));
+        let base = self.state.transform.then(Affine::translate(origin));
         let paths = amiki_scene::expand_text_run(run, outline);
         for (path, glyph_t) in paths {
             // `Paint` 非 Copy（渐变经 Arc 共享）；clone 只做一次原子加，可忽略。
             self.scene
-                .push_blend(base.then(glyph_t), path, paint.clone(), self.blend);
+                .push_blend(base.then(glyph_t), path, paint.clone(), self.state.blend);
             self.stamp_fill_rule();
-            if !self.clip_stack.is_empty() {
-                self.scene.draws.last_mut().unwrap().clips = self.clip_stack.clone();
+            if !self.state.clips.is_empty() {
+                self.scene.draws.last_mut().unwrap().clips = self.state.clips.clone();
             }
         }
         self
@@ -360,14 +464,14 @@ impl Canvas {
     where
         F: FnMut(usize, u32) -> Option<amiki_scene::GlyphOutline>,
     {
-        let base = self.transform.then(Affine::translate(origin));
+        let base = self.state.transform.then(Affine::translate(origin));
         let paths = amiki_scene::expand_text_run_with(run, outline);
         for (path, glyph_t) in paths {
             self.scene
-                .push_blend(base.then(glyph_t), path, paint.clone(), self.blend);
+                .push_blend(base.then(glyph_t), path, paint.clone(), self.state.blend);
             self.stamp_fill_rule();
-            if !self.clip_stack.is_empty() {
-                self.scene.draws.last_mut().unwrap().clips = self.clip_stack.clone();
+            if !self.state.clips.is_empty() {
+                self.scene.draws.last_mut().unwrap().clips = self.state.clips.clone();
             }
         }
         self

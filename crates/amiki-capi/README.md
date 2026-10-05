@@ -182,9 +182,9 @@ crates\amiki-capi\verify.cmd
 > **这个脚本验证过有牙**：把 C 示例背景色的一个通道从 24 改成 25，
 > 第 5 项立刻失败并返回退出码 1（C 的哈希变了，C# / Node 没变）。
 
-它检查的符号数当前是 **header 声明 82 / 导出 82，无缺失**（0.8.0 新增
-`amiki_canvas_set_fill_rule` / `amiki_canvas_get_fill_rule` 与 `amiki_fill_rule` 枚举；
-0.7.0 新增 6 个字体回退符号）。
+它检查的符号数当前是 **header 声明 84 / 导出 84，无缺失**（0.9.0 新增
+`amiki_canvas_save` / `amiki_canvas_restore` 与两个状态栈错误码；
+0.8.0 新增填充规则枚举与 2 个符号；0.7.0 新增 6 个字体回退符号）。
 
 手工核对（不用脚本时）：
 

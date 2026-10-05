@@ -35,6 +35,9 @@
 | `Canvas::set_blend` | 混合模式 |
 | `Canvas::set_fill_rule` / `fill_rule` | **填充规则**：`NonZero`（默认）/ `EvenOdd`（0.8.0，状态式） |
 | `Canvas::push_clip` / `pop_clip` | 裁剪 |
+| `Canvas::save` / `restore` | **状态栈**（0.9.0）：四项状态（变换 / 混合 / 裁剪栈 / 填充规则）整体存取 |
+| `Canvas::save_depth` / `clip_depth` | 当前栈深度（只读查询） |
+| `amiki::CanvasError` / `amiki::MAX_STACK_DEPTH` | 状态栈错误（`StackOverflow` / `StackUnderflow`）与深度上限（32） |
 | `Canvas::scene` | 产出场景（字段） |
 | `amiki::color` | 调色板常量 |
 | `render_to_rgba(&Canvas, f32) -> Result<Vec<u8>, gpu::RenderError>` | CPU 渲染为 RGBA8 |
@@ -66,6 +69,38 @@
 | **0.7.0：`amiki_layout::layout_with_stack`**、`layout_with_stack_policy` | 混排排版：断行/禁则与单字体路径**完全共用**，行高取栈里第一个字体 |
 | **0.7.0：`amiki_scene::expand_text_run_with`**、`TextCache::expand_with`、`TextRun::push_glyph_in`、`GlyphKey::with_font` | 按**字体下标**取字形轮廓；缓存键带字体内部 ID |
 | **0.7.0：`amiki::Canvas::text_with_stack`** | 门面侧的字体回退绘制入口 |
+| **0.9.0：`amiki::Canvas::save` / `restore`**、`CanvasError`、`MAX_STACK_DEPTH` | **状态栈**：四项状态（变换 / 混合模式 / 裁剪栈 / 填充规则）整体存取 |
+
+### 状态栈怎么用（0.9.0）
+
+UI 框架的基本假设：**每个控件在自己的局部状态里画完就收回去**。
+
+```rust
+// 控件 A：局部变换 + 局部混合模式
+canvas.save()?;
+canvas.set_transform(局部变换).set_blend(BlendMode::Multiply);
+canvas.fill_path(&背景, paint);
+canvas.restore()?;              // 四项一起回到保存点
+
+// 控件 B：局部 even-odd + 局部裁剪
+canvas.save()?;
+canvas.set_fill_rule(FillRule::EvenOdd);
+canvas.push_clip(&圆角);
+canvas.fill_path(&星形, paint);
+canvas.restore()?;              // 填充规则与裁剪深度都回来了
+```
+
+四条要点：
+
+| 要点 | 说明 |
+|---|---|
+| 保存**四项** | 变换 / 混合模式 / 裁剪栈 / 填充规则。`restore` 是**整体覆盖**（不是叠加） |
+| 深度 **32** | 第 33 次 `save` 返回 `Err(CanvasError::StackOverflow)`，栈不变 |
+| 空栈 `restore` | 返回 `Err(CanvasError::StackUnderflow)`，**不静默 no-op**（多 restore 一次是 bug） |
+| 与裁剪正交 | `push_clip` / `pop_clip` 仍可独立使用；`restore` 只是把深度退回保存点 |
+| 层内独立 | `push_layer_filtered` 的子画布栈从**空**开始，层内 save/restore 只影响层内 |
+
+**不进 AMK1**：栈是录制期的概念，编码时每条 draw 已带完整状态、栈已展开。
 
 ## 三、实验面
 

@@ -208,7 +208,7 @@ extern "C" {
  * ========================================================================== */
 
 #define AMIKI_VERSION_MAJOR 0
-#define AMIKI_VERSION_MINOR 8
+#define AMIKI_VERSION_MINOR 9
 #define AMIKI_VERSION_PATCH 0
 /** 预发布标签（正式版为空串）。**不参与数值比较**，只用于展示。 */
 #define AMIKI_VERSION_PRERELEASE "alpha"
@@ -261,7 +261,19 @@ typedef enum amiki_result {
      * 目前只有一处：`amiki_font_stack_resolve` / `amiki_canvas_draw_text_with_stack`
      * —— 字体栈里没有任何字体含该字符。
      */
-    AMIKI_ERROR_NOT_FOUND = 7
+    AMIKI_ERROR_NOT_FOUND = 7,
+    /**
+     * **0.9.0 新增**：状态栈已满。
+     * `amiki_canvas_save` 在已存了 32 层时返回它；栈**不变**。
+     * 出现它几乎一定是漏了 `amiki_canvas_restore`。
+     */
+    AMIKI_ERROR_STACK_OVERFLOW = 8,
+    /**
+     * **0.9.0 新增**：状态栈为空。
+     * `amiki_canvas_restore` 在没有配对的 `save` 时返回它 ——
+     * **不静默 no-op**，因为多 restore 一次是实实在在的 bug。
+     */
+    AMIKI_ERROR_STACK_UNDERFLOW = 9
 } amiki_result;
 
 /** 人类可读的说明（静态字符串，不可释放）。越界值返回 `"unknown"`。 */
@@ -655,6 +667,36 @@ AMIKI_API amiki_result amiki_canvas_push_clip(amiki_canvas* canvas, const amiki_
 
 /** 弹出最近压入的裁剪。栈空时返回 `AMIKI_ERROR_INVALID_ARGUMENT`。 */
 AMIKI_API amiki_result amiki_canvas_pop_clip(amiki_canvas* canvas);
+
+/**
+ * **保存当前状态到状态栈**（0.9.0）。
+ *
+ * 保存的是**四项**：变换、混合模式、裁剪栈（深度与内容）、填充规则。
+ * 与 `amiki_canvas_restore` 严格配对使用，是 UI 框架的基本假设 ——
+ * 每个控件在自己的局部状态里画完就收回去，不必手工记账。
+ *
+ * - **最大深度 32**。已满时返回 `AMIKI_ERROR_STACK_OVERFLOW`，栈**不变**
+ *   （不静默丢弃，也不覆盖最旧的那层）。
+ * - **与层正交**：`amiki_canvas_begin_layer` 打开的层是**独立画布**，
+ *   层内的状态栈从空开始，层内的 save/restore 不影响外层计数，
+ *   层被 `end_layer` 合成之后其栈即丢弃。
+ * - **不进 AMK1**：栈是录制期的概念。编码时每条 draw 已带完整状态、栈已展开。
+ *
+ * 为什么是 32：UI 典型嵌套 5–10 层，32 有 3–5 倍余量；超过 32 说明
+ * 调用方有 bug（多半漏了 restore），显式报错比静默截断好。
+ */
+AMIKI_API amiki_result amiki_canvas_save(amiki_canvas* canvas);
+
+/**
+ * **从状态栈恢复**（0.9.0）：四项状态**整体覆盖**为最近一次
+ * `amiki_canvas_save` 时的值（不是叠加）。
+ *
+ * - 栈空时返回 `AMIKI_ERROR_STACK_UNDERFLOW`，**不静默 no-op**、状态不变。
+ * - 恢复会**连同裁剪深度一起回退**：若 save 之后压过裁剪，restore 会把
+ *   裁剪深度退回保存点，之后 `amiki_canvas_pop_clip` 仍可独立使用。
+ * - 恢复**不会**撤销已经完成的层合成（层一旦 `end_layer` 就已挂进场景）。
+ */
+AMIKI_API amiki_result amiki_canvas_restore(amiki_canvas* canvas);
 
 /* ---- 绘制 ---- */
 

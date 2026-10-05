@@ -46,6 +46,16 @@ bit 12    = fill_rule
 阅读代码时对应的常量：`STREAM_VERSION` / `STREAM_VERSION_V1` / `FILL_RULE_BIT`
 （都在 `amiki-scene/src/lib.rs` 的 AMK1 段）。
 
+## 状态栈不进 AMK1（0.9.0）
+
+`Canvas::save` / `restore`（以及 C ABI 的 `amiki_canvas_save` / `amiki_canvas_restore`）
+是**录制期**的概念：它们影响的是**之后**每条 draw 烙进 `Draw` 的状态。
+编码时每条 draw 已带完整状态，栈信息**早已展开** ——
+所以**格式没有任何变化**（仍是 v2、仍然没有 flags 字段、bit 12 的定义不变）。
+
+换句话说：一份 AMK1 字节流**无法**还原出"录制时调用方 save 过几次"，
+也不需要 —— 那是调用方的局部记账，与场景内容无关。
+
 ## 明确不支持（显式报错，不静默降级）
 
 | 情形 | 行为 |

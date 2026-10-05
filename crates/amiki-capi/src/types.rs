@@ -29,6 +29,18 @@ pub const AMIKI_ERROR_UNKNOWN: i32 = 6;
 /// 0.7.0 新增：**找得到对象类型、但里面没有要找的东西** ——
 /// 目前只用于 `amiki_font_stack_resolve`（字体栈里没有一个字体含该码点）。
 pub const AMIKI_ERROR_NOT_FOUND: i32 = 7;
+/// 0.9.0 新增：状态栈已满（`amiki_canvas_save`）。
+pub const AMIKI_ERROR_STACK_OVERFLOW: i32 = 8;
+/// 0.9.0 新增：状态栈为空（`amiki_canvas_restore`）。
+pub const AMIKI_ERROR_STACK_UNDERFLOW: i32 = 9;
+
+/// 门面的状态栈错误 → C 错误码（0.9.0）。
+pub(crate) fn canvas_error_to_i32(e: amiki::CanvasError) -> i32 {
+    match e {
+        amiki::CanvasError::StackOverflow => AMIKI_ERROR_STACK_OVERFLOW,
+        amiki::CanvasError::StackUnderflow => AMIKI_ERROR_STACK_UNDERFLOW,
+    }
+}
 
 /// 人类可读的说明。与 header 里 `amiki_result_string` 的返回值一致。
 ///
@@ -43,6 +55,8 @@ pub(crate) fn result_message(r: i32) -> &'static std::ffi::CStr {
         AMIKI_ERROR_NOT_SUPPORTED => c"not supported by this backend",
         AMIKI_ERROR_PANIC => c"engine panicked (this is a bug in Amiki2D)",
         AMIKI_ERROR_NOT_FOUND => c"not found in this font stack",
+        AMIKI_ERROR_STACK_OVERFLOW => c"state stack overflow (missing restore)",
+        AMIKI_ERROR_STACK_UNDERFLOW => c"state stack underflow (restore without save)",
         // 给出比 "unknown" 更有用的信息：调用方看到它就知道"引擎报了个未分类错误"，
         // 而 "unknown" 只留给**越界的错误码**（那是调用方自己的 bug）。
         AMIKI_ERROR_UNKNOWN => c"unspecified engine error",

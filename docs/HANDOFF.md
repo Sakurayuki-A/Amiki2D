@@ -131,9 +131,12 @@ open(P, "w", encoding="utf-8", newline="").write(s + extra)
 
 ## 当前状态（全部实测，非记忆）
 
-- **151 测试全绿**（并行）/ 三后端各 **26 / 0** / clippy 零警告 / cargo doc 零警告
-- 提交数 120 · 工作树 clean
-- Rust 15 453 行；WGSL 1 347 行
+> ⚠️ 下面这组数字**每次发版都要重新量**（`docs/HANDOFF.md` 第 9 条纪律的另一半）。
+> 本次（0.9.0）已把此前停在 0.2.0 时代的 **151** 更新为 **297**。
+
+- **297 测试全绿**（并行）/ 三后端各 **26 / 0** / clippy 零警告 / cargo doc 零警告
+- 提交数 148 · 工作树 clean
+- Rust **26 601** 行；WGSL 1 570 行；8 个 crate
 - crate 分层与依赖边界：
   - `amiki-math` / `amiki-scene` / `amiki-raster` / `amiki-layout` —— **零第三方依赖**
   - `amiki-text` —— ttf-parser + rustybuzz（字体栈隔离在此）
@@ -147,7 +150,7 @@ open(P, "w", encoding="utf-8", newline="").write(s + extra)
 | 1 | P0-1/2/3、P1-1、P2-1/2 达标 | ✅ |
 | 2 | P3 六项达成 | ✅（多后端验证范围经决策收缩） |
 | 3 | 没有已知的静默错误路径 | ✅ |
-| 4 | 全部测试通过 + 有对拍 | ✅ 151 |
+| 4 | 全部测试通过 + 有对拍 | ✅ 297 |
 | 5 | 文档与代码一致 | ✅ |
 | 6 | 真实应用可持续运行 | ✅ |
 
@@ -243,7 +246,7 @@ loop {
 ## 交接时的仓库状态
 
 ```
-提交数 120 · 工作树 clean
-151 测试全绿（并行）· 三后端各 26/0 · clippy 与 cargo doc 零警告
+提交数 148 · 工作树 clean
+297 测试全绿（并行）· 三后端各 26/0 · clippy 与 cargo doc 零警告
 最新提交见 git log -1
 ```

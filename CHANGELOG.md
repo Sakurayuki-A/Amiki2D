@@ -5,6 +5,86 @@
 
 ---
 
+## [0.9.0-alpha] —— `save` / `restore` 状态栈
+
+**新能力**：`Canvas::save()` / `Canvas::restore()` —— 保存与恢复
+**四项状态**（变换、混合模式、裁剪栈、填充规则）。这是 0.8.0 验收 6 的原文前提，
+也是 UI 框架的核心假设（每个控件在局部状态里画完就收回去，不必手工记账）。
+
+不调用它们的代码**逐字节不变**：既有 278 条测试一条没改，`verify.cmd`
+三示例 SHA256 与 0.8.0 **完全相同**（`90A8B3B8…`）。
+
+### 语义（全部有测试钉住）
+
+| 行为 | 定义 |
+|---|---|
+| `save()` | 把当前四项状态压栈。**第 33 层**返回 `StackOverflow`，栈不变（不静默丢弃） |
+| `restore()` | 弹出并**整体覆盖**当前状态（不是叠加）。空栈返回 `StackUnderflow`，**不静默 no-op** |
+| 深度上限 | `MAX_STACK_DEPTH = 32`（UI 典型嵌套 5–10 层，3–5 倍余量） |
+| 裁剪 | `restore` 把裁剪深度退回保存点；`push_clip` / `pop_clip` 仍可**独立**使用（两者正交） |
+| 层 | `amiki_canvas_begin_layer` 内的画布是**独立**画布，栈从空开始、独立计数、独立报错 |
+| 层初始状态 | 子画布继承父画布的**填充规则**；变换一律从单位变换开始 |
+| AMK1 | **不进编码流**。栈是录制期概念，编码时每条 draw 已带完整状态、栈已展开（格式仍 v2） |
+
+### 为什么不做"只恢复某一项"
+
+`restore` 是**整体覆盖**：四项一起回到保存点。支持"只恢复某一项"会让调用方
+必须记住"当前哪些项被局部改过"，那正是状态栈要消灭的负担。
+
+### C ABI（符号 82 → 84）
+
+| 新增 | 说明 |
+|---|---|
+| `amiki_canvas_save` / `amiki_canvas_restore` | 与门面同语义；文档写明 32 层上限、溢出/下溢显式报错、与层正交、不进 AMK1 |
+| `AMIKI_ERROR_STACK_OVERFLOW = 8` | 状态栈已满 |
+| `AMIKI_ERROR_STACK_UNDERFLOW = 9` | 状态栈为空 |
+
+### 本轮抓到并修掉的两个真 bug（都是 C ABI 的**镜像漂移**）
+
+C 侧独立维护着两份门面状态的镜像 —— `clip_depth`（push 加 / pop 减）与
+`fill_rule`（`set_fill_rule` 写）。`restore` 会把门面这两项一起回退，
+但**不会**自动同步 C 侧的镜像：
+
+1. `clip_depth` 停在旧值 ⇒ `save → push_clip → restore` 之后
+   `amiki_canvas_pop_clip` 会以为栈里还有一层（测试 `canvas_restore_syncs_clip_depth`）。
+2. `fill_rule` 停在旧值 ⇒ 恢复后 `amiki_canvas_get_fill_rule` 仍报 `EVENODD`，
+   与**实际绘制**不一致（测试 `canvas_save_restore_roundtrip` 抓到的就是这个）。
+
+现在 `amiki_canvas_restore` 成功后会重新读回门面的真实 `clip_depth` 与 `fill_rule`。
+这类"同一状态存两份"的问题，正是状态栈该消灭的东西 —— 成因已写在代码注释里。
+
+### 顺带修掉一条 0.8.0 的遗漏
+
+门面的 `push_layer_filtered` **没有继承填充规则**（0.8.0 只在 C ABI 的
+`begin_layer` 里继承了）⇒ "门面 + EvenOdd + 层"会静默退回 NonZero，
+与 `amiki.h` 写明的契约不符。已补齐，并加测试
+`layer_inherits_current_fill_rule`。
+
+### 门面 API 变化
+
+- 新增：`save()` / `restore()` / `CanvasError` / `CanvasState` / `MAX_STACK_DEPTH`
+- 新增只读查询：`save_depth()` / `clip_depth()`（后者同时供 C ABI 同步用）
+- **四个 setter 的签名一字未动**，但它们现在改的是 `self.state.*` ——
+  `CanvasState` 成为 Canvas 状态的**唯一来源**，`restore` 整体写回它。
+
+### 测试（278 → 297，+19）
+
+| 位置 | 新增 | 覆盖 |
+|---|---|---|
+| `amiki/tests/state_stack.rs` | 12 | 四项状态各自往返（比 `Draw` 逐字段而非比 getter）、三层嵌套、32/33 溢出、空栈与多 restore 下溢、整体覆盖非叠加、裁剪往返与独立使用、层内栈独立、层继承填充规则、**空配对零破坏** |
+| `amiki/tests/state_stack_gpu.rs` | 3 | **GPU↔CPU 最大通道差 1**、空配对在 GPU/CPU 两侧都不改变输出、`restore` 后的绘制与"从未改过状态"逐字节相同 |
+| `amiki-capi`（内联） | 4 | ABI 往返（渲染结果逐字节比对）、32/33 与两个错误码、**裁剪深度镜像同步**、层内栈独立 |
+
+### 顺手清理
+
+- `docs/HANDOFF.md` 的"当前状态"数字：**151 → 297**（既有 D1 漂移）
+- `docs/KNOWN_ISSUES.md` 新登记 **D5**：even-odd 的跨度分解**没有缓存**
+  （0.8.0 引入，逐帧重画同一 even-odd 路径会逐帧重算；只有 even-odd 付这个成本，
+  正确性不受影响）。**没顺手做缓存**的理由写在条目里：缓存键与失效条件需要先想清楚。
+- `docs/AMK1.md` 补一句"状态栈不进 AMK1"（格式仍 v2，无变化）。
+
+---
+
 ## [0.8.0-alpha] —— even-odd 填充规则
 
 **新能力**：`FillRule::EvenOdd`（奇偶填充）与既有的 `NonZero` 并存。

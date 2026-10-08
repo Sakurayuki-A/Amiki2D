@@ -150,7 +150,7 @@ open(P, "w", encoding="utf-8", newline="").write(s + extra)
 > 0.9.0 已把此前停在 0.2.0 时代的 **151** 更新为 **297**；0.9.2 起为 **298**。
 
 - **298 测试全绿**（并行）/ 三后端各 **26 / 0** / clippy 零警告 / cargo doc 零警告
-- 提交数 153 · 工作树 clean
+- 提交数见 `git rev-list --count HEAD`（不写死：任何一次提交都会让它过时）· 工作树 clean
 - Rust **26 798** 行；WGSL 1 570 行；8 个 crate
 - crate 分层与依赖边界：
   - `amiki-math` / `amiki-scene` / `amiki-raster` / `amiki-layout` —— **零第三方依赖**
@@ -261,7 +261,7 @@ loop {
 ## 交接时的仓库状态
 
 ```
-提交数 153 · 工作树 clean
+提交数见 `git rev-list --count HEAD`（不写死：任何一次提交都会让它过时）· 工作树 clean
 298 测试全绿（并行）· 三后端各 26/0 · clippy 与 cargo doc 零警告
 最新提交见 git log -1
 ```

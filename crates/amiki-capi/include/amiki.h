@@ -209,7 +209,7 @@ extern "C" {
 
 #define AMIKI_VERSION_MAJOR 0
 #define AMIKI_VERSION_MINOR 9
-#define AMIKI_VERSION_PATCH 0
+#define AMIKI_VERSION_PATCH 1
 /** 预发布标签（正式版为空串）。**不参与数值比较**，只用于展示。 */
 #define AMIKI_VERSION_PRERELEASE "alpha"
 
@@ -574,6 +574,21 @@ AMIKI_API void amiki_free(uint8_t* ptr, size_t size);
  * 这也是 `context` 与 `canvas` 分开的原因。
  *
  * 失败时 `*out` 不被写入。
+ *
+ * ## 后端起不来时返回什么（0.9.1 起明确）
+ *
+ * 请求了拿不到的后端（`AMIKI_BACKEND_GPU` 而机器上没有可用适配器、
+ * 或 `AMIKI_BACKENDS` 点名的后端在这台机器上不可用）返回
+ * **`AMIKI_ERROR_BACKEND_UNAVAILABLE`**，并且**绝不返回
+ * `AMIKI_ERROR_PANIC`** —— 那是"引擎有 bug"，与"这台机器跑不了这个后端"
+ * 是两件必须分清的事。
+ *
+ * 注意这条覆盖**驱动库内部 panic** 的情形：例如 GL 上下文缺 compute 能力时，
+ * wgpu 会在创建 compute pipeline 时 panic（见 `docs/KNOWN_ISSUES.md` 的 **B17**），
+ * 引擎把它收敛成 `BACKEND_UNAVAILABLE`，并在
+ * `amiki_result_string()` 之外把驱动给的原文一并放进内部错误消息（不进 C 错误码）。
+ *
+ * `AMIKI_BACKEND_AUTO` 则按承诺落到 CPU（拿不到 GPU 不是错误）。
  */
 AMIKI_API amiki_result amiki_context_create(amiki_backend backend, amiki_context** out);
 
@@ -784,6 +799,20 @@ AMIKI_API amiki_result amiki_canvas_draw_text_with_stack(amiki_canvas* canvas,
  *     amiki_canvas_begin_layer(cv, b, amiki_filter_blur(8.0f), 1.0f, AMIKI_BLEND_NORMAL);
  *     amiki_canvas_draw_rect(cv, ...);      // 这些进入层
  *     amiki_canvas_end_layer(cv);
+ *
+ * ## 两条非直观行为（绑定作者最容易踩，来自嵌入式集成反馈 P5）
+ *
+ * 1. **层是独立画布，层内绘制不继承外层画布的变换。** 层内一律从**单位变换**
+ *    开始（`bounds` 本身就是设备空间，层内直接用设备坐标即可 —— 这样少一类
+ *    坐标错误）。想让层内容跟随外层的平移/缩放，必须在层内自己设一次。
+ *    会继承的只有**填充规则**（`amiki_canvas_set_fill_rule` 设的那个）。
+ * 2. **层统一在所有普通绘制之后合成。** 场景里的绘制与层是两批：先按顺序画完
+ *    所有 `draw`，再按顺序合成所有层。因此"开一个层、画点别的、再 `end_layer`"
+ *    里那些"别的"会被压到**层下面**。做 UI 的正确姿势是：**每个面板整体画进
+ *    自己的层**，而不是把层当成"括号"夹住一部分绘制。
+ *
+ * （第 2 条是**有意**的设计：它保证"层内绘制先完成、再整层滤波"的语义，
+ * 也避免层内内容被父场景后续绘制意外穿插。）
  */
 AMIKI_API amiki_result amiki_canvas_begin_layer(amiki_canvas* canvas, amiki_layer_bounds bounds,
                                                 amiki_filter filter, float opacity,
@@ -799,6 +828,20 @@ AMIKI_API amiki_result amiki_canvas_end_layer(amiki_canvas* canvas);
  * 行序**从上到下**、alpha **非预乘**、未覆盖处为透明。
  *
  * 长度不足返回 `AMIKI_ERROR_INVALID_ARGUMENT` 且**不写入任何字节**。
+ *
+ * ## 与 OpenGL 宿主共存时的性能特征（嵌入式集成反馈 P3）
+ *
+ * 这是**同步**调用：GPU 后端会提交、等待、再把结果读回 CPU（保护性读回，
+ * 见 `docs/KNOWN_ISSUES.md` 的 **B11**）。在**已经持有 OpenGL 上下文**的宿主
+ * 进程里（例如 Minecraft 这类游戏），跨 API 的同步可能是主要成本 ——
+ * 实测报告是每帧固定 ~20 ms 停顿，且与画布尺寸无关；独立进程里同一画布只要 ~10 ms。
+ *
+ * 因此：
+ * - **多块小画布 + 只在内容变化时重渲染**（嵌入式 UI 的常见做法）能摊销这笔成本；
+ * - 游戏内若不走 GPU 的收益不明显，直接用 **CPU 后端**（`AMIKI_BACKEND_CPU`）
+ *   反而是更稳的选择 —— 它不涉及任何跨 API 同步；
+ * - 目前**没有**异步接口（`begin` / `poll` / `try_read` 分离）。
+ *   需要"提交与读回分到不同帧"的宿主，暂时只能在应用层错帧调度。
  */
 AMIKI_API amiki_result amiki_canvas_render_rgba8(amiki_canvas* canvas, uint8_t* out,
                                                  size_t out_len);

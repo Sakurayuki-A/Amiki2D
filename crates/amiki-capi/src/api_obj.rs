@@ -28,7 +28,7 @@ fn make_backend(backend: i32) -> Result<(Backend, CString), i32> {
         AMIKI_BACKEND_CPU => Ok((Backend::Cpu, c"CPU".to_owned())),
 
         #[cfg(feature = "gpu")]
-        AMIKI_BACKEND_GPU => match pollster::block_on(amiki_gpu::GpuRenderer::new()) {
+        AMIKI_BACKEND_GPU => match amiki_gpu::GpuRenderer::new_blocking() {
             // 先取名字再 move —— `Box::new(r)` 会把 `r` 拿走，
             // 同一个表达式里再用 `&r.adapter_name` 是借用已移动的值。
             Ok(r) => {
@@ -41,7 +41,7 @@ fn make_backend(backend: i32) -> Result<(Backend, CString), i32> {
         AMIKI_BACKEND_GPU => Err(AMIKI_ERROR_BACKEND_UNAVAILABLE),
 
         #[cfg(feature = "gpu")]
-        AMIKI_BACKEND_AUTO => match pollster::block_on(amiki_gpu::GpuRenderer::new()) {
+        AMIKI_BACKEND_AUTO => match amiki_gpu::GpuRenderer::new_blocking() {
             Ok(r) => {
                 let name = adapter_cstring(&r.adapter_name);
                 Ok((Backend::Gpu(Box::new(r)), name))

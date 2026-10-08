@@ -979,6 +979,42 @@ impl GpuRenderer {
         Ok(renderer)
     }
 
+    /// 同步创建渲染器，**把"后端起不来"时的 panic 收敛成 `Err`**。
+    ///
+    /// # 为什么需要它（来自嵌入式集成反馈 P4，已在本机复现）
+    ///
+    /// 某些后端在**初始化期会内部 panic**，而不是返回错误：`AMIKI_BACKENDS=gl`
+    /// 且进程无窗口时，wgpu 25 在创建 compute pipeline 那一步 panic
+    /// （`wgpu_core.rs:1410`）—— GL 上下文没有 compute 能力时它不报错，直接 panic。
+    ///
+    /// 那个 panic 会一路冒到调用方：C ABI 的兜底捕获把它变成
+    /// `AMIKI_ERROR_PANIC`（"引擎有 bug，请上报"），而契约是
+    /// `AMIKI_ERROR_BACKEND_UNAVAILABLE`（"这个后端在这台机器上不可用"）。
+    /// 对嵌入式宿主来说这两种说法指向完全不同的排查方向。
+    ///
+    /// # 只包初始化这一段
+    ///
+    /// 只捕获**创建渲染器**期间的 panic。渲染过程中的 panic 照旧冒出 ——
+    /// 那是真的 bug，不该被这条吞掉：既不静默画错，也不把真 bug
+    /// 伪装成"后端不可用"。
+    pub fn new_blocking() -> Result<GpuRenderer, RenderError> {
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            pollster::block_on(Self::new())
+        })) {
+            Ok(r) => r,
+            Err(payload) => {
+                let msg = payload
+                    .downcast_ref::<&str>()
+                    .map(|s| (*s).to_string())
+                    .or_else(|| payload.downcast_ref::<String>().cloned())
+                    .unwrap_or_else(|| "（panic 未提供信息）".to_string());
+                Err(RenderError(format!(
+                    "GPU 后端初始化失败，该后端在这台机器上不可用：{msg}"
+                )))
+            }
+        }
+    }
+
     pub fn from_device(
         device: wgpu::Device,
         queue: wgpu::Queue,

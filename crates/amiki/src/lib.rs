@@ -481,7 +481,7 @@ impl Canvas {
 /// 便捷入口：GPU 渲染为 RGBA8，GPU 不可用时自动落到 CPU 引擎。
 #[cfg(feature = "gpu")]
 pub fn render_to_rgba(canvas: &Canvas, flatten_eps: f32) -> Result<Vec<u8>, gpu::RenderError> {
-    match pollster::block_on(gpu::GpuRenderer::new()) {
+    match gpu::GpuRenderer::new_blocking() {
         Ok(r) => r.render_blocking(&canvas.scene, flatten_eps),
         Err(e) => {
             eprintln!("GPU 不可用（{e}），使用 CPU 引擎");

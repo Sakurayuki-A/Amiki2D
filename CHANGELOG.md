@@ -5,6 +5,70 @@
 
 ---
 
+## [0.9.1-alpha] —— 后端起不来不再报 PANIC（嵌入式集成反馈 P4）
+
+**补丁**：修复一个**错误码误导**的真 bug，并补齐三处绑定作者最容易踩的文档。
+没有改渲染数学、没有改 API、没有改 AMK1。
+
+### Fixed：后端初始化失败泄漏成 `AMIKI_ERROR_PANIC`
+
+**现象**（来自嵌入式集成反馈 P4，本机已复现）：`AMIKI_BACKENDS=gl` 且进程无窗口时，
+`amiki_context_create` 返回 **5（`AMIKI_ERROR_PANIC`）** —— 而 `amiki.h` 的契约是
+"请求的后端不可用 ⇒ `AMIKI_ERROR_BACKEND_UNAVAILABLE`"。
+
+**根因**：panic 不在引擎里，在 **wgpu 内部** —— GL 上下文缺 compute 能力时，
+wgpu 25 在**创建 compute pipeline** 那一步 panic
+（`wgpu-25.0.2/src/backend/wgpu_core.rs:1410`），而不是返回错误。
+引擎的 C ABI 兜底捕获把它一律映射成 `PANIC`，于是调用方以为"引擎有 bug"。
+
+**修复**：新增 `GpuRenderer::new_blocking()` —— 用 `catch_unwind` 把**初始化那一段**
+的 panic 收敛成 `Err`（只包初始化：渲染过程中的 panic 照旧冒出，那是真 bug，
+不该被这条吞掉）。C ABI 与门面共 3 个调用点改用它，于是：
+
+```text
+修复前：amiki_context_create → 5（PANIC）
+修复后：amiki_context_create → 3（BACKEND_UNAVAILABLE）
+```
+
+**回归测试**：`crates/amiki-capi/tests/gl_backend_unavailable.rs`（独立集成测试进程，
+因为要设进程级的 `AMIKI_BACKENDS`）。它钉的契约是：结果是 `AMIKI_OK`
+（机器真能起 GL）或 `BACKEND_UNAVAILABLE`/`NOT_SUPPORTED`（起不来但说清了），
+**绝不能是 `PANIC`**。修复前该测试**确实失败**（先把测试写成红的，再改代码）。
+
+**登记**：`docs/KNOWN_ISSUES.md` 新增 **B17** —— GL 后端**需要 compute shader**，
+受限上下文（无窗口进程 / 老驱动 / 部分 ANGLE）里**根本起不来**，请改用
+Vulkan / DX12 / CPU。已按纪律第 9 条同步 `docs/OVERVIEW.md` 的 5.2 与图例计数。
+
+### Docs：三处绑定作者最容易踩的说明（写进 `amiki.h`）
+
+| 处 | 补了什么 |
+|---|---|
+| `amiki_context_create` | 后端起不来返回什么（含"驱动库内部 panic 也被收敛"），以及**绝不返回 PANIC** 的理由；`AUTO` 落 CPU 的承诺不变 |
+| `amiki_canvas_begin_layer` | **P5.1** 层是独立画布、**不继承外层变换**（只继承填充规则）；**P5.2** 层统一在**所有**普通绘制之后合成 ⇒ 把层当"括号"夹住一部分绘制，后画的会被压到层下面；正确姿势是每个面板整体画进自己的层 |
+| `amiki_canvas_render_rgba8` | **P3** 与 OpenGL 宿主共存时的同步读回特征（B11）：跨 API 同步可能是主要成本、与画布尺寸无关；多块小画布摊薄 + 游戏内优先 CPU 后端；目前**没有**异步接口 |
+
+### 测试
+
+297 → **298**（+1：上面那条 GL 回归）。既有测试与三示例产物**均未变**
+（`verify.cmd` 的 SHA256 与 0.9.0 相同）。
+
+### 已知未做（都留了明确的下一步，不藏）
+
+- **P1**（宿主报告"CPU 渲染有 ~15ms 固定开销"）：我方实测**引擎侧不存在**
+  （空场景 release 0.15–0.55 ms / debug 0.23–0.50 ms，且随面积线性）。
+  相同内容在 **debug 下 10.3–10.9 ms**、release 下 1.45–1.74 ms ⇒ 优先怀疑
+  宿主侧的构建档位或每次调用的固定工作。**需要对方的复现数据**才能继续。
+- **P2**（层影子的子场景按**全画布**渲染）：设计缺陷**已确认**
+  （`amiki-raster/src/lib.rs` 里先 `render_inner_f32(scene.width, scene.height, …)`
+  再裁到 `inflated_bounds`），修复方向也已定（只渲染 bounds 区域，可复用 M4 的
+  tile 机制；tile 之间本就独立 ⇒ 结果应逐像素不变）。**本轮未实施** ——
+  它是自成一体的改动，值得单独一轮带对拍验证。
+- **"含层反而更快"的反常**：实测含层时 CPU 渲染比不含层**快 3–4 倍**
+  （release 1.45 ms → 0.30 ms；墨迹像素数相同 ⇒ 不是绘制被丢）。
+  两条 CPU 路径的逐像素成本差异可疑，**待查**。
+
+---
+
 ## [0.9.0-alpha] —— `save` / `restore` 状态栈
 
 **新能力**：`Canvas::save()` / `Canvas::restore()` —— 保存与恢复

@@ -848,14 +848,128 @@ fn shade_tile_f32(binned: &BinnedScene, img: &mut [[f32; 4]], w: usize, h: usize
 /// 合成在**预乘空间**进行：层缓冲是直线色，直接交给要求直线输入的 `composite`
 /// 会在小 alpha 处放大模糊量化噪声（实测边缘色偏 86/255）。故把目标也转成预乘，
 /// 算完再转回直线存储。
-/// 与 [`layer_buffer_from_content`] 同逻辑，但源是**未裁剪的 f32**。
+/// 与 [`shade_tile_f32`] 同一数学，但写出到**区域缓冲**（`ox/oy` 为区域原点，
+/// `stride` 为区域行宽）。
 ///
-/// 为什么另开一个而不是让原函数泛型化：原函数做的是 `u8 / 255.0` 的转换，
-/// 那一步正是 HDR 信息的丢失点。f32 版本**完全不做转换**，直接搬
-/// `[f32; 4]` —— 语义差别值得一个独立的函数名。
+/// ⚠️ 传给 `shade_pixel` 的宽度必须是**画布宽度**（`binned.width`），不是
+/// 区域行宽 —— `shade_pixel` 用 `py * w + px` 去索引**全画布**尺寸的 clip map，
+/// 换成区域行宽会读到错的裁剪覆盖率。
+fn shade_tile_f32_region(
+    binned: &BinnedScene,
+    img: &mut [[f32; 4]],
+    stride: usize,
+    ox: usize,
+    oy: usize,
+    tx: usize,
+    ty: usize,
+) {
+    let tiles_x = binned.tiles_x as usize;
+    let off = binned.tile_draw_offsets[ty * tiles_x + tx];
+    if off[1] == 0 {
+        return; // 本 tile 无绘制
+    }
+    let full_w = binned.width as usize;
+    let full_h = binned.height as usize;
+    let rw = stride;
+    let rh = img.len() / stride.max(1);
+    let x0 = (tx * TILE_USIZE).max(ox);
+    let x1 = ((tx + 1) * TILE_USIZE).min(ox + rw).min(full_w);
+    let y0 = (ty * TILE_USIZE).max(oy);
+    let y1 = ((ty + 1) * TILE_USIZE).min(oy + rh).min(full_h);
+    for py in y0..y1 {
+        let row = py % TILE_USIZE;
+        for px in x0..x1 {
+            let v = shade_pixel(binned, full_w, off, row, px, py);
+            img[(py - oy) * stride + (px - ox)] = v;
+        }
+    }
+}
+
+/// 渲染 `scene` 的**一个矩形区域**为未裁剪 f32；区域外的像素**不存在**。
 ///
-/// 边界计算与原函数逐字一致（含 `inflated_bounds` 的滤镜扩散余量），
-/// 否则两条路径会在边界上给出不同结果。
+/// # 为什么可以只渲一个区域（与全量渲染后裁剪**逐像素相同**）
+///
+/// `shade_tile` 只读三样东西：本 tile 的绘制表（`tile_draw_offsets`）、
+/// 本行在 tile 内的段引用（`row_lists`）、以及跨 tile 的**前缀**（`carries`）。
+/// 三者都与"别的 tile 有没有被渲过"无关 —— `carries` 在 `bin` 阶段就算好了。
+/// 因此省掉区域外的 tile，不会改变区域内任何一个像素的值。
+///
+/// （这正是 M4 增量渲染能成立的前提，这里只是把它用到层上。）
+fn render_inner_f32_region(
+    scene: &amiki_scene::Scene,
+    eps: f32,
+    mip_bias: f32,
+    ox: i32,
+    oy: i32,
+    rw: u32,
+    rh: u32,
+) -> Vec<[f32; 4]> {
+    let mut binned = bin(scene, eps);
+    binned.mip_bias = mip_bias;
+    let stride = rw as usize;
+    let mut img = vec![[0.0f32; 4]; (rw * rh) as usize];
+    if rw == 0 || rh == 0 {
+        return img;
+    }
+    let (ox, oy) = (ox.max(0) as usize, oy.max(0) as usize);
+    let last_x = binned.tiles_x.saturating_sub(1) as usize;
+    let last_y = binned.tiles_y.saturating_sub(1) as usize;
+    let tx0 = (ox / TILE_USIZE).min(last_x);
+    let tx1 = ((ox + stride - 1) / TILE_USIZE).min(last_x);
+    let ty0 = (oy / TILE_USIZE).min(last_y);
+    let ty1 = ((oy + rh as usize - 1) / TILE_USIZE).min(last_y);
+    for ty in ty0..=ty1 {
+        for tx in tx0..=tx1 {
+            shade_tile_f32_region(&binned, &mut img, stride, ox, oy, tx, ty);
+        }
+    }
+    img
+}
+
+/// 渲染并滤波一层，返回 `(区域原点 x, 区域原点 y, 已滤波缓冲)`。
+///
+/// **只渲染 `inflated_bounds` 覆盖的区域**（0.9.2 之前是"先按全画布渲染、
+/// 再裁到 bounds"，浪费的那部分与层大小无关、只与画布大小有关 —— 层多、
+/// 层小、画布大的 UI 场景里这是主要成本）。
+///
+/// 裁剪边界与旧的 `layer_buffer_from_content_f32` **逐字一致**
+/// （`bx/by` 钳到 0、`lw/lh` 再钳到画布内、空则返回 `None`）。
+fn render_layer_content_f32(
+    scene: &amiki_scene::Scene,
+    layer: &amiki_scene::Layer,
+    eps: f32,
+    mip_bias: f32,
+) -> Option<(i32, i32, LayerBuffer)> {
+    if layer.bounds.is_empty() {
+        return None;
+    }
+    let b = inflated_bounds(layer.bounds, layer.filter);
+    let bx = b.x.max(0);
+    let by = b.y.max(0);
+    if bx >= scene.width as i32 || by >= scene.height as i32 {
+        return None;
+    }
+    let lw = b.width.min(scene.width - bx as u32);
+    let lh = b.height.min(scene.height - by as u32);
+    if lw == 0 || lh == 0 {
+        return None;
+    }
+    let content = render_inner_f32_region(&layer.scene, eps, mip_bias, bx, by, lw, lh);
+    let mut buf = LayerBuffer::new(lw, lh);
+    for y in 0..lh {
+        for x in 0..lw {
+            buf.set(x, y, content[(y * lw + x) as usize]);
+        }
+    }
+    apply_filter(&mut buf, layer.filter);
+    Some((bx, by, buf))
+}
+
+/// 把**已渲染的全画布 f32 内容**裁到层的 `inflated_bounds` 并滤波。
+///
+/// 0.9.2 起层的主路径改走 [`render_layer_content_f32`]（只渲染区域，不再需要
+/// 这一步的裁剪）；本函数保留给**增量/持久**路径（`persist.rs`），它跨帧复用
+/// 层缓冲、手里只有整幅内容。
 fn layer_buffer_from_content_f32(
     content: &[[f32; 4]],
     root_w: u32,
@@ -1046,9 +1160,9 @@ fn composite_layer(
     // 工作。此前这里用的是 8 位的 `render_inner`，>1.0 的高光源在模糊**之前**
     // 就被裁到 1.0 —— 发光效果直接消失（`hdr_values_survive_a_blurred_layer`
     // 测到的两个 level 能量完全相同，就是这个原因）。
-    let layer_img = render_inner_f32(scene.width, scene.height, &layer.scene, eps, mip_bias);
-    let Some((bx, by, buf)) = layer_buffer_from_content_f32(&layer_img, scene.width, scene.height, layer)
-    else {
+    //
+    // 0.9.2：**只在 `inflated_bounds` 区域渲染**（此前是全画布渲染再裁）。
+    let Some((bx, by, buf)) = render_layer_content_f32(scene, layer, eps, mip_bias) else {
         return;
     };
     // 4) 合成回父图像（整幅）
@@ -1221,11 +1335,9 @@ fn composite_layer_f32(
     if layer.bounds.is_empty() {
         return;
     }
-    // 层内容走 f32（>1.0 存活），滤镜在未裁剪的数据上做，合成也不裁剪
-    let content = render_inner_f32(scene.width, scene.height, &layer.scene, eps, mip_bias);
-    let Some((bx, by, buf)) =
-        layer_buffer_from_content_f32(&content, scene.width, scene.height, layer)
-    else {
+    // 层内容走 f32（>1.0 存活），滤镜在未裁剪的数据上做，合成也不裁剪。
+    // 0.9.2：与 `composite_layer` 一样，**只渲染 `inflated_bounds` 区域**。
+    let Some((bx, by, buf)) = render_layer_content_f32(scene, layer, eps, mip_bias) else {
         return;
     };
     blend_layer_rect_f32(

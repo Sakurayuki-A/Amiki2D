@@ -651,13 +651,44 @@ impl Canvas {
     }
 }
 
+/// 进程级共享的 GPU 渲染器（0.10.8）。
+///
+/// # 为什么必须共享（这是修一个真实的性能 bug）
+///
+/// 原先本函数**每次调用**都执行 `GpuRenderer::new_blocking()` —— 那是一次完整的
+/// wgpu 设备/队列/适配器初始化。实测（`tests/gpu_fixed_cost.rs`）：
+/// 64×64 两个矩形每次都要 **87–138 ms**，而 CPU 做同一件事只要 **0.15 ms**；
+/// 且耗时**与尺寸内容完全无关** ⇒ 正是嵌入式反馈里"与尺寸无关的 ~20 ms 停顿"的形状。
+///
+/// 现在初始化只做一次；失败也**缓存**（`Err(String)`），避免在没有 GPU 的机器上
+/// 每次调用都重试一次昂贵的初始化。
+#[cfg(feature = "gpu")]
+fn shared_gpu_renderer() -> Result<&'static std::sync::Mutex<gpu::GpuRenderer>, String> {
+    static CELL: std::sync::OnceLock<Result<std::sync::Mutex<gpu::GpuRenderer>, String>> =
+        std::sync::OnceLock::new();
+    match CELL.get_or_init(|| {
+        gpu::GpuRenderer::new_blocking()
+            .map(std::sync::Mutex::new)
+            .map_err(|e| format!("{e:?}"))
+    }) {
+        Ok(m) => Ok(m),
+        Err(msg) => Err(msg.clone()),
+    }
+}
+
 /// 便捷入口：GPU 渲染为 RGBA8，GPU 不可用时自动落到 CPU 引擎。
+///
+/// 渲染器是**进程级共享**的（见私有函数 `shared_gpu_renderer`）；锁只在一帧渲染期间持有。
 #[cfg(feature = "gpu")]
 pub fn render_to_rgba(canvas: &Canvas, flatten_eps: f32) -> Result<Vec<u8>, gpu::RenderError> {
-    match gpu::GpuRenderer::new_blocking() {
-        Ok(r) => r.render_blocking(&canvas.scene, flatten_eps),
-        Err(e) => {
-            eprintln!("GPU 不可用（{e}），使用 CPU 引擎");
+    match shared_gpu_renderer() {
+        Ok(cell) => {
+            // 锁中毒时取回内部值继续，不 panic（与 C ABI 的 Poison 机制同一态度）
+            let r = cell.lock().unwrap_or_else(|p| p.into_inner());
+            r.render_blocking(&canvas.scene, flatten_eps)
+        }
+        Err(msg) => {
+            eprintln!("GPU 不可用（{msg}），使用 CPU 引擎");
             Ok(render_cpu(canvas, flatten_eps))
         }
     }

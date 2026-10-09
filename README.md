@@ -16,7 +16,7 @@
 错误的 tile）；`0.6.0-alpha` 新增 **mipmap**（大幅缩小的位图不再走样）。
 C ABI（0.4.0）让引擎能被 Rust 之外的语言调用（C / C# / Node 三个示例输出**逐字节一致**；
 三者均为**原生 FFI**，Node 走 koffi 而非 WASM）；
-WASM（0.5.0）让它在**浏览器与任何 JS 运行时**里跑（模块 **987.9 KB**，
+WASM（0.5.0）让它在**浏览器与任何 JS 运行时**里跑（模块 **1 025.7 KB（0.10.0 实测；启用可选 `codec` 会 +343.9 KB）**，
 与原生 CPU 后端输出**逐字节一致**）。`0.3.0-alpha` 的发布判据 6 条**全部满足**。
 核心渲染管线（M1–M3）、工程硬化（M3.5）、增量渲染（M4）、文本（M5）、
 渐变/位图/滤镜（M6），加上 P0 能力门槛（描边、含层增量、帧路径层合成）、
@@ -95,7 +95,7 @@ P1-1 性能（提取 **2.03 → 0.59 ms**）与 P3 工程成熟度六项。
   引擎**绝不 panic 跨 FFI 边界**；panic 后对象中毒并显式拒绝后续调用。
   详见 [`crates/amiki-capi/README.md`](crates/amiki-capi/README.md)
 - **WASM（0.5.0）**：`crates/amiki-capi/examples/wasm/` 下的独立交付——
-  纯 CPU 构建（`--no-default-features`，模块 **987.9 KB**；0.5.0 时为
+  纯 CPU 构建（`--no-default-features`，模块 **1 025.7 KB（0.10.0 实测；启用可选 `codec` 会 +343.9 KB）**；0.5.0 时为
   950.7 KB，0.6.0 加入 mipmap 后 +15 KB，0.7.0 加入字体回退后 +22 KB），JS 加载器用
   **原生 WebAssembly API** 直调同一份 C ABI（不依赖 wasm-bindgen），
   与原生 CPU 后端输出**字节一致**。

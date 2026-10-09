@@ -61,9 +61,18 @@ PNG 解码 / PNG 编码 / JPEG 解码；C ABI 加 3 个符号（84 → 87）。
 - `amiki-codec` 自身依赖 **17 个包，无 `-sys` / `cc`**（纯 Rust）。
 - wasm（探针口径：`opt-level=z` + LTO + `panic=abort`，**未过 `wasm-opt`**）：
   `+png` = **166.2 KB**、`+png+zune-jpeg` = **283.4 KB**。
-  ⚠️ **相对基线（不含解码）的增量本轮没测准** —— 探针的基线配置当时构建失败，
-  报告里已如实标注；引擎级 wasm 数字（含 `wasm-opt`）要等 wasm 构建下次跑时补。
-  可以确定的是**构造上不受影响**：wasm 构建走 `--no-default-features`，不启用编解码。
+  **引擎级实测**（`cargo build -p amiki-capi --target wasm32-unknown-unknown
+--profile wasm-release --no-default-features`，`amiki2d.wasm`）：
+
+| 配置 | 大小 |
+|---|---|
+| 不带编解码 | **1 025.7 KB** |
+| 带 `codec` | **1 369.5 KB** |
+| **增量** | **+343.9 KB（+33.5%）** |
+
+⚠️ 两点如实说明：**`wasm-opt` 未安装**，以上是优化前的数字；**基线已不是 987.9 KB**
+（那是 0.7.0 的旧值，此后 even-odd 与状态栈让模块长大到 1 025.7 KB）。
+这正是 `codec` **默认关（wasm 侧）** 的原因：要读图就付 +33.5%，不读就一分不涨。
 
 ## [0.9.2-alpha] —— 层只渲染自己的区域（嵌入式集成反馈 P2）
 

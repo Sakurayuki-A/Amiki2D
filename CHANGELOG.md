@@ -9,6 +9,50 @@
 
 ---
 
+---
+
+## [0.10.2-alpha] —— 虚线（dash path effect）
+
+**新能力**：`stroke_path_dashed` —— 虚线描边。Rust 侧两个层次都给：
+`amiki_scene::dash_polyline` / `amiki_scene::stroke_path_dashed`（几何层，返回 `Option`）
+与门面 `Canvas::stroke_path_dashed`。**老签名一字未动**（新能力走新入口）。
+
+### 实现：复用既有描边，不引入新数学
+
+```text
+flatten_path → dash_polyline（按弧长切）→ stroke_polyline（每段开口）→ 合成一条 Path
+```
+
+端帽 / 连接 / miter limit 全部走**同一条**既有描边路径，只是每段是**开口**的，
+所以各自带端帽 —— 与 SVG / Skia 语义一致。**没有新的覆盖率数学、没有碰 WGSL。**
+
+### 语义（与 SVG / Skia 对齐）
+
+| 情形 | 行为 |
+|---|---|
+| 模式元素个数为**奇数** | 视为把列表重复一遍（`[10]` 等价 `[10,10]`） |
+| 消耗完一轮 | 从头再来 |
+| **闭合路径** | 沿周长切（起点从折线首点算），首尾相接处照常成段 |
+| 模式非法（空 / 全 0 / 负数 / NaN / Inf） | **显式返回 `None`、什么都不画** —— 绝不静默按实线画 |
+
+### 实测（`crates/amiki/tests/dash.rs`，6 条测试）
+
+| 判据 | 结果 |
+|---|---|
+| 直线 `[10,5]` 切 100 长 | **7 段**，首段 0→10、末段 90→100（逐点核对） |
+| 奇数模式 `[10]` | 与 `[10,10]` **段数相同**（2 段） |
+| 闭合正方形周长 40、`[4,4]` | **5 段** |
+| 非法模式 5 种 | 全部 `None`（含门面入口） |
+| 描边轮廓 | 实线 14 个元素 → 虚线 `[8,6]` **121 个**（确实断了） |
+
+演示图：`out/dash_demo.png`（蓝实线矩形 + 橙虚线矩形 + 绿虚线竖线）。
+
+### 账本
+
+**B20 的"无路径效果"一项收窄**：虚线已做；仍缺 Skia 那套完整路径效果
+（`Corner` / `Discrete` / `Trim` / 1D·2D 图案）与**颜色滤镜**、图像滤镜全家桶。
+测试 312 → **318**；clippy / rustdoc 零告警。
+
 ## [0.10.1-alpha] —— `Canvas::text_cached`：把字形轮廓缓存做成**安全的**入口
 
 **新 API**（Rust 门面，additive）：`Canvas::text_cached(&mut TextCache, run, origin, paint, outline)`。

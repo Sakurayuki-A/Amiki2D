@@ -271,6 +271,33 @@ impl Canvas {
         self.stroke_path_with(path, style, Paint::Solid(color))
     }
 
+    /// 描边的**虚线版**（0.10.2）：`pattern` 是交替的「实 / 虚」长度。
+    ///
+    /// 与 [`Canvas::stroke_path_with`] 的关系是"先切成虚线、再走同一条描边路径" ——
+    /// 端帽 / 连接 / miter limit 语义完全一致，只是每段是**开口**的，各自带端帽
+    /// （与 SVG / Skia 一致）。**奇数个元素**视为把列表重复一遍。
+    ///
+    /// 返回 `None` = **虚线模式非法**（空 / 全 0 / 含负数或非有限值），
+    /// 此时**什么都不画** —— 显式拒绝，不静默按实线画。
+    ///
+    /// ```ignore
+    /// canvas.stroke_path_dashed(&rect, style, Color::rgb8(200,70,40), &[14.0, 8.0]);
+    /// ```
+    pub fn stroke_path_dashed(
+        &mut self,
+        path: &Path,
+        style: amiki_scene::StrokeStyle,
+        color: amiki_scene::Color,
+        pattern: &[f32],
+    ) -> Option<&mut Self> {
+        const EPS_DEVICE: f32 = 0.1;
+        let scale = self.state.transform.max_scale().max(1e-6);
+        let outline =
+            amiki_scene::stroke_path_dashed(path, &style, pattern, EPS_DEVICE / scale)?;
+        self.fill_path(&outline, Paint::Solid(color));
+        Some(self)
+    }
+
     /// 绘制一张位图（M6），放置到设备空间的矩形 `[x0,x1] × [y0,y1]`。
     ///
     /// 放置会经过画布当前变换，因此可以配合 `translate` / `rotate` / `scale`

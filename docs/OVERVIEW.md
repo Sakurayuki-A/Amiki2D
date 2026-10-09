@@ -66,7 +66,7 @@
 | **文字缓存**（0.10.1） | `Canvas::text_cached`：**调用方持有** `TextCache` 复用字形轮廓（与 `text()` 逐像素相同，实测 1.3×）；缓存键含字体身份，故不能由门面自动持有（见 5.4 的 D8） |
 | **状态栈** | `Canvas::save` / `restore`（0.9.0）：**四项状态**（变换 / 混合模式 / 裁剪栈 / 填充规则）整体存取；深度 32，溢出/下溢**显式报错**；层内栈独立 —— 这是 UI 框架"局部状态"的基本假设 |
 | **裁剪** | 矩形 / 路径裁剪，含嵌套裁剪栈 |
-| **描边** | join（miter / round / bevel，含 miter limit）、cap（butt / round / square）、开放折线与闭合环 |
+| **描边** | join（miter / round / bevel，含 miter limit）、cap（butt / round / square）、开放折线与闭合环、**虚线**（0.10.2） |
 | **渐变** | 线性 / 径向 / 扫描；双端逐像素一致 |
 | **位图** | 旋转 / 缩放 / 平铺（Repeat 采样器）+ **mipmap**（见 2.2 的 B4） |
 | **图像编解码**（0.10.0） | **自己读图**：PNG（含**索引色** / 1–16 位）解码 + PNG 编码 + JPEG 解码；在**可选 crate** `amiki-codec` 里 —— 核心四 crate 仍零第三方依赖 |
@@ -106,7 +106,7 @@
 | **C ABI** | **87 个符号**；`verify.cmd` 一条命令核对"header 声明 = 实际导出"、C/C++ 两种包含方式、三示例产物一致、版本一致性 |
 | **WASM** | 原生 WebAssembly API（不依赖 wasm-bindgen）；浏览器验证页**页内自校验 SHA-256** |
 | **dogfooding** | `window_demo` 真实窗口应用：列表视图（200 行滚动、点击选中）+ 展示页（渐变/位图/滤镜/动画真字），**中英混排正常** |
-| **工程质量** | `cargo test --workspace` **312 passed / 0 failed**；clippy 与 `cargo doc` **零警告** |
+| **工程质量** | `cargo test --workspace` **318 passed / 0 failed**；clippy 与 `cargo doc` **零警告** |
 | **代码规模** | Rust **24 618** 行 / 48 文件；WGSL **1 570** 行 / 13 文件；**8 个 crate** |
 
 ---
@@ -167,7 +167,7 @@
 
 | 项 | 证据 |
 |---|---|
-| **全工作区测试** | `cargo test --workspace` → **312 passed / 0 failed** |
+| **全工作区测试** | `cargo test --workspace` → **318 passed / 0 failed** |
 | **静态检查** | `cargo clippy --workspace --all-targets` 与 `cargo doc --workspace --no-deps` **零警告** |
 | **三后端** | Vulkan / DX12 / GL 在同一块 RTX 3050 上各跑通（`AMIKI_BACKENDS` 可指定；GL 遇位图**显式报错**而非静默画错） |
 | **GPU ↔ CPU 逐像素** | 图形、渐变、位图、滤镜、**HDR 层**、**CJK 字形**全部对拍；CJK 实测最大通道差 **1** |

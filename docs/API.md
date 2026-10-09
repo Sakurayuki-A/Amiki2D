@@ -32,6 +32,7 @@
 | `Canvas::text` | 文字（M5） |
 | `Canvas::text_with_stack` | 文字 + **字体回退**（0.7.0） |
 | `Canvas::text_cached` | 文字 + **调用方持有的字形轮廓缓存**（0.10.1，见 D8） |
+| `Canvas::stroke_path_dashed` | **虚线描边**（0.10.2）：模式非法时返回 `None`，不静默画实线 |
 | `Canvas::set_transform` / `translate` / `rotate` / `scale` / `reset` | 变换 |
 | `Canvas::set_blend` | 混合模式 |
 | `Canvas::set_fill_rule` / `fill_rule` | **填充规则**：`NonZero`（默认）/ `EvenOdd`（0.8.0，状态式） |

@@ -209,7 +209,7 @@ extern "C" {
 
 #define AMIKI_VERSION_MAJOR 0
 #define AMIKI_VERSION_MINOR 10
-#define AMIKI_VERSION_PATCH 1
+#define AMIKI_VERSION_PATCH 2
 /** 预发布标签（正式版为空串）。**不参与数值比较**，只用于展示。 */
 #define AMIKI_VERSION_PRERELEASE "alpha"
 

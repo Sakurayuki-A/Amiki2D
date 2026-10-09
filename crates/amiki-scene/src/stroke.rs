@@ -510,6 +510,125 @@ pub fn stroke_path(path: &Path, style: &StrokeStyle, eps: f32) -> Path {
     Path::from_els(els)
 }
 
+/// 把折线按**虚线模式**切成若干子折线（0.10.2）。
+///
+/// `pattern` 是交替的「实 / 虚」长度；与 SVG / Skia 同语义：
+/// - **奇数个元素**视为把列表重复一遍（`[10,5,2]` 等价于 `[10,5,2,10,5,2]`）；
+/// - 消耗完一轮就从头再来；
+/// - **闭合折线**沿周长切，首尾相接处照常成段（起点从折线首点算）。
+///
+/// 返回的每段都是**开口**折线（虚线各自带自己的端帽，与 Skia 一致）。
+///
+/// `None` = 模式无效（空、全 0、含负数或非有限值）—— **显式拒绝，不静默按实线画**。
+pub fn dash_polyline(pts: &[Vec2], closed: bool, pattern: &[f32]) -> Option<Vec<Vec<Vec2>>> {
+    if pattern.is_empty()
+        || pattern.iter().any(|v| !v.is_finite() || *v < 0.0)
+        || pattern.iter().all(|v| *v == 0.0)
+    {
+        return None;
+    }
+    let mut pat: Vec<f32> = pattern.to_vec();
+    if !pat.len().is_multiple_of(2) {
+        pat.extend_from_slice(pattern);
+    }
+    let total: f32 = pat.iter().sum();
+    if total <= 0.0 || !total.is_finite() {
+        return None;
+    }
+    let mut line: Vec<Vec2> = pts.to_vec();
+    if closed {
+        if let Some(&p0) = pts.first() {
+            if line.last() != Some(&p0) {
+                line.push(p0);
+            }
+        }
+    }
+    if line.len() < 2 {
+        return None;
+    }
+
+    let mut out: Vec<Vec<Vec2>> = Vec::new();
+    let mut seg: Vec<Vec2> = vec![line[0]];
+    let mut idx = 0usize;
+    let mut left = pat[0];
+    let mut on = true;
+
+    for w in line.windows(2) {
+        let (a, b) = (w[0], w[1]);
+        let mut remain = (b - a).hypot();
+        if remain <= 0.0 {
+            continue;
+        }
+        let dir = (b - a) * (1.0 / remain);
+        let mut cur = a;
+        let mut guard = 0usize;
+        while remain > 1e-9 {
+            guard += 1;
+            if guard > 1_000_000 {
+                break; // 防御：模式里全是极小值时不至于挂死
+            }
+            if left <= 1e-9 {
+                idx = (idx + 1) % pat.len();
+                left = pat[idx];
+                on = idx % 2 == 0;
+                if left <= 1e-9 {
+                    continue;
+                }
+            }
+            let step = remain.min(left);
+            cur = cur + dir * step;
+            remain -= step;
+            left -= step;
+            if on {
+                seg.push(cur);
+            } else {
+                if seg.len() >= 2 {
+                    out.push(std::mem::take(&mut seg));
+                } else {
+                    seg.clear();
+                }
+                seg.push(cur);
+            }
+        }
+    }
+    if seg.len() >= 2 {
+        out.push(seg);
+    }
+    Some(out)
+}
+
+/// 描边的**虚线版**：先按 `pattern` 切段再逐段描边（0.10.2）。
+///
+/// 与 [`stroke_path`] 的关系是"切成虚线再走同一条描边路径" —— 端帽 / 连接 /
+/// miter limit 的语义完全一致，只是每段是**开口**的，所以各自带端帽。
+///
+/// `None` = 虚线模式无效（见 [`dash_polyline`]）；**显式拒绝，不静默画成实线**。
+pub fn stroke_path_dashed(
+    path: &Path,
+    style: &StrokeStyle,
+    pattern: &[f32],
+    eps: f32,
+) -> Option<Path> {
+    // 先把模式验证一次：避免"画了一半才发现模式非法"的半成品输出
+    dash_polyline(&[Vec2::new(0.0, 0.0), Vec2::new(1.0, 0.0)], false, pattern)?;
+    let mut els: Vec<PathEl> = Vec::new();
+    for (poly, closed) in flatten_path(path, &Affine::IDENTITY, eps) {
+        for d in dash_polyline(&poly, closed, pattern)? {
+            for c in stroke_polyline(&d, false, style) {
+                if c.len() < 3 {
+                    continue;
+                }
+                els.push(PathEl::MoveTo(c[0]));
+                for p in &c[1..] {
+                    els.push(PathEl::LineTo(*p));
+                }
+                els.push(PathEl::Close);
+            }
+        }
+    }
+    Some(Path::from_els(els))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

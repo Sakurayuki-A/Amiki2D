@@ -15,7 +15,10 @@ pub use mipmap::{
     MipLevel,
 };
 mod stroke;
-pub use stroke::{flatten_path, stroke_path, stroke_polyline, LineCap, LineJoin, StrokeStyle};
+pub use stroke::{
+    dash_polyline, flatten_path, stroke_path, stroke_path_dashed, stroke_polyline, LineCap,
+    LineJoin, StrokeStyle,
+};
 mod tone;
 pub use tone::{linear_to_srgb, rgba8_from_f32_with, srgb_to_linear, ToneMap};
 

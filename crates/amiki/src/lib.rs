@@ -444,6 +444,52 @@ impl Canvas {
         self
     }
 
+    /// 与 [`Canvas::text`] 同样绘制，但**用调用方持有的 [`amiki_scene::TextCache`]** 复用字形轮廓。
+    ///
+    /// # 为什么缓存必须由调用方持有（0.10.0，见 `docs/KNOWN_ISSUES.md` 的 D8）
+    ///
+    /// 缓存键是 [`amiki_scene::GlyphKey`] = `{ font_id, 字形 id, 字号 }`。
+    /// 门面的 `text()` 只拿得到"按字形 id 取轮廓"的闭包，**拿不到字体身份** ——
+    /// 若在门面内部自建缓存，就只能把 `font_id` 填成 `FontId::UNKNOWN`，
+    /// 于是"字体 A 的字形 5"与"字体 B 的字形 5"在**同字号**下会命中同一条 ⇒
+    /// **静默画错**。所以缓存交给调用方：**谁知道字体身份，谁持有缓存**。
+    ///
+    /// 典型用法（UI 每帧重画同一批文字）：
+    ///
+    /// ```ignore
+    /// let mut cache = TextCache::new();
+    /// loop {
+    ///     canvas.text_cached(&mut cache, &run, origin, paint.clone(), |id| font.outline(id).ok());
+    /// }
+    /// // cache.hits() 会随帧数增长，misses 只在首次或换字号时增加
+    /// ```
+    ///
+    /// 输出与 [`Canvas::text`] **逐字段相同**（同一份展开逻辑，只是查了缓存）——
+    /// 有测试断言两者的 `Draw` 完全相等。
+    pub fn text_cached<F>(
+        &mut self,
+        cache: &mut amiki_scene::TextCache,
+        run: &amiki_scene::TextRun,
+        origin: Vec2,
+        paint: Paint,
+        outline: F,
+    ) -> &mut Self
+    where
+        F: FnMut(u32) -> Option<amiki_scene::GlyphOutline>,
+    {
+        let base = self.state.transform.then(Affine::translate(origin));
+        let paths = cache.expand(run, outline);
+        for (path, glyph_t) in paths {
+            self.scene
+                .push_blend(base.then(glyph_t), path, paint.clone(), self.state.blend);
+            self.stamp_fill_rule();
+            if !self.state.clips.is_empty() {
+                self.scene.draws.last_mut().unwrap().clips = self.state.clips.clone();
+            }
+        }
+        self
+    }
+
     /// 绘制一段**已 shaping** 的文本，字形可按**字体下标**取轮廓（字体回退）。
     ///
     /// 与 [`Canvas::text`] 的唯一区别：`outline` 同时收到字形所属的**字体下标**

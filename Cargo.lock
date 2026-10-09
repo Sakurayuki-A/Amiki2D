@@ -57,7 +57,7 @@ dependencies = [
 
 [[package]]
 name = "amiki"
-version = "0.10.0-alpha"
+version = "0.10.1-alpha"
 dependencies = [
  "amiki-gpu",
  "amiki-layout",
@@ -73,7 +73,7 @@ dependencies = [
 
 [[package]]
 name = "amiki-capi"
-version = "0.10.0-alpha"
+version = "0.10.1-alpha"
 dependencies = [
  "amiki",
  "amiki-codec",
@@ -88,7 +88,7 @@ dependencies = [
 
 [[package]]
 name = "amiki-codec"
-version = "0.10.0-alpha"
+version = "0.10.1-alpha"
 dependencies = [
  "amiki-scene",
  "image",
@@ -98,7 +98,7 @@ dependencies = [
 
 [[package]]
 name = "amiki-gpu"
-version = "0.10.0-alpha"
+version = "0.10.1-alpha"
 dependencies = [
  "amiki-math",
  "amiki-raster",
@@ -112,7 +112,7 @@ dependencies = [
 
 [[package]]
 name = "amiki-layout"
-version = "0.10.0-alpha"
+version = "0.10.1-alpha"
 dependencies = [
  "amiki-math",
  "amiki-scene",
@@ -121,11 +121,11 @@ dependencies = [
 
 [[package]]
 name = "amiki-math"
-version = "0.10.0-alpha"
+version = "0.10.1-alpha"
 
 [[package]]
 name = "amiki-raster"
-version = "0.10.0-alpha"
+version = "0.10.1-alpha"
 dependencies = [
  "amiki-math",
  "amiki-scene",
@@ -133,14 +133,14 @@ dependencies = [
 
 [[package]]
 name = "amiki-scene"
-version = "0.10.0-alpha"
+version = "0.10.1-alpha"
 dependencies = [
  "amiki-math",
 ]
 
 [[package]]
 name = "amiki-text"
-version = "0.10.0-alpha"
+version = "0.10.1-alpha"
 dependencies = [
  "amiki-math",
  "amiki-scene",

@@ -13,7 +13,7 @@
 > **0.7.0 关闭了 B15**（无字体回退）—— 它正是"能力缺失但用户以为有"的典型，
 > 所以归本表。
 
-图例：**A** 未验证（2）· **B** 已知限制（17，其中 5 条已关闭：B4 / B5 / B12 / B13 / B15）· **C** 明确不做（5，其中 C4 已划掉移出）· **D** 技术债（7）
+图例：**A** 未验证（2）· **B** 已知限制（20，其中 5 条已关闭：B4 / B5 / B12 / B13 / B15）· **C** 明确不做（5，其中 C4 已划掉移出）· **D** 技术债（7）
 
 ---
 
@@ -378,6 +378,55 @@ stderr（默认 panic hook 在 unwind 前就打印）。彻底静音要临时替
 
 **与 B1 的区别**：B1 是"能起来、但某能力不行"（GL 不支持位图）；
 B17 是"**根本起不来**"。
+
+### B18 **图像编解码缺失**（0.9.2 登记，来自 Skia 对比）
+
+**现状**：引擎**不读也不写**任何图像文件格式 —— 只接受调用方给的 RGBA 像素。
+Skia 侧对照：`include/codec/SkEncodedImageFormat.h` 列了 **14 种**
+（PNG/JPEG/WEBP/GIF/BMP/ICO/WBMP/AVIF/HEIF/JPEGXL/DNG/PKM/KTX/ASTC），
+`src/codec` 94 文件；编码在 `include/encode` + `src/encode`。
+**我们：解码 0 种、编码 0 种。**
+
+**影响**：这是**用户默认会以为有**的能力 —— 任何真实应用都得在外部接一个解码器
+（本仓库的示例自己用了 `image` crate）。撞墙点很靠前。
+
+**处置（未决策）**：先做 **PNG + JPEG 解码**。**放置位置是决策点**：
+四个核心 crate 目前**零第三方依赖**，解码必须放进**可选 crate**
+（例如 `amiki-codec`），别把依赖污染进核心。
+
+**证据**：`docs/COMPARE_SKIA.md` 表 A-1。
+
+### B19 字体**只能从文件加载**（无系统字体管理）（0.9.2 登记）
+
+**现状**：`Font::from_file` 是唯一入口。Skia 侧对照：`BUILD.gn` 里有
+**10 个以上** fontmgr 开关（`fontmgr_win` / `win_gdi` / `fontconfig` /
+`android` / `custom_directory` / `custom_embedded` / `empty` / …），
+`include/ports` 21 个头。
+
+**影响**："列出系统字体""按族名取字体"这类常见需求做不到；调用方得自己找字体文件。
+
+**处置（未决策）**：平台字体枚举同样应放**可选 crate**（与 B18 同一个决策点）。
+
+**证据**：`docs/COMPARE_SKIA.md` 表 A-4。
+
+### B20 **效果生态单薄**：只有模糊与投影（0.9.2 登记）
+
+**现状**：
+- **图像滤镜**：我们 2 种（模糊、投影，且是**层滤镜**而非可组合的滤镜图）；
+  Skia `include/effects/SkImageFilters.h` 有 **28 个**工厂
+  （`Arithmetic Blend Blur ColorFilter Compose Crop Dilate DisplacementMap
+  DistantLit* DropShadowOnly Empty Erode Image Magnifier MatrixConvolution
+  MatrixTransform Merge Offset Picture RuntimeShader Shader PointLit* SpotLit* Tile`）。
+- **颜色滤镜**：我们**没有**；Skia 有色彩矩阵 / HSL / 亮度 / 高对比 / Overdraw。
+- **路径效果**：我们**没有**；Skia 有虚线 / 圆角 / 离散 / 裁剪(Trim) / 1D / 2D 图案。
+
+**影响**：UI 里高频的"**虚线**"与"**整体调色**"目前都要调用方自己绕
+（自己把路径切成段、自己在像素上做矩阵）。
+
+**处置（未决策）**：先补**虚线**（在路径展开阶段）与**颜色矩阵滤镜**（在颜色解析阶段）
+—— 两者都**不需要新架构**；图像滤镜全家桶排其后。
+
+**证据**：`docs/COMPARE_SKIA.md` 表 A-2。
 
 ## C. 明确不做（已决定的边界，避免范围蔓延）
 

@@ -69,6 +69,7 @@
 | **描边** | join（miter / round / bevel，含 miter limit）、cap（butt / round / square）、开放折线与闭合环、**虚线**（0.10.2） |
 | **渐变** | 线性 / 径向 / 扫描；双端逐像素一致 |
 | **位图** | 旋转 / 缩放 / 平铺（Repeat 采样器）+ **mipmap**（见 2.2 的 B4） |
+| **九宫格贴图**（0.10.3） | `Canvas::image_nine`：四角**保持源尺寸不缩放**、边单向、中间双向（对齐 Skia `drawImageNine` / Android 9-patch）；实现是「取子图 + 普通矩形放置」⇒ CPU/GPU/AMK1 都不需要知道它存在 |
 | **图像编解码**（0.10.0） | **自己读图**：PNG（含**索引色** / 1–16 位）解码 + PNG 编码 + JPEG 解码；在**可选 crate** `amiki-codec` 里 —— 核心四 crate 仍零第三方依赖 |
 | **滤镜与离屏层** | 高斯模糊（多次 ping-pong）、投影、分组不透明度；含层场景的**帧路径合成**（GPU compute 直接合成，不读回） |
 | **HDR** | `Rgba16Float` 贯穿渲染目标 / 层 / 模糊，>1.0 的值能穿过层边界存活；出口可选色调映射（见 2.2 的 B12 / B13） |
@@ -106,7 +107,7 @@
 | **C ABI** | **87 个符号**；`verify.cmd` 一条命令核对"header 声明 = 实际导出"、C/C++ 两种包含方式、三示例产物一致、版本一致性 |
 | **WASM** | 原生 WebAssembly API（不依赖 wasm-bindgen）；浏览器验证页**页内自校验 SHA-256** |
 | **dogfooding** | `window_demo` 真实窗口应用：列表视图（200 行滚动、点击选中）+ 展示页（渐变/位图/滤镜/动画真字），**中英混排正常** |
-| **工程质量** | `cargo test --workspace` **318 passed / 0 failed**；clippy 与 `cargo doc` **零警告** |
+| **工程质量** | `cargo test --workspace` **323 passed / 0 failed**；clippy 与 `cargo doc` **零警告** |
 | **代码规模** | Rust **24 618** 行 / 48 文件；WGSL **1 570** 行 / 13 文件；**8 个 crate** |
 
 ---
@@ -167,7 +168,7 @@
 
 | 项 | 证据 |
 |---|---|
-| **全工作区测试** | `cargo test --workspace` → **318 passed / 0 failed** |
+| **全工作区测试** | `cargo test --workspace` → **323 passed / 0 failed** |
 | **静态检查** | `cargo clippy --workspace --all-targets` 与 `cargo doc --workspace --no-deps` **零警告** |
 | **三后端** | Vulkan / DX12 / GL 在同一块 RTX 3050 上各跑通（`AMIKI_BACKENDS` 可指定；GL 遇位图**显式报错**而非静默画错） |
 | **GPU ↔ CPU 逐像素** | 图形、渐变、位图、滤镜、**HDR 层**、**CJK 字形**全部对拍；CJK 实测最大通道差 **1** |
@@ -256,6 +257,9 @@
 | `0.8.0` | **even-odd 填充规则** | 状态式 `set_fill_rule` + AMK1 v2 的 bit 12 + C ABI 82 个符号；实现靠**几何预处理**（覆盖率数学与 WGSL 一行未改）；顺带查明既有精度限制 B16（关闭 B5） |
 | `0.9.2` | **层只渲染自己的区域** | 层子场景按 `inflated_bounds` 渲染（2.7×），输出逐字节不变 |
 | `0.10.0` | **图像编解码** | 可选 crate `amiki-codec`：PNG（含索引色）解码/编码 + JPEG 解码；C ABI 87 符号；定调"核心零依赖 + 生态放可选 crate"（B18 部分关闭） |
+| `0.10.3` | **九宫格** | `image_nine`：四角不缩放、边/中间拉伸；实现绕开 uv 子区间约定（取子图 + 矩形放置） |
+| `0.10.2` | **虚线** | `dash_polyline` / `stroke_path_dashed` / `Canvas::stroke_path_dashed`；非法模式显式 `None`（B20 收窄） |
+| `0.10.1` | **文本缓存入口** | `Canvas::text_cached`：缓存由调用方持有（缺字体身份则不能自动缓存，见 D8）；实测 1.3× |
 | `0.9.0` | **状态栈** | `save` / `restore` 四项状态（变换 / 混合 / 裁剪栈 / 填充规则）；深度 32、溢出下溢显式报错、层内栈独立；C ABI 84 个符号；抓修 C ABI 的 `clip_depth` / `fill_rule` 镜像漂移；登记 D5 |
 
 ### 6.2 候选下一步（**尚未决策**，按"能消除哪一类风险"分组）

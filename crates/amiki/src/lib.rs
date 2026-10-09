@@ -271,6 +271,31 @@ impl Canvas {
         self.stroke_path_with(path, style, Paint::Solid(color))
     }
 
+    /// **九宫格贴图**（0.10.3）：把源图按 `insets` 切成 9 块铺满 `dst`。
+    ///
+    /// 四角**保持源尺寸不缩放**、四边单向拉伸、中间双向拉伸 —— 与 Skia
+    /// `drawImageNine` / Android 9-patch 同义。UI 里"一个圆角面板贴图适配任意
+    /// 尺寸"就是靠它：圆角与边框装饰在放大时**不变形**。
+    ///
+    /// 实现方式：按 [`amiki_scene::nine_patch`] 算出的 9 组矩形，**取子图**后用
+    /// 最普通的 [`Canvas::image`]（矩形放置）逐块画 —— 不涉及 uv 子区间的任何约定，
+    /// 因此 CPU / GPU 两侧与 AMK1 编码都不需要知道九宫格存在。
+    pub fn image_nine(
+        &mut self,
+        image: std::sync::Arc<amiki_scene::Image>,
+        insets: amiki_scene::Insets,
+        dst: (f32, f32, f32, f32),
+    ) -> &mut Self {
+        for slice in amiki_scene::nine_patch(image.width, image.height, insets, dst) {
+            let Some(sub) = amiki_scene::sub_image(&image, slice.src) else {
+                continue; // 越界块：跳过（显式，不画半张图）
+            };
+            let (x0, y0, x1, y1) = slice.dst;
+            self.image(std::sync::Arc::new(sub), x0, y0, x1, y1);
+        }
+        self
+    }
+
     /// 描边的**虚线版**（0.10.2）：`pattern` 是交替的「实 / 虚」长度。
     ///
     /// 与 [`Canvas::stroke_path_with`] 的关系是"先切成虚线、再走同一条描边路径" ——

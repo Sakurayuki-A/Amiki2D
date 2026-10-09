@@ -950,6 +950,142 @@ pub struct Clip {
     pub path: Path,
 }
 
+/// 九宫格的**边距**（源图像素）：左 / 上 / 右 / 下。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub struct Insets {
+    pub left: u32,
+    pub top: u32,
+    pub right: u32,
+    pub bottom: u32,
+}
+
+impl Insets {
+    pub fn new(left: u32, top: u32, right: u32, bottom: u32) -> Insets {
+        Insets { left, top, right, bottom }
+    }
+    /// 四边同宽。
+    pub fn all(v: u32) -> Insets {
+        Insets { left: v, top: v, right: v, bottom: v }
+    }
+}
+
+/// 九宫格的**一块**：源图上的矩形 + 它在目标上应占的矩形。
+///
+/// 只给矩形、不给 `ImagePlacement`，是**有意的设计**（见 [`nine_patch`] 的说明）：
+/// 调用方用最普通的"把子图画进矩形"的路径即可，不涉及 uv 子区间的任何约定。
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct NinePatchSlice {
+    /// 源矩形（像素，左上闭、右下开）：`(x, y, w, h)`
+    pub src: (u32, u32, u32, u32),
+    /// 目标矩形（设备坐标）：`(x0, y0, x1, y1)`
+    pub dst: (f32, f32, f32, f32),
+}
+
+/// 把源图按 `insets` 切成 **9 块**，算出每块的**源矩形**与**目标矩形**。
+///
+/// # 语义（**与 Skia `drawImageNine` / Android 9-patch 对齐**）
+///
+/// ```text
+///   ┌───┬─────────┬───┐   四角：**保持源尺寸，不缩放**（1 源像素 = 1 设备像素）
+///   │ 1 │    2    │ 3 │   四边：单向拉伸
+///   ├───┼─────────┼───┤   中间：双向拉伸
+///   │ 4 │    5    │ 6 │
+///   ├───┼─────────┼───┤   ⇒ 圆角/边框装饰在任意尺寸下**不变形**（这才是它的用途）
+///   │ 7 │    8    │ 9 │
+///   └───┴─────────┴───┘
+/// ```
+///
+/// # 为什么返回矩形而不是 `ImagePlacement`
+///
+/// 第一版我用 `ImagePlacement` 的 "uv 子区间 → 设备矩形" 仿射来拼 9 块，结果与
+/// 采样器的 texel 约定对不上：实测设备像素 `(1,1)` 取到的是源图 **texel (2,2)**
+/// 处四色交汇的混合（`[128,101,76]` ≈ 等权四色 `[125,102,80]`）。与其猜约定，
+/// 不如**绕开它**：把 9 块切成子图后用最普通的矩形放置画 —— 那条路径已被
+/// "1:1 逐像素不变"的保证覆盖过。
+///
+/// # 边界处理（显式，不静默）
+///
+/// - `insets` 超出源图尺寸 ⇒ 按比例夹断到不超过源尺寸；
+/// - `dst` 比两角之和还小 ⇒ 两角**等比压缩**（不产生负尺寸的块）；
+/// - 两侧边距之和等于源尺寸 ⇒ 该行/列宽度为 0 ⇒ **跳过**（只剩四角）；
+/// - `dst` 退化（宽或高 ≤ 0）或源图任一维为 0 ⇒ 返回**空**（什么都不画）。
+pub fn nine_patch(
+    src_w: u32,
+    src_h: u32,
+    insets: Insets,
+    dst: (f32, f32, f32, f32),
+) -> Vec<NinePatchSlice> {
+    let (dx0, dy0, dx1, dy1) = dst;
+    if src_w == 0 || src_h == 0 || dx1 <= dx0 || dy1 <= dy0 {
+        return Vec::new();
+    }
+    let (mut il, mut ir) = (insets.left.min(src_w), insets.right.min(src_w));
+    if il + ir > src_w {
+        let k = src_w as f32 / (il + ir) as f32;
+        il = (il as f32 * k).round() as u32;
+        ir = src_w - il;
+    }
+    let (mut it, mut ib) = (insets.top.min(src_h), insets.bottom.min(src_h));
+    if it + ib > src_h {
+        let k = src_h as f32 / (it + ib) as f32;
+        it = (it as f32 * k).round() as u32;
+        ib = src_h - it;
+    }
+    let (dw, dh) = (dx1 - dx0, dy1 - dy0);
+    // 角的设备边长 = 源 inset 原值（不缩放）；放不下两角时等比压缩
+    let (mut dl, mut dr) = (il as f32, ir as f32);
+    if dl + dr > dw {
+        let k = dw / (dl + dr);
+        dl *= k;
+        dr *= k;
+    }
+    let (mut dt, mut db) = (it as f32, ib as f32);
+    if dt + db > dh {
+        let k = dh / (dt + db);
+        dt *= k;
+        db *= k;
+    }
+
+    let sx = [0u32, il, src_w - ir, src_w];
+    let sy = [0u32, it, src_h - ib, src_h];
+    let dx = [dx0, dx0 + dl, dx1 - dr, dx1];
+    let dy = [dy0, dy0 + dt, dy1 - db, dy1];
+
+    let mut out = Vec::with_capacity(9);
+    for row in 0..3 {
+        for col in 0..3 {
+            let (sx0, sx1) = (sx[col], sx[col + 1]);
+            let (sy0, sy1) = (sy[row], sy[row + 1]);
+            let (x0, x1) = (dx[col], dx[col + 1]);
+            let (y0, y1) = (dy[row], dy[row + 1]);
+            if sx1 <= sx0 || sy1 <= sy0 || x1 <= x0 || y1 <= y0 {
+                continue;
+            }
+            out.push(NinePatchSlice {
+                src: (sx0, sy0, sx1 - sx0, sy1 - sy0),
+                dst: (x0, y0, x1, y1),
+            });
+        }
+    }
+    out
+}
+
+/// 从源图取出一个子图（**复制**像素；九宫格每块很小，代价可忽略）。
+///
+/// 越界或空尺寸返回 `None` —— 显式，不产出半张图。
+pub fn sub_image(src: &Image, rect: (u32, u32, u32, u32)) -> Option<Image> {
+    let (x, y, w, h) = rect;
+    if w == 0 || h == 0 || x + w > src.width || y + h > src.height {
+        return None;
+    }
+    let mut data = Vec::with_capacity((w * h * 4) as usize);
+    for row in 0..h {
+        let off = (((y + row) * src.width + x) * 4) as usize;
+        data.extend_from_slice(&src.data[off..off + (w * 4) as usize]);
+    }
+    Image::from_rgba8(w, h, data)
+}
+
 /// 一次绘制：变换 + 路径 + 样式 + 混合模式 + 裁剪引用。
 ///
 /// 派生 `PartialEq` 供 M4 的 [`edit_damage`] 判定"这条 draw 是否被改动"：

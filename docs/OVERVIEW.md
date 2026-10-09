@@ -108,7 +108,7 @@
 | **C ABI** | **87 个符号**；`verify.cmd` 一条命令核对"header 声明 = 实际导出"、C/C++ 两种包含方式、三示例产物一致、版本一致性 |
 | **WASM** | 原生 WebAssembly API（不依赖 wasm-bindgen）；浏览器验证页**页内自校验 SHA-256** |
 | **dogfooding** | `window_demo` 真实窗口应用：列表视图（200 行滚动、点击选中）+ 展示页（渐变/位图/滤镜/动画真字），**中英混排正常** |
-| **工程质量** | `cargo test --workspace` **334 passed / 0 failed**；clippy 与 `cargo doc` **零警告** |
+| **工程质量** | `cargo test --workspace` **337 passed / 0 failed**；clippy 与 `cargo doc` **零警告** |
 | **代码规模** | Rust **24 618** 行 / 48 文件；WGSL **1 570** 行 / 13 文件；**8 个 crate** |
 
 ---
@@ -169,7 +169,7 @@
 
 | 项 | 证据 |
 |---|---|
-| **全工作区测试** | `cargo test --workspace` → **334 passed / 0 failed** |
+| **全工作区测试** | `cargo test --workspace` → **337 passed / 0 failed** |
 | **静态检查** | `cargo clippy --workspace --all-targets` 与 `cargo doc --workspace --no-deps` **零警告** |
 | **三后端** | Vulkan / DX12 / GL 在同一块 RTX 3050 上各跑通（`AMIKI_BACKENDS` 可指定；GL 遇位图**显式报错**而非静默画错） |
 | **GPU ↔ CPU 逐像素** | 图形、渐变、位图、滤镜、**HDR 层**、**CJK 字形**全部对拍；CJK 实测最大通道差 **1** |

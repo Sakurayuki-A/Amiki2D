@@ -77,6 +77,8 @@ pub struct Canvas {
     ///
     /// **不进 AMK1**：栈是录制期的概念。编码时 Draw 已带完整状态、栈已展开。
     state_stack: Vec<CanvasState>,
+    /// 颜色矩阵滤镜（0.10.5）。**不在状态栈里**，见 `set_color_filter`。
+    color_filter: Option<amiki_scene::ColorMatrix>,
 }
 
 impl Canvas {
@@ -90,6 +92,7 @@ impl Canvas {
                 fill_rule: FillRule::NonZero,
             },
             state_stack: Vec::new(),
+            color_filter: None,
         }
     }
 
@@ -220,6 +223,7 @@ impl Canvas {
     /// `fill_path` 是它的实心便捷形式。图像等样式需要它，因为
     /// `Paint::Image` 携带放置信息，不能由路径自身推导。
     pub fn fill_path_with(&mut self, path: &Path, paint: Paint) -> &mut Self {
+        let paint = self.filtered_paint(paint);
         self.scene.push_blend(self.state.transform, path.clone(), paint, self.state.blend);
         self.stamp_fill_rule();
         if !self.state.clips.is_empty() {
@@ -269,6 +273,77 @@ impl Canvas {
         color: amiki_scene::Color,
     ) -> &mut Self {
         self.stroke_path_with(path, style, Paint::Solid(color))
+    }
+
+    /// **颜色矩阵滤镜**（0.10.5）：对**已解析的颜色**生效，不改任何着色管线。
+    ///
+    /// 传 `None` 关闭。作用范围与代价**都写在明处**：
+    ///
+    /// | 绘制类型 | 处理方式 | 代价 |
+    /// |---|---|---|
+    /// | `Paint::Solid` | 提交时变换颜色 | 无 |
+    /// | `Paint::Gradient` | 提交时变换**每个色标** | 一份渐变定义的浅拷贝 |
+    /// | `Paint::Image` | 提交时**逐像素**变换（**源图不被修改**） | 与像素数成正比 |
+    ///
+    /// 三类都处理是为了**不留静默缺口** —— 宁可付代价，也不出现"滤镜对图像不生效
+    /// 但没人告诉你"。图像很大时请自行权衡（大图逐帧过滤是真实的开销）。
+    ///
+    /// **不在 `save` / `restore` 的状态栈里**（状态栈是四项：变换 / 混合 / 裁剪 /
+    /// 填充规则）。这一点是**有意**的、也写在这里：需要"局部滤镜"请自行存取
+    /// [`Canvas::color_filter`] 的返回值。
+    ///
+    /// 变换在**提交时**发生 ⇒ CPU / GPU 两侧看到的仍是普通 `Paint`，
+    /// **不需要知道滤镜存在**（与描边轮廓化、九宫格同一个思路）。
+    pub fn set_color_filter(&mut self, m: Option<amiki_scene::ColorMatrix>) -> &mut Self {
+        self.color_filter = m;
+        self
+    }
+
+    /// 当前颜色滤镜（`None` = 未设置）。
+    pub fn color_filter(&self) -> Option<amiki_scene::ColorMatrix> {
+        self.color_filter
+    }
+
+    /// 把滤镜应用到一份 `Paint`（无滤镜时原样返回，**零拷贝**）。
+    fn filtered_paint(&self, paint: Paint) -> Paint {
+        let Some(m) = self.color_filter else {
+            return paint;
+        };
+        match paint {
+            Paint::Solid(c) => Paint::Solid(m.apply(c)),
+            Paint::Gradient(g) => {
+                let mut g2 = (*g).clone();
+                for s in &mut g2.stops {
+                    s.color = m.apply(s.color);
+                }
+                Paint::Gradient(std::sync::Arc::new(g2))
+            }
+            Paint::Image { image, placement } => {
+                // 逐像素变换；**克隆后改**，源图保持不变
+                let mut img2 = (*image).clone();
+                for px in img2.data.chunks_mut(4) {
+                    if px.len() != 4 {
+                        continue;
+                    }
+                    let c = amiki_scene::Color {
+                        r: px[0] as f32 / 255.0,
+                        g: px[1] as f32 / 255.0,
+                        b: px[2] as f32 / 255.0,
+                        a: px[3] as f32 / 255.0,
+                    };
+                    let o = m.apply(c);
+                    let to_u8 = |v: f32| (v.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+                    px[0] = to_u8(o.r);
+                    px[1] = to_u8(o.g);
+                    px[2] = to_u8(o.b);
+                    px[3] = to_u8(o.a);
+                }
+                Paint::Image {
+                    image: std::sync::Arc::new(img2),
+                    placement,
+                }
+            }
+        }
     }
 
     /// **九宫格贴图**（0.10.3）：把源图按 `insets` 切成 9 块铺满 `dst`。
@@ -487,7 +562,7 @@ impl Canvas {
         for (path, glyph_t) in paths {
             // `Paint` 非 Copy（渐变经 Arc 共享）；clone 只做一次原子加，可忽略。
             self.scene
-                .push_blend(base.then(glyph_t), path, paint.clone(), self.state.blend);
+                .push_blend(base.then(glyph_t), path, self.filtered_paint(paint.clone()), self.state.blend);
             self.stamp_fill_rule();
             if !self.state.clips.is_empty() {
                 self.scene.draws.last_mut().unwrap().clips = self.state.clips.clone();
@@ -533,7 +608,7 @@ impl Canvas {
         let paths = cache.expand(run, outline);
         for (path, glyph_t) in paths {
             self.scene
-                .push_blend(base.then(glyph_t), path, paint.clone(), self.state.blend);
+                .push_blend(base.then(glyph_t), path, self.filtered_paint(paint.clone()), self.state.blend);
             self.stamp_fill_rule();
             if !self.state.clips.is_empty() {
                 self.scene.draws.last_mut().unwrap().clips = self.state.clips.clone();
@@ -566,7 +641,7 @@ impl Canvas {
         let paths = amiki_scene::expand_text_run_with(run, outline);
         for (path, glyph_t) in paths {
             self.scene
-                .push_blend(base.then(glyph_t), path, paint.clone(), self.state.blend);
+                .push_blend(base.then(glyph_t), path, self.filtered_paint(paint.clone()), self.state.blend);
             self.stamp_fill_rule();
             if !self.state.clips.is_empty() {
                 self.scene.draws.last_mut().unwrap().clips = self.state.clips.clone();

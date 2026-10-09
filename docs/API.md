@@ -33,6 +33,7 @@
 | `Canvas::text_with_stack` | 文字 + **字体回退**（0.7.0） |
 | `Canvas::text_cached` | 文字 + **调用方持有的字形轮廓缓存**（0.10.1，见 D8） |
 | `Canvas::stroke_path_dashed` | **虚线描边**（0.10.2）：模式非法时返回 `None`，不静默画实线 |
+| `Canvas::set_color_filter` | **颜色矩阵滤镜**（0.10.5）：提交时作用于纯色 / 渐变停靠点 / 图像像素；**不在状态栈里**；`None` 关闭 |
 | `Canvas::image_nine` | **九宫格贴图**（0.10.3）：四角保持源尺寸不缩放，边/中间拉伸（见 `amiki_scene::nine_patch`） |
 | `Canvas::set_transform` / `translate` / `rotate` / `scale` / `reset` | 变换 |
 | `Canvas::set_blend` | 混合模式 |

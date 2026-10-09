@@ -430,7 +430,9 @@ Skia 侧对照：`include/codec/SkEncodedImageFormat.h` 列了 **14 种**
 **0.10.2 已做**：**虚线**（`dash_polyline` / `stroke_path_dashed` / 门面 `Canvas::stroke_path_dashed`）——
 按弧长切段后复用既有描边，端帽语义与 SVG/Skia 一致；非法模式**显式返回 `None`**。
 
-**仍未做**：**颜色矩阵滤镜**（颜色解析阶段，不需要新架构）；图像滤镜全家桶（28 → 我们 2）；
+**0.10.5 已做**：**颜色矩阵滤镜**接进画布（`Canvas::set_color_filter`，提交时作用于纯色 / 渐变停靠点 / 图像像素；未动光栅器与 WGSL）。
+
+**仍未做**：图像滤镜全家桶（28 → 我们 2）；
 路径效果里 Skia 的其余几种（`Corner` / `Discrete` / `Trim` / 1D·2D 图案）。
 
 **证据**：`docs/COMPARE_SKIA.md` 表 A-2。

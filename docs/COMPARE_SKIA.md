@@ -161,3 +161,42 @@ Select-String <skia>\include\core\SkCanvas.h -Pattern '^\s+(?:virtual\s+)?void\s
 Select-String <skia>\BUILD.gn -Pattern '^\s*(skia_enable_\w+)\s*='
 Get-Content <skia>\RELEASE_NOTES.md -TotalCount 12   # 版本锚点
 ```
+
+---
+
+## 明确不做（0.10.6 追加）：**Decal 平铺模式**
+
+**决定**：不做 ✗。**替代方案**：源矩形 / `uv` 区间（见下方"候选"）。
+
+**理由**（不是"难"，是架构代价）：Decal 的语义是"uv 落在 `[0,1]` 之外 ⇒ 采样为透明"。
+GPU 侧**没有对应的硬件地址模式**（Mirror/C Repeat 都有），只能在 WGSL 里手写
+`fract` + 透明分支 ⇒ 于是同一条规则在 **CPU 光栅器与 WGSL 各写一份** ✗ —— 这正与我们
+对外承诺的 **CPU↔GPU 逐像素一致（≤2/255）** 的代价结构相冲突，也和本项目一路避免
+"两侧各写一份"的架构选择冲突（描边轮廓化、九宫格取子图、颜色滤镜提交时变换，都是
+"让两侧不需要知道"）。
+
+**Mirror 为什么反而可以做** ✓：它两侧都只是**一条地址规则**（CPU 一行镜像映射；
+GPU 用 `mirror-repeat` 地址模式 ✓），**不存在第二份实现**。但它服务于**装饰性图案
+平铺** ✓，对嵌入式 UI 不是刚性需求 ⇒ 排期在源矩形之后（实现需 `bool → enum` 的破坏性
+变更，以 `0.11.0` 承载；C ABI 侧保留旧字段语义、新增入口 ✓）。
+
+---
+
+## 候选（已登记，未实现）：`ImagePlacement` 的**源矩形 / uv 区间**
+
+**问题**：现在 `ImagePlacement` 只能把源图 `[0,1]²` 整体映射到设备空间 ⇒
+"从 512×512 图集里取第 3 行第 2 格"办不到（只能先 `sub_image` 复制像素）。
+
+**方案**：新增 `ImagePlacement::sub_rect(src_uv_rect, dst_rect)`；uv 由源矩形算出。
+
+**为什么它是 Decal 的替代**：只画确定的 uv 区间 ⇒ **根本不存在溢出** ⇒ 不需要 Decal ✓，
+且它是**纯数据**（placement）⇒ CPU / GPU 共用同一份定义、**不需要改 WGSL** ✓。
+
+**前置条件已完成（0.10.6）**：图像采样约定已实测并固化成测试 ——
+
+```text
+texel = device / texel_px − 0.5      ⇒ texel 中心在 (i + 0.5) × texel_px
+```
+
+（`crates/amiki/tests/image_uv_convention.rs`；推论：`texel_px` 为偶数时任何整数像素
+中心都取不到 texel 中心 ⇒ 判据要用**奇数** `texel_px` 才能拿到纯色像素 ✓。）

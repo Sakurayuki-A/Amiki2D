@@ -159,6 +159,17 @@ pub struct AmikiFont {
     /// 所以 C 侧的输入缓冲用完即可释放。
     pub(crate) font: amiki_text::Font,
     pub(crate) poison: Poison,
+
+    /// **每个字体句柄自己的字形轮廓缓存**（0.10.6，解决 `KNOWN_ISSUES` 的 D8）。
+    ///
+    /// 为什么不新增"缓存句柄"：C 侧调用方给的就是 `const amiki_font*` —— 一个
+    /// **稳定的字体身份**。把缓存挂在字体上，键天然是 `(字体, 字形 id, 字号)`
+    /// ⇒ **构造上不可能把 A 字体的字形当成 B 字体的**（D8 担心的静默错误），
+    /// 而且**不需要任何新 API**：`amiki_canvas_draw_text` 自动受益。
+    ///
+    /// 用 `Mutex` 是因为绘制入口收的是 `const amiki_font*`；锁只在一次绘制期间
+    /// 持有（无竞争）。锁中毒时取回内部值继续，**不 panic**。
+    pub cache: std::sync::Mutex<amiki_scene::TextCache>,
 }
 
 /// **有序字体栈**（字体回退，0.7.0）。

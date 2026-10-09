@@ -547,7 +547,8 @@ pub extern "C" fn amiki_canvas_draw_text(
         };
         with_paint!(c, paint, |paint| {
             let font_ref = &f.font;
-            c.target().text(&run, amiki_math::Vec2::new(x, y), paint, |id| {
+            let mut cache = f.cache.lock().unwrap_or_else(|p| p.into_inner());
+                c.target().text_cached(&mut cache, &run, amiki_math::Vec2::new(x, y), paint, |id| {
                 font_ref.outline(id).ok()
             });
             AMIKI_OK
@@ -1276,7 +1277,11 @@ pub extern "C" fn amiki_font_create_from_file(
         let Ok(font) = amiki_text::Font::from_file(s) else {
             return AMIKI_ERROR_INVALID_ARGUMENT;
         };
-        let h = Box::new(AmikiFont { font, poison: Poison::default() });
+        let h = Box::new(AmikiFont {
+            font,
+            poison: Poison::default(),
+            cache: std::sync::Mutex::new(amiki_scene::TextCache::new()),
+        });
         // SAFETY: `out` 已判空
         unsafe { *out = Box::into_raw(h) };
         AMIKI_OK
@@ -1298,7 +1303,11 @@ pub extern "C" fn amiki_font_create_from_memory(
         let Ok(font) = amiki_text::Font::from_bytes(bytes) else {
             return AMIKI_ERROR_INVALID_ARGUMENT;
         };
-        let h = Box::new(AmikiFont { font, poison: Poison::default() });
+        let h = Box::new(AmikiFont {
+            font,
+            poison: Poison::default(),
+            cache: std::sync::Mutex::new(amiki_scene::TextCache::new()),
+        });
         // SAFETY: `out` 已判空
         unsafe { *out = Box::into_raw(h) };
         AMIKI_OK

@@ -676,11 +676,29 @@ fn shared_gpu_renderer() -> Result<&'static std::sync::Mutex<gpu::GpuRenderer>, 
     }
 }
 
-/// 便捷入口：GPU 渲染为 RGBA8，GPU 不可用时自动落到 CPU 引擎。
+/// GPU 路径**已验证支持的最大边长**（0.10.8）。
+///
+/// 超过它的画布会**明确回落到 CPU**，而不是静默画错。理由（实测，见
+/// `crates/amiki/tests/consistency_probe.rs`）：3840×2160 的画布，GPU 会在
+/// **`y ≥ 2048` 的横带**上给出错误像素（最差像素差 255、`>16` 的通道 19.4 万个、
+/// 错误聚集在第 128 行瓦片起 —— `2048 / TILE(16) = 128`）。
+/// 在查清并修掉那个上限之前，**宁可少用 GPU，也不输出错的像素**。
+#[cfg(feature = "gpu")]
+pub const GPU_MAX_SUPPORTED_SIDE: u32 = 2048;
+
+/// 便捷入口：GPU 渲染为 RGBA8；GPU 不可用、或画布超出**已验证范围**时回落 CPU 引擎。
 ///
 /// 渲染器是**进程级共享**的（见私有函数 `shared_gpu_renderer`）；锁只在一帧渲染期间持有。
 #[cfg(feature = "gpu")]
 pub fn render_to_rgba(canvas: &Canvas, flatten_eps: f32) -> Result<Vec<u8>, gpu::RenderError> {
+    let (w, h) = (canvas.scene.width, canvas.scene.height);
+    if w > GPU_MAX_SUPPORTED_SIDE || h > GPU_MAX_SUPPORTED_SIDE {
+        eprintln!(
+            "画布 {w}×{h} 超出 GPU 路径已验证范围（≤ {GPU_MAX_SUPPORTED_SIDE}），\
+             已知 y≥2048 会算错；使用 CPU 引擎"
+        );
+        return Ok(render_cpu(canvas, flatten_eps));
+    }
     match shared_gpu_renderer() {
         Ok(cell) => {
             // 锁中毒时取回内部值继续，不 panic（与 C ABI 的 Poison 机制同一态度）

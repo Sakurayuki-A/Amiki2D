@@ -68,6 +68,7 @@
 | **描边** | join（miter / round / bevel，含 miter limit）、cap（butt / round / square）、开放折线与闭合环 |
 | **渐变** | 线性 / 径向 / 扫描；双端逐像素一致 |
 | **位图** | 旋转 / 缩放 / 平铺（Repeat 采样器）+ **mipmap**（见 2.2 的 B4） |
+| **图像编解码**（0.10.0） | **自己读图**：PNG（含**索引色** / 1–16 位）解码 + PNG 编码 + JPEG 解码；在**可选 crate** `amiki-codec` 里 —— 核心四 crate 仍零第三方依赖 |
 | **滤镜与离屏层** | 高斯模糊（多次 ping-pong）、投影、分组不透明度；含层场景的**帧路径合成**（GPU compute 直接合成，不读回） |
 | **HDR** | `Rgba16Float` 贯穿渲染目标 / 层 / 模糊，>1.0 的值能穿过层边界存活；出口可选色调映射（见 2.2 的 B12 / B13） |
 | **增量渲染（damage region）** | 只重画脏 tile；静态界面省 **96.5%** 的 tile 着色；层的脏区经 `inflated_bounds` 传播（模糊/投影不会漏边） |
@@ -101,10 +102,10 @@
 | **多后端** | Vulkan / DX12 / GL 三个 wgpu 后端，**同一块 RTX 3050** 上全部跑通（跨厂商未验证 → A1） |
 | **性能** | 提取 **2.03 → 0.59 ms**（−71%）；冷启动 **337 → 61 ms**；帧路径三项口径：主机侧 2.2–2.8 ms / GPU pass 2.1 ms / 保护性同步读回 4.3–4.6 ms |
 | **API 稳定性** | `docs/API.md`：稳定 / 实验 / 内部三级清单 + 已知限制 + 环境变量表 |
-| **C ABI** | **84 个符号**；`verify.cmd` 一条命令核对"header 声明 = 实际导出"、C/C++ 两种包含方式、三示例产物一致、版本一致性 |
+| **C ABI** | **87 个符号**；`verify.cmd` 一条命令核对"header 声明 = 实际导出"、C/C++ 两种包含方式、三示例产物一致、版本一致性 |
 | **WASM** | 原生 WebAssembly API（不依赖 wasm-bindgen）；浏览器验证页**页内自校验 SHA-256** |
 | **dogfooding** | `window_demo` 真实窗口应用：列表视图（200 行滚动、点击选中）+ 展示页（渐变/位图/滤镜/动画真字），**中英混排正常** |
-| **工程质量** | `cargo test --workspace` **297 passed / 0 failed**；clippy 与 `cargo doc` **零警告** |
+| **工程质量** | `cargo test --workspace` **309 passed / 0 failed**；clippy 与 `cargo doc` **零警告** |
 | **代码规模** | Rust **24 618** 行 / 48 文件；WGSL **1 570** 行 / 13 文件；**8 个 crate** |
 
 ---
@@ -165,7 +166,7 @@
 
 | 项 | 证据 |
 |---|---|
-| **全工作区测试** | `cargo test --workspace` → **297 passed / 0 failed** |
+| **全工作区测试** | `cargo test --workspace` → **309 passed / 0 failed** |
 | **静态检查** | `cargo clippy --workspace --all-targets` 与 `cargo doc --workspace --no-deps` **零警告** |
 | **三后端** | Vulkan / DX12 / GL 在同一块 RTX 3050 上各跑通（`AMIKI_BACKENDS` 可指定；GL 遇位图**显式报错**而非静默画错） |
 | **GPU ↔ CPU 逐像素** | 图形、渐变、位图、滤镜、**HDR 层**、**CJK 字形**全部对拍；CJK 实测最大通道差 **1** |
@@ -210,7 +211,7 @@
 | **B14** | 并发创建 context，在**启用 Vulkan 校验层**时会崩进程 | wgpu 在 `debug_assertions` 下默认开校验层；**release 不受影响**。约束：**串行创建、并行使用**（写在 `amiki.h` 线程模型里） |
 | **B16** | `\|W\| ≥ 2` 区域的边缘覆盖率**饱和**（**既有**精度限制，0.8.0 查明） | 自相交/同向重叠路径的边缘会略"胖"：五角星实测最大偏差 **0.1387**（≈35/255）。不报错、不崩；**even-odd 不受影响**（偏差 0.0027）。严格精度场景应避免自相交路径 |
 | **B17** | **GL 后端要求 compute shader**；受限上下文（无窗口进程 / 老驱动 / 部分 ANGLE）里**根本起不来** | 0.9.1 起显式报 BACKEND_UNAVAILABLE（**修前是 PANIC** ✗）。改用 Vulkan / DX12 / CPU 引擎 |
-| **B18** | **图像编解码缺失**：不读也不写任何图像文件格式（只吃 RGBA） | 对照 Skia 的 **14 种**格式；调用方得在外部解码。处置：先做 PNG+JPEG **解码**，且必须放**可选 crate**（核心保持零依赖）。见 [COMPARE_SKIA](COMPARE_SKIA.md) A-1 |
+| **B18** | **图像编解码**：**0.10.0 部分关闭** —— 已有 PNG（含索引色/16 位取高字节）解码+编码、JPEG 解码；**仍缺** GIF/WEBP/AVIF/HEIF/JPEGXL/… 与 JPEG 编码 | 见 [COMPARE_SKIA](COMPARE_SKIA.md) A-1；已做的在可选 crate `amiki-codec`（核心保持零依赖） |
 | **B19** | 字体**只能从文件加载**（无系统字体管理） | 对照 Skia 的 10+ 个 fontmgr 后端；"列系统字体 / 按族名取"做不到 |
 | **B20** | **效果生态单薄**：图像滤镜 2/28（仅模糊、投影）、**无颜色滤镜**、**无路径效果**（虚线等） | 先补虚线 + 颜色矩阵（**都不需要新架构**），见 [COMPARE_SKIA](COMPARE_SKIA.md) A-2 |
 
@@ -251,6 +252,8 @@
 | `0.6.1` | **脏区派发修复** | 修掉 M4 起的静默错误（脏区不在原点时重算错 tile）；把并发创建 context 的崩溃查清为 **Vulkan 校验层**问题并写进 ABI |
 | `0.7.0` | **字体回退** | 有序字体栈 + 缺字策略；老 API 零破坏；C ABI 80 个符号（关闭 B15） |
 | `0.8.0` | **even-odd 填充规则** | 状态式 `set_fill_rule` + AMK1 v2 的 bit 12 + C ABI 82 个符号；实现靠**几何预处理**（覆盖率数学与 WGSL 一行未改）；顺带查明既有精度限制 B16（关闭 B5） |
+| `0.9.2` | **层只渲染自己的区域** | 层子场景按 `inflated_bounds` 渲染（2.7×），输出逐字节不变 |
+| `0.10.0` | **图像编解码** | 可选 crate `amiki-codec`：PNG（含索引色）解码/编码 + JPEG 解码；C ABI 87 符号；定调"核心零依赖 + 生态放可选 crate"（B18 部分关闭） |
 | `0.9.0` | **状态栈** | `save` / `restore` 四项状态（变换 / 混合 / 裁剪栈 / 填充规则）；深度 32、溢出下溢显式报错、层内栈独立；C ABI 84 个符号；抓修 C ABI 的 `clip_depth` / `fill_rule` 镜像漂移；登记 D5 |
 
 ### 6.2 候选下一步（**尚未决策**，按"能消除哪一类风险"分组）

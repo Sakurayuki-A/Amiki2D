@@ -208,8 +208,8 @@ extern "C" {
  * ========================================================================== */
 
 #define AMIKI_VERSION_MAJOR 0
-#define AMIKI_VERSION_MINOR 9
-#define AMIKI_VERSION_PATCH 2
+#define AMIKI_VERSION_MINOR 10
+#define AMIKI_VERSION_PATCH 0
 /** 预发布标签（正式版为空串）。**不参与数值比较**，只用于展示。 */
 #define AMIKI_VERSION_PRERELEASE "alpha"
 
@@ -887,6 +887,41 @@ AMIKI_API amiki_result amiki_path_circle(amiki_path* path, float cx, float cy, f
 AMIKI_API amiki_result amiki_image_create_rgba8(const uint8_t* pixels, uint32_t width,
                                                 uint32_t height, size_t stride,
                                                 amiki_image** out);
+
+/**
+ * **从文件加载图像**（0.10.0）。支持 **PNG** 与 **JPEG**。
+ *
+ * - **按内容判格式**（magic bytes），**不看扩展名** —— 扩展名是提示，不是事实。
+ * - PNG 覆盖：灰度 / 灰度+α / RGB / RGBA / **索引色（调色板 + tRNS）**，
+ *   位深 1/2/4/8/16（低比特按规范缩放；**16 位取高字节**，见 `docs/KNOWN_ISSUES.md` 的 B18）。
+ * - JPEG 覆盖：基线 + 渐进、灰度 / RGB（CMYK 与 12 位精度**显式报错**）。
+ * - 与 `amiki_image_create_rgba8` 一致：**默认生成 mip 链**（可用
+ *   `amiki_image_set_mipmap_mode` 关掉）。
+ * - 错误：文件读不到 ⇒ `AMIKI_ERROR_NOT_FOUND`；格式不认识 / 该格式的此项特性
+ *   不支持 ⇒ `AMIKI_ERROR_NOT_SUPPORTED`；数据坏或尺寸非法 ⇒
+ *   `AMIKI_ERROR_INVALID_ARGUMENT`。**绝不 panic、绝不静默画错。**
+ * - 尺寸上限：总像素 64M（护住"解一个 5 万×5 万的头"这种内存放大）。
+ */
+AMIKI_API amiki_result amiki_image_create_from_file(const char* utf8_path, amiki_image** out);
+
+/**
+ * **从内存加载图像**（0.10.0）。与 `amiki_image_create_from_file` 同语义。
+ *
+ * **不复制输入缓冲**：本调用返回后 `data` 即可释放。
+ */
+AMIKI_API amiki_result amiki_image_create_from_bytes(const uint8_t* data, size_t len,
+                                                     amiki_image** out);
+
+/**
+ * **把图像编码成 PNG**（0.10.0，RGBA8 无损）。
+ *
+ * - 成功时 `*out_data` 指向引擎分配的缓冲、`*out_len` 是它的长度；
+ *   **调用方必须用 `amiki_free(*out_data, *out_len)` 释放**（与其它"引擎分配"
+ *   的 API 同一套契约，见文件头的所有权约定）。
+ * - 失败时**不写出参**。
+ */
+AMIKI_API amiki_result amiki_image_encode_png(const amiki_image* image, uint8_t** out_data,
+                                              size_t* out_len);
 
 AMIKI_API void amiki_image_destroy(amiki_image* image);
 

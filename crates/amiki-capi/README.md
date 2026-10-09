@@ -182,7 +182,7 @@ crates\amiki-capi\verify.cmd
 > **这个脚本验证过有牙**：把 C 示例背景色的一个通道从 24 改成 25，
 > 第 5 项立刻失败并返回退出码 1（C 的哈希变了，C# / Node 没变）。
 
-它检查的符号数当前是 **header 声明 84 / 导出 84，无缺失**（0.9.0 新增
+它检查的符号数当前是 **header 声明 87 / 导出 87，无缺失**（0.10.0 新增图像编解码 3 个；0.9.0 新增
 `amiki_canvas_save` / `amiki_canvas_restore` 与两个状态栈错误码；
 0.8.0 新增填充规则枚举与 2 个符号；0.7.0 新增 6 个字体回退符号）。
 
@@ -206,6 +206,7 @@ C ABI **不隐藏**引擎的边界，而是把它们照实暴露：
 | B1 | GL 后端遇到位图 → 渲染返回 `AMIKI_ERROR_NOT_SUPPORTED`，**不会静默画错** |
 | B2 | 字体不支持 `.ttc` / `.woff` / `.woff2` → `AMIKI_ERROR_INVALID_ARGUMENT` |
 | ~~B5~~ | ~~只有 nonzero 填充规则~~ —— **0.8.0 已关闭**：`amiki_canvas_set_fill_rule` 支持 `AMIKI_FILL_EVENODD` |
+| B18 | 图像编解码另有缺项（GIF/WEBP/AVIF/… 与 JPEG 编码）—— **0.10.0 已能读 PNG/JPEG**：`amiki_image_create_from_file` / `_from_bytes` / `amiki_image_encode_png` |
 | **B14** | **并发创建 context**：在**启用 Vulkan 校验层**时（debug 构建默认）会崩在 `VkLayer_khronos_validation.dll`；**release 不受影响**。统一按"**串行创建、并行使用**"写。详见 header 的「线程模型」 |
 | C1 | 不支持双向文本 |
 | — | 引擎不做内部同步：一个 context 必须在**同一线程**上使用 |

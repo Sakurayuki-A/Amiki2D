@@ -13,7 +13,7 @@ name = "amiki2d"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [features]
-default = ["gpu"]
+default = ["gpu", "codec"]
 
 # GPU 路径。**WASM 构建请关掉它**：
 #
@@ -24,8 +24,17 @@ default = ["gpu"]
 # `AMIKI_ERROR_BACKEND_UNAVAILABLE` —— 都是**显式行为**，不是静默降级。
 gpu = ["dep:amiki-gpu", "dep:pollster", "amiki/gpu"]
 
+# 图像编解码（0.10.0）：PNG 解码/编码 + JPEG 解码。
+#
+# **默认开，但要能关**：native 默认带上（C 调用方随时能读图）；wasm 构建走
+# `--no-default-features`，于是**不启用 ⇒ 模块体积一分不涨**（实测编解码给 wasm
+# 带 +166 KB ~ +283 KB 量级，见 CHANGELOG 0.10.0）。注意关掉后少导出 3 个符号，
+# 而 `verify.cmd` 的"header 声明 = 实际导出"只对**默认配置**（native）负责。
+codec = ["dep:amiki-codec"]
+
 [dependencies]
 amiki = { path = "../amiki", default-features = false }
+amiki-codec = { workspace = true, optional = true }
 amiki-gpu = { workspace = true, optional = true }
 pollster = { workspace = true, optional = true }
 amiki-math = { workspace = true }

@@ -570,7 +570,7 @@ pub fn dash_polyline(pts: &[Vec2], closed: bool, pattern: &[f32]) -> Option<Vec<
             if left <= 1e-9 {
                 idx = (idx + 1) % pat.len();
                 left = pat[idx];
-                on = idx % 2 == 0;
+                on = idx.is_multiple_of(2);
                 if left <= 1e-9 {
                     continue;
                 }

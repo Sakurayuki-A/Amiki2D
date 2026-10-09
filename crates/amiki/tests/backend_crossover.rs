@@ -10,7 +10,6 @@
 //! 判据：**没有断言**。耗时数据在这里只被打印；严格判据交给独立基准。
 
 use amiki::Canvas;
-use amiki_math::Vec2;
 use amiki_scene::{Color, Paint, PathBuilder};
 
 const SIZES: [(u32, u32, &str); 4] = [

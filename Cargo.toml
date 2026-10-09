@@ -9,6 +9,7 @@ members = [
     "crates/amiki-text",
     "crates/amiki-layout",
     "crates/amiki-capi",
+    "crates/amiki-codec",
 ]
 
 [workspace.package]
@@ -27,6 +28,8 @@ amiki-math = { path = "crates/amiki-math" }
 amiki-scene = { path = "crates/amiki-scene" }
 amiki-raster = { path = "crates/amiki-raster" }
 amiki-gpu = { path = "crates/amiki-gpu" }
+# 图像编解码：**可选** crate（唯一带第三方依赖的一层）
+amiki-codec = { path = "crates/amiki-codec" }
 
 [profile.release]
 debug = true

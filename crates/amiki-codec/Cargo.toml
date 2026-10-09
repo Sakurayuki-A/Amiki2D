@@ -1,0 +1,21 @@
+[package]
+name = "amiki-codec"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Amiki2D 的图像编解码（**可选** crate：PNG 解码/编码 + JPEG 解码）"
+
+# 为什么是独立 crate（而不是塞进 amiki-scene）：
+# 四个核心 crate（math/scene/raster/layout）**零第三方依赖**是本项目的立身之本
+# （可审计、26.8k 行）。图像编解码必须带依赖，所以它单独一层：
+# 不想要的人不用它，体积与依赖树一分不涨。
+[dependencies]
+amiki-scene = { workspace = true }
+# 注意：`png` 0.17 的 feature 只有 `benchmarks` / `unstable` —— 没有叫 "png" 的
+# feature（我第一版凭印象写了 `features = ["png"]`，直接依赖解析失败）。
+png = "0.17"
+zune-jpeg = "0.4"
+
+[dev-dependencies]
+# 交叉验证用（工作区里已有）。注意：**只做参照**，不参与我们的解码实现。
+image = { workspace = true }

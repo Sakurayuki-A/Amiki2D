@@ -563,8 +563,8 @@ pub enum PollStatus {
 /// - **层场景直接同步算完**（层合成需要根图像，异步没有收益）⇒ `begin` 后第一次
 ///   `poll` 即 `Ready`。这是**有意**的，不是遗漏；
 /// - CPU 后端不走这里（它同步），所以"首帧即就绪"对调用方是统一语义。
-pub struct PendingFrame<'a> {
-    gpu: &'a GpuRenderer,
+pub struct PendingFrame {
+    gpu: std::sync::Arc<GpuRenderer>,
     /// `Some` = 已算完（层场景，或推进中出错）
     ready: Option<Result<Vec<u8>, RenderError>>,
     /// `Some` = 还在飞：在飞回读 + 最终要用的色调映射
@@ -573,23 +573,27 @@ pub struct PendingFrame<'a> {
 
 impl GpuRenderer {
     /// 提交一帧，**不等待**（等价 `begin_with(..., ToneMap::Raw, 0.0)`）。
-    pub fn begin(&self, scene: &Scene, eps: f32) -> Result<PendingFrame<'_>, RenderError> {
+    pub fn begin(
+        self: &std::sync::Arc<Self>,
+        scene: &Scene,
+        eps: f32,
+    ) -> Result<PendingFrame, RenderError> {
         self.begin_with(scene, eps, amiki_scene::ToneMap::Raw, 0.0)
     }
 
     /// 提交一帧，**不等待**；返回在飞句柄，何时 `poll` / `try_read` 由调用方决定。
     pub fn begin_with(
-        &self,
+        self: &std::sync::Arc<Self>,
         scene: &Scene,
         eps: f32,
         tone: amiki_scene::ToneMap,
         mip_bias: f32,
-    ) -> Result<PendingFrame<'_>, RenderError> {
+    ) -> Result<PendingFrame, RenderError> {
         if !scene.layers.is_empty() {
             // 层合成需要**根图像**（每层要合成回它）⇒ 异步在这里没有收益，
             // 直接同步算完并放进 `ready`。文档已写明，不是静默降级。
             return Ok(PendingFrame {
-                gpu: self,
+                gpu: std::sync::Arc::clone(self),
                 ready: Some(self.render_blocking_with(scene, eps, tone, mip_bias)),
                 pending: None,
             });
@@ -599,11 +603,15 @@ impl GpuRenderer {
         self.run_pipeline(&frame.scene, &tex, false, &frame.clip_views, None)?;
         // 拷贝 + map_async 都已提交；这里**不等**。
         let (p, _) = self.begin_read_raw(&tex, 8)?;
-        Ok(PendingFrame { gpu: self, ready: None, pending: Some((p, tone)) })
+        Ok(PendingFrame {
+            gpu: std::sync::Arc::clone(self),
+            ready: None,
+            pending: Some((p, tone)),
+        })
     }
 }
 
-impl PendingFrame<'_> {
+impl PendingFrame {
     /// 非阻塞推进一次。
     pub fn poll(&mut self) -> PollStatus {
         if self.ready.is_some() {

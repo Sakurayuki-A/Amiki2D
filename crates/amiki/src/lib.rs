@@ -713,10 +713,13 @@ pub fn render_to_rgba(canvas: &Canvas, flatten_eps: f32) -> Result<Vec<u8>, gpu:
 /// 两种形态：`Gpu` 是真正在飞的帧；`Cpu` 是**已经算好**的结果 —— 当画布超出
 /// GPU 已验证范围、或 GPU 不可用时，异步入口与同步入口做出**同样的选择**（回落 CPU），
 /// 于是 `Cpu` 恒为"首帧即就绪"。
+///
+/// `Cpu` 里是 `Option`：**结果被取走之后就是 `None`** —— 这样"再取一次"得到
+/// `None`（还没好 / 已经取走），而不是一张**零字节的图**（后者会被当成一张合法的空图）。
 #[cfg(feature = "gpu")]
 pub enum PendingRender {
     Gpu(gpu::PendingFrame),
-    Cpu(Vec<u8>),
+    Cpu(Option<Vec<u8>>),
 }
 
 #[cfg(feature = "gpu")]
@@ -729,12 +732,22 @@ impl PendingRender {
         }
     }
 
-    /// 就绪则取值；未就绪返回 `None`（**不返回半成品**）。
-    pub fn try_read(self) -> Option<Result<Vec<u8>, gpu::RenderError>> {
+    /// **就绪则取走**（`&mut self`）：未就绪（或已经取走）返回 `None`，
+    /// 且**什么都不动**（可以继续 `poll`）。
+    ///
+    /// C ABI 的 `amiki_canvas_try_read_render_rgba8` 无法"消费掉"一个还没取到的帧
+    /// （C 侧没有所有权可表达），所以它要求"取不到不算数"。
+    pub fn take_ready(&mut self) -> Option<Result<Vec<u8>, gpu::RenderError>> {
         match self {
-            PendingRender::Gpu(f) => f.try_read(),
-            PendingRender::Cpu(v) => Some(Ok(v)),
+            PendingRender::Gpu(f) => f.take_ready(),
+            PendingRender::Cpu(v) => v.take().map(Ok),
         }
+    }
+
+    /// 取值（**消费句柄**）：就绪则取走；未就绪返回 `None`，在飞的那一帧被丢弃 ——
+    /// 调用方已经放弃它了。想要"取不到还能接着问"用 [`Self::take_ready`]。
+    pub fn try_read(mut self) -> Option<Result<Vec<u8>, gpu::RenderError>> {
+        self.take_ready()
     }
 }
 
@@ -752,13 +765,13 @@ pub fn begin_render_to_rgba(
         eprintln!(
             "画布 {w}×{h} 超出 GPU 路径已验证范围（≤ {GPU_MAX_SUPPORTED_SIDE}）；使用 CPU 引擎"
         );
-        return Ok(PendingRender::Cpu(render_cpu(canvas, flatten_eps)));
+        return Ok(PendingRender::Cpu(Some(render_cpu(canvas, flatten_eps))));
     }
     match shared_gpu_renderer() {
         Ok(r) => Ok(PendingRender::Gpu(r.begin(&canvas.scene, flatten_eps)?)),
         Err(msg) => {
             eprintln!("GPU 不可用（{msg}），使用 CPU 引擎");
-            Ok(PendingRender::Cpu(render_cpu(canvas, flatten_eps)))
+            Ok(PendingRender::Cpu(Some(render_cpu(canvas, flatten_eps))))
         }
     }
 }

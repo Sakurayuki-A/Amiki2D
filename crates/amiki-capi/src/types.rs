@@ -33,6 +33,11 @@ pub const AMIKI_ERROR_NOT_FOUND: i32 = 7;
 pub const AMIKI_ERROR_STACK_OVERFLOW: i32 = 8;
 /// 0.9.0 新增：状态栈为空（`amiki_canvas_restore`）。
 pub const AMIKI_ERROR_STACK_UNDERFLOW: i32 = 9;
+/// 0.10.9 新增：异步渲染的**在飞帧还没算完**。
+///
+/// 只有 `amiki_canvas_try_read_render_rgba8` 会返回它，且**不写入任何字节** ——
+/// 它不是失败，是"过一会儿再问"。同步入口永远不会返回它。
+pub const AMIKI_ERROR_BUSY: i32 = 10;
 
 /// 门面的状态栈错误 → C 错误码（0.9.0）。
 pub(crate) fn canvas_error_to_i32(e: amiki::CanvasError) -> i32 {
@@ -57,6 +62,7 @@ pub(crate) fn result_message(r: i32) -> &'static std::ffi::CStr {
         AMIKI_ERROR_NOT_FOUND => c"not found in this font stack",
         AMIKI_ERROR_STACK_OVERFLOW => c"state stack overflow (missing restore)",
         AMIKI_ERROR_STACK_UNDERFLOW => c"state stack underflow (restore without save)",
+        AMIKI_ERROR_BUSY => c"render not ready yet (poll again)",
         // 给出比 "unknown" 更有用的信息：调用方看到它就知道"引擎报了个未分类错误"，
         // 而 "unknown" 只留给**越界的错误码**（那是调用方自己的 bug）。
         AMIKI_ERROR_UNKNOWN => c"unspecified engine error",

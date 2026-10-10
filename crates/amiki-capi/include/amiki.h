@@ -45,7 +45,7 @@
  *
  * ### 哪些函数「不」返回 `amiki_result`
  *
- * 68 个导出里有 42 个返回 `amiki_result`。其余 26 个**都不可能失败**，
+ * 90 个导出里有 57 个返回 `amiki_result`。其余 33 个**都不可能失败**，
  * 分三类 —— 这条规则是刻意的，不是遗漏：
  *
  * 1. **`_destroy`**（返回 `void`）：销毁空指针是合法空操作，没有失败态。
@@ -93,6 +93,7 @@
  * 6. **输出缓冲由调用方提供**：`amiki_canvas_render_rgba8` 写入你给的
  *    `out`/`out_len`（RGBA8、行序从上到下、**非预乘** alpha），
  *    长度不足则返回 `AMIKI_ERROR_INVALID_ARGUMENT` 且不写入任何字节。
+ *    异步的 `amiki_canvas_try_read_render_rgba8` 是同一套约定（含"长度不足不写字节"）。
  *
  * 7. **字符串**一律 UTF-8。带 `\0` 结尾的用 `const char*`；
  *    文本绘制用 `utf8` + `utf8_len` 显式长度，因此可以含 `\0`。
@@ -273,7 +274,16 @@ typedef enum amiki_result {
      * `amiki_canvas_restore` 在没有配对的 `save` 时返回它 ——
      * **不静默 no-op**，因为多 restore 一次是实实在在的 bug。
      */
-    AMIKI_ERROR_STACK_UNDERFLOW = 9
+    AMIKI_ERROR_STACK_UNDERFLOW = 9,
+    /**
+     * **0.10.9 新增**：异步渲染提交的那一帧**还没算完**
+     * （只有 `amiki_canvas_try_read_render_rgba8` 会返回它）。
+     *
+     * 它**不是失败**，是"过一会儿再问"：继续 `amiki_canvas_poll_render_rgba8`，
+     * 或稍后再 `try_read`。返回它时**一个字节都不会写**，那一帧也**留在原地**
+     * （还能接着问）。同步入口 `amiki_canvas_render_rgba8` 永远不会返回它。
+     */
+    AMIKI_ERROR_BUSY = 10
 } amiki_result;
 
 /** 人类可读的说明（静态字符串，不可释放）。越界值返回 `"unknown"`。 */
@@ -829,6 +839,14 @@ AMIKI_API amiki_result amiki_canvas_end_layer(amiki_canvas* canvas);
  *
  * 长度不足返回 `AMIKI_ERROR_INVALID_ARGUMENT` 且**不写入任何字节**。
  *
+ * ## 超出 GPU 已验证范围的画布：回落 CPU
+ *
+ * GPU 路径在 **`y ≥ 2048`** 会**静默算错**（实测最差像素差 255，见
+ * `docs/KNOWN_ISSUES.md` 与 `amiki::GPU_MAX_SUPPORTED_SIDE`）。所以宽或高超过
+ * **2048** 的画布，**即使 context 选的是 GPU 后端**，也会明确**回落到 CPU 引擎**
+ * 并在 stderr 打印原因 —— 输出永远正确，代价是慢一些。
+ * 异步入口 `amiki_canvas_begin_render_rgba8` 做**同一个判断**。
+ *
  * ## 与 OpenGL 宿主共存时的性能特征（嵌入式集成反馈 P3）
  *
  * 这是**同步**调用：GPU 后端会提交、等待、再把结果读回 CPU（保护性读回，
@@ -840,11 +858,84 @@ AMIKI_API amiki_result amiki_canvas_end_layer(amiki_canvas* canvas);
  * - **多块小画布 + 只在内容变化时重渲染**（嵌入式 UI 的常见做法）能摊销这笔成本；
  * - 游戏内若不走 GPU 的收益不明显，直接用 **CPU 后端**（`AMIKI_BACKEND_CPU`）
  *   反而是更稳的选择 —— 它不涉及任何跨 API 同步；
- * - 目前**没有**异步接口（`begin` / `poll` / `try_read` 分离）。
- *   需要"提交与读回分到不同帧"的宿主，暂时只能在应用层错帧调度。
+ * - **0.10.9 起另有异步接口**：`amiki_canvas_begin_render_rgba8` +
+ *   `amiki_canvas_poll_render_rgba8` + `amiki_canvas_try_read_render_rgba8`，
+ *   把"提交"与"读回"分到不同帧（见下面三节）。本函数**一行没变**。
  */
 AMIKI_API amiki_result amiki_canvas_render_rgba8(amiki_canvas* canvas, uint8_t* out,
                                                  size_t out_len);
+
+/* ---- 输出：异步三入口（0.10.9 新增）---- */
+
+/**
+ * **提交一帧、立即返回**。之后用 `poll` 问就绪、`try_read` 取值。
+ *
+ * 与 `amiki_canvas_render_rgba8` 是**同一个引擎、同一套前置判断**，所以两条入口的
+ * 产物**逐字节相同**（无 GPU、超范围回落 CPU、正常 GPU 三种情形都是）。
+ * 区别只在"什么时候等"：同步入口在调用里等完读回，异步入口把读回留给调用方
+ * 在**合适的时机**去问（例如已经不再持锁、或换到下一帧）。
+ *
+ * 典型用法 —— 把同步读回摊到两帧：
+ *
+ *     amiki_canvas_begin_render_rgba8(cv);            // 本帧：只提交
+ *     ... 去做别的事 ...
+ *     int32_t ready = 0;
+ *     amiki_canvas_poll_render_rgba8(cv, &ready);     // 稍后：非阻塞地问
+ *     if (ready) {
+ *         amiki_canvas_try_read_render_rgba8(cv, px, len);   // 取走（帧自动释放）
+ *     }
+ *
+ * ## 语义（写死在这里，实现与测试都照此）
+ *
+ * - 在飞帧是**提交那一刻场景的快照**：提交之后再改画布不影响它；
+ * - **CPU 分支首帧即就绪**：CPU 后端、以及 GPU 超出已验证范围而回落 CPU 的情形，
+ *   在 `begin` 里就已经算完 ⇒ 第一次 `poll` 就是 ready，`try_read` 立刻能取。
+ *   这**不是遗漏** —— CPU 本来就没有"在飞"可言，统一语义比"假装在飞"好；
+ * - **重复 begin 是允许的**：上一个还没取走的帧被丢弃（它只是一次还没算完的计算）。
+ *   这样"不想等了"不需要再来一个 cancel 接口；
+ * - 打开中的层没配对的 `amiki_canvas_end_layer` ⇒ `AMIKI_ERROR_INVALID_ARGUMENT`
+ *   （与同步入口同一条理由：直接渲染会静默丢掉那些绘制）；
+ * - 提交阶段就失败（准备 / 派发）**立刻**报错，**不装作"在飞"**再让 `try_read` 报；
+ * - 一帧**只需要 `width * height * 4` 字节**，取走即释放；结果一直挂在这个
+ *   `amiki_canvas` 上，所以**没有新的句柄，也就没有"忘了销毁"这种泄漏路径**；
+ * - `amiki_canvas_clear` 会把在飞的那一帧一起丢掉（它算的是清空**之前**的内容）。
+ *
+ * ## 线程
+ *
+ * 与画布其余操作同一约束：**同一个线程**（引擎不做内部同步，见「线程模型」）。
+ */
+AMIKI_API amiki_result amiki_canvas_begin_render_rgba8(amiki_canvas* canvas);
+
+/**
+ * **非阻塞地问一次：在飞的那一帧算完了吗**。
+ *
+ * 写入 `*out_ready`：非 0 = 可以 `try_read` 了；**0 = 还没好**。
+ * 注意 **0 不是错误** —— 它是"过一会儿再问"，这正是异步接口存在的理由。
+ * `out_ready` **不可为 NULL**（"算完没有"就是这次调用的全部意义）；
+ * 失败时**不写** `*out_ready`。
+ *
+ * 没 `begin` 就调用 ⇒ `AMIKI_ERROR_INVALID_ARGUMENT`：**不假装已就绪**
+ * （那会让调用方去读一个不存在的帧），与 `restore` 多于 `save` 同一类处理。
+ */
+AMIKI_API amiki_result amiki_canvas_poll_render_rgba8(amiki_canvas* canvas,
+                                                      int32_t* out_ready);
+
+/**
+ * **就绪则取值**：写入 `out`（长度至少 `width * height * 4`；行序、alpha 约定与
+ * 同步入口完全相同），并**消费掉这一帧**。
+ *
+ * | 情况 | 返回 | `out` 写入 | 那一帧 |
+ * |---|---|---|---|
+ * | 已就绪 | `AMIKI_OK` | `width*height*4` 字节 | 消费掉（之后再 `poll` 会报"没提交过"） |
+ * | 还没好 | `AMIKI_ERROR_BUSY` | **一个字节都不写** | **留在原地**（可以继续 `poll` / 再 `try_read`） |
+ * | `out_len` 不足 | `AMIKI_ERROR_INVALID_ARGUMENT` | 一个字节都不写 | **不被消费**（补够长度就能取） |
+ * | 没 `begin` 过 | `AMIKI_ERROR_INVALID_ARGUMENT` | 一个字节都不写 | — |
+ * | 取值阶段 GPU 出错 | `AMIKI_ERROR_NOT_SUPPORTED` / `AMIKI_ERROR_UNKNOWN` | 一个字节都不写 | 消费掉（错误是终局的，要重来就重新 `begin`） |
+ *
+ * 最后两行是"绝不静默出错"的落地：**宁可不给图，也不给半张图**。
+ */
+AMIKI_API amiki_result amiki_canvas_try_read_render_rgba8(amiki_canvas* canvas, uint8_t* out,
+                                                          size_t out_len);
 
 /** 压平容差（设备像素，默认 0.1）。越小曲线越精确、越慢。 */
 AMIKI_API amiki_result amiki_canvas_set_flatten_tolerance(amiki_canvas* canvas, float eps);

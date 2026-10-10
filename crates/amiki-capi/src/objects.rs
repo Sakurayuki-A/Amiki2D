@@ -53,11 +53,15 @@ impl Poison {
 ///
 /// 这一点是 C ABI 相对 `amiki::render_to_rgba` 的关键改进：后者每次都
 /// `GpuRenderer::new()`（实测冷启动约 61 ms），逐帧调用会让它成为主要开销。
+///
+/// 0.10.9 起用 `Arc` 而不是 `Box`：异步入口要调
+/// `GpuRenderer::begin_with(self: &Arc<Self>, ...)`（在飞帧自己持一份渲染器引用，
+/// 于是它没有生命周期、可以放进画布状态里）。
 pub(crate) enum Backend {
     /// wgpu 后端。`gpu` feature 关掉时**这个变体不存在** ——
     /// 于是"误用 GPU"会变成**编译错误**而不是运行时错误。
     #[cfg(feature = "gpu")]
-    Gpu(Box<amiki_gpu::GpuRenderer>),
+    Gpu(Arc<amiki_gpu::GpuRenderer>),
     /// CPU 引擎（`amiki-raster`）。**零第三方依赖**，因此 wasm32 上也能跑。
     Cpu,
 }
@@ -107,7 +111,25 @@ pub struct AmikiCanvas {
     /// 填充规则（`amiki_canvas_set_fill_rule`，0.8.0）。状态式、粘性：
     /// 影响**后续**填充，直到再次设置。默认 `NonZero`。
     pub(crate) fill_rule: amiki_scene::FillRule,
+    /// **在飞的那一帧**（异步入口，P3 第 ③b 步）。`None` = 没有提交过 / 已经取走。
+    ///
+    /// 挂在画布上而不是做成新的不透明句柄：C 侧没有所有权语义，多一个句柄就要多一个
+    /// `_destroy`（符号 +1，且忘了销毁就是泄漏）。取完自动清空，**没有泄漏路径**。
+    pub(crate) pending: Option<PendingCanvasRender>,
     pub(crate) poison: Poison,
+}
+
+/// 异步渲染提交后**在飞的那一帧**（P3 第 ③b 步，C ABI 侧的状态）。
+///
+/// 与 `amiki::PendingRender` 的区别：这里的 CPU 分支带上画布自己的**色调映射**
+/// 与 **mip bias**，与同步入口 `amiki_canvas_render_rgba8` 用的是同一份实现 ——
+/// "两条入口逐字节相同"这条承诺的根据就在这里。
+pub(crate) enum PendingCanvasRender {
+    /// **已经算好**（CPU 后端；或 GPU 超出已验证范围而回落 CPU）⇒ 首帧即就绪。
+    Ready(Vec<u8>),
+    /// GPU 上真在飞。`PendingFrame` 自己持 `Arc<GpuRenderer>`，所以无生命周期参数。
+    #[cfg(feature = "gpu")]
+    InFlight(amiki_gpu::PendingFrame),
 }
 
 impl AmikiCanvas {
@@ -129,6 +151,8 @@ impl AmikiCanvas {
         self.mip_bias = 0.0;
         self.fill_rule = amiki_scene::FillRule::NonZero;
         self.root.set_fill_rule(amiki_scene::FillRule::NonZero);
+        // 清空画布 = 连在飞的那一帧一起丢（它算的是旧内容，留着只会让调用方取到过期像素）
+        self.pending = None;
         self.poison = Poison::default();
     }
 }

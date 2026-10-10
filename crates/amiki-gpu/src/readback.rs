@@ -70,18 +70,10 @@ impl GpuRenderer {
             WaitMode::Polling => self.device.poll(wgpu::PollType::Poll),
         };
         polled.map_err(|e| RenderError(format!("poll 失败: {e}")))?;
-        if p.got.is_none() {
-            match p.rx.try_recv() {
-                Ok(r) => p.got = Some(r),
-                Err(std::sync::mpsc::TryRecvError::Empty) => return Ok(false),
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                    return Err(RenderError("map 回调通道关闭".into()));
-                }
-            }
-        }
-        match &p.got {
+        // 回调结果的判断只有一份实现（`map_outcome`）—— 同步与异步都走它。
+        match p.map_outcome() {
             Some(Ok(())) => Ok(true),
-            Some(Err(e)) => Err(RenderError(format!("map 失败: {e}"))),
+            Some(Err(msg)) => Err(RenderError(msg)),
             None => Ok(false),
         }
     }
@@ -259,6 +251,46 @@ pub(crate) struct PendingRead {
     got: Option<Result<(), wgpu::BufferAsyncError>>,
     byte_size: usize,
     strip: Option<(usize, usize, u32)>,
+}
+
+impl PendingRead {
+    /// 问一次 map 回调的结果：**不 `device.poll`**，也不消耗已记下的结果（可反复问）。
+    ///
+    /// - `None` = 还在飞；
+    /// - `Some(Ok(()))` = **缓冲确实已映射**，可以 `finish_read`；
+    /// - `Some(Err(msg))` = 映射失败或回调通道关闭（错误不吞）。
+    ///
+    /// # 为什么必须由它来判断"能不能取值"
+    ///
+    /// 在**未映射**的 `wgpu::Buffer` 上调 `get_mapped_range` 会 panic（wgpu 的契约）。
+    /// 而 `rx` 里能收到消息 ⇒ 回调已经跑过 ⇒ 映射已完成（回调是 `device.poll`
+    /// 内部触发的）。所以"先问 `map_outcome`，拿到 `Some(Ok(()))` 才取值"是
+    /// `try_read` 不 panic 的**根据**，不是防御性代码。
+    ///
+    /// # 为什么结果要留着而不是 `take` 走
+    ///
+    /// 回调跑完之后 `tx` 会被析构 ⇒ 同一个通道**再** `try_recv` 得到的是
+    /// `Disconnected`。若把结果 take 走，第二次问就会把"已经完成了"读成
+    /// "通道关闭"（我在 C ABI 上踩到过：`poll` 问过一次 Ready，`try_read`
+    /// 再问一次就报错）。所以这里只**看**，不拿走。
+    pub(crate) fn map_outcome(&mut self) -> Option<Result<(), String>> {
+        if self.got.is_none() {
+            match self.rx.try_recv() {
+                Ok(r) => self.got = Some(r),
+                Err(std::sync::mpsc::TryRecvError::Empty) => return None,
+                // 记下的结果里没有成功/失败，而发送端已经没了 ⇒ 回调**从来没跑过**。
+                // 这是真的出事了，必须报出去（不能装作"还在飞"，那会变成永久 Pending）。
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    return Some(Err("map 回调通道关闭".into()));
+                }
+            }
+        }
+        match &self.got {
+            Some(Ok(())) => Some(Ok(())),
+            Some(Err(e)) => Some(Err(format!("map 失败: {e}"))),
+            None => None,
+        }
+    }
 }
 
 /// 等待策略：同步用 `Blocking`（一次 `Wait`，不忙等），异步用 `Polling`（立即返回）。

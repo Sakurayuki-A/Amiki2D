@@ -107,10 +107,10 @@
 | **多后端** | Vulkan / DX12 / GL 三个 wgpu 后端，**同一块 RTX 3050** 上全部跑通（跨厂商未验证 → A1） |
 | **性能** | 提取 **2.03 → 0.59 ms**（−71%）；冷启动 **337 → 61 ms**；帧路径三项口径：主机侧 2.2–2.8 ms / GPU pass 2.1 ms / 保护性同步读回 4.3–4.6 ms |
 | **API 稳定性** | `docs/API.md`：稳定 / 实验 / 内部三级清单 + 已知限制 + 环境变量表 |
-| **C ABI** | **87 个符号**；`verify.cmd` 一条命令核对"header 声明 = 实际导出"、C/C++ 两种包含方式、三示例产物一致、版本一致性 |
+| **C ABI** | **90 个符号**（0.10.9 起含异步三入口 `amiki_canvas_begin/poll/try_read_render_rgba8`）；`verify.cmd` 一条命令核对"header 声明 = 实际导出"、C/C++ 两种包含方式、三示例产物一致、版本一致性 |
 | **WASM** | 原生 WebAssembly API（不依赖 wasm-bindgen）；浏览器验证页**页内自校验 SHA-256** |
 | **dogfooding** | `window_demo` 真实窗口应用：列表视图（200 行滚动、点击选中）+ 展示页（渐变/位图/滤镜/动画真字），**中英混排正常** |
-| **工程质量** | `cargo test --workspace` **345 passed / 0 failed**；clippy 与 `cargo doc` **零警告** |
+| **工程质量** | `cargo test --workspace` **358 passed / 0 failed**；clippy 与 `cargo doc` **零警告** |
 | **代码规模** | Rust **24 618** 行 / 48 文件；WGSL **1 570** 行 / 13 文件；**8 个 crate** |
 
 ---

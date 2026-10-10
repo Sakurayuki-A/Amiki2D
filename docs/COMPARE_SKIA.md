@@ -102,7 +102,7 @@ svg 4 · xps 4 · lazy 3 · android 4
 
 | 项 | 我们 | Skia | 证据 |
 |---|---|---|---|
-| **跨语言 C ABI** | 手写 `amiki.h`（**84 符号**，所有权/线程模型/错误模型写清），C/C#/Node 三示例产物**逐字节一致** | **`include/c/` 已从 main 移除**（`sk_canvas.h` 不存在）⇒ 跨语言只能走 C++ 或各语言自建绑定 | 在快照里搜 `sk_canvas.h` = 无 |
+| **跨语言 C ABI** | 手写 `amiki.h`（**90 符号**，所有权/线程模型/错误模型写清；0.10.9 起含 `begin`/`poll`/`try_read` 异步渲染），C/C#/Node 三示例产物**逐字节一致** | **`include/c/` 已从 main 移除**（`sk_canvas.h` 不存在）⇒ 跨语言只能走 C++ 或各语言自建绑定 | 在快照里搜 `sk_canvas.h` = 无 |
 | **CPU↔GPU 逐像素一致承诺** | ≤2/255（实测多为 0–1）；稀疏↔稠密**逐字节一致** | **不承诺** CPU 与 GPU 输出一致（后端不同即结果不同） | 我们的对拍设施 + `VERIFY.md` |
 | **二进制流格式有兼容承诺** | AMK1 v1/v2：v1 只解不编、未知版本**显式报错**、`docs/AMK1.md` 写明每个 bit | `.skp`（SkPicture）**明确不保证跨版本兼容** | 我们 `docs/AMK1.md` |
 | **WASM 体量** | **987.9 KB**（纯 CPU，与原生字节一致） | CanvasKit（`modules/canvaskit` 149 文件）是 **MB 级**，且需要 WebGL/WebGPU 才有意义 | 两边构建选项对照 |

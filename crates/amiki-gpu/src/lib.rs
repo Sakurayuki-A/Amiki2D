@@ -543,11 +543,6 @@ fn composite_layer_gpu(
     }
 }
 
-    /// 校验脏区与画布 tile 尺寸一致。///
-/// `Damage` 用的是它自己的画布 tile 数，而派发范围按当前场景的 tile 数钳制。
-/// 若两者不一致（例如调用方复用了为不同尺寸画布建的 `Damage`），
-/// "全脏"会被误判成"只脏左上角"，从而**静默留下陈旧像素**。
-/// 这类错误必须炸出来，不能靠钳制掩盖。
 /// 一帧的推进状态（P3 第 ② 步）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PollStatus {
@@ -558,8 +553,10 @@ pub enum PollStatus {
 /// **在飞的一帧**（P3 第 ② 步）：`begin` 之后它已在 GPU 上跑，`poll` 不阻塞。
 ///
 /// 语义（写死在文档里，C ABI 也照此）：
-/// - `poll()` 非阻塞、可反复调用；`Ready` 之后才可 `try_read()`；
-/// - `try_read()` 未就绪返回 `None`，**绝不返回半成品**；
+/// - `poll()` 非阻塞、可反复调用（`Polling` 单次实测 0.071 ms）；
+/// - `try_read()` **只取值、不推进**：回调还没跑过就返回 `None`，句柄留在原地，
+///   调用方可以继续 `poll` —— 所以它**既不返回半成品，也不 panic**
+///   （未映射的缓冲上取像素是 wgpu 明确会 panic 的用法）；
 /// - **层场景直接同步算完**（层合成需要根图像，异步没有收益）⇒ `begin` 后第一次
 ///   `poll` 即 `Ready`。这是**有意**的，不是遗漏；
 /// - CPU 后端不走这里（它同步），所以"首帧即就绪"对调用方是统一语义。
@@ -632,16 +629,46 @@ impl PendingFrame {
         }
     }
 
-    /// 就绪则取值；未就绪返回 `None`（**不返回半成品**）。
-    pub fn try_read(mut self) -> Option<Result<Vec<u8>, RenderError>> {
+    /// **就绪则取走**（`&mut self`）：未就绪返回 `None`，且**这一帧什么都不动**
+    /// （还能继续 `poll`、再取）。
+    ///
+    /// 判据是 `device.poll` **有没有把 map 回调跑过**（`PendingRead::map_outcome`）：
+    /// 未映射的缓冲上取像素是 wgpu 明确会 panic 的用法，所以"先问再取"不是防御性
+    /// 代码，而是**唯一正确**的顺序。
+    ///
+    /// C ABI 的三入口走这条 —— 它需要"取不到不算数"（未就绪 ⇒ `AMIKI_ERROR_BUSY`，
+    /// 帧还在，调用方可以接着问）。
+    pub fn take_ready(&mut self) -> Option<Result<Vec<u8>, RenderError>> {
         if let Some(r) = self.ready.take() {
             return Some(r);
         }
-        let (p, tone) = self.pending.take()?;
-        Some(self.gpu.finish_read_f32(p).map(|px| rgba8_from_f32_with(&px, tone)))
+        let (mut p, tone) = self.pending.take()?;
+        match p.map_outcome() {
+            Some(Ok(())) => {
+                Some(self.gpu.finish_read_f32(p).map(|px| rgba8_from_f32_with(&px, tone)))
+            }
+            Some(Err(msg)) => Some(Err(RenderError(msg))),
+            None => {
+                // 还在飞：原样放回，**不消费**这次提交
+                self.pending = Some((p, tone));
+                None
+            }
+        }
+    }
+
+    /// 取值（**消费句柄**）：就绪则取走；未就绪返回 `None`，句柄连同在飞的回读
+    /// 一起被丢弃 —— 调用方已经放弃它了。想要"取不到还能接着问"用 [`Self::take_ready`]。
+    pub fn try_read(mut self) -> Option<Result<Vec<u8>, RenderError>> {
+        self.take_ready()
     }
 }
 
+/// 校验脏区与画布 tile 尺寸一致。
+///
+/// `Damage` 用的是它自己的画布 tile 数，而派发范围按当前场景的 tile 数钳制。
+/// 若两者不一致（例如调用方复用了为不同尺寸画布建的 `Damage`），
+/// "全脏"会被误判成"只脏左上角"，从而**静默留下陈旧像素**。
+/// 这类错误必须炸出来，不能靠钳制掩盖。
 fn check_damage_bounds(damage: Option<&amiki_scene::Damage>, tiles_x: u32, tiles_y: u32) {
     if let Some(d) = damage {
         assert_eq!(

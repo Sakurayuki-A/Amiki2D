@@ -58,3 +58,28 @@ fn cpu_branch_is_ready_on_first_poll() {
     assert_eq!(got.len(), 8 * 2049 * 4);
     eprintln!("CPU 分支：首帧即 Ready，{} 字节", got.len());
 }
+
+/// 判据 3（0.10.9）：`take_ready` **取不到不算数** —— 未就绪时返回 `None`
+/// 且那一帧留在原地，轮询到就绪后仍能取到同一张图；取走之后再取得到 `None`
+/// （**不能是一张零字节的"合法空图"**）。
+///
+/// C ABI 的三入口就建立在这条语义上（见 `amiki_canvas_try_read_render_rgba8`）。
+#[test]
+fn take_ready_does_not_consume_a_frame_that_is_not_ready() {
+    let c = scene();
+    let sync = amiki::render_to_rgba(&c, 0.05).expect("同步渲染");
+    let mut pending = amiki::begin_render_to_rgba(&c, 0.05).expect("begin");
+
+    let mut misses = 0u32;
+    let got = loop {
+        if let Some(r) = pending.take_ready() {
+            break r.expect("无错误");
+        }
+        misses += 1;
+        assert!(misses < 200_000, "map 回调一直没触发");
+        let _ = pending.poll();
+    };
+    assert_eq!(got, sync, "取不到不算数的路径也必须给出同一张图");
+    assert!(pending.take_ready().is_none(), "取走之后应当得到 None");
+    eprintln!("take_ready：未就绪 {misses} 次后取到，与同步逐字节相同");
+}

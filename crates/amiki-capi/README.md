@@ -69,6 +69,24 @@ amiki_font_destroy(cjk);
 `AMIKI_MISSING_GLYPH_NOTDEF` / `AMIKI_MISSING_GLYPH_SKIP`
 （默认值见 `amiki_text_options_default()`）。
 
+**异步渲染**（0.10.9）：把"提交"与"读回"分到不同帧 —— 适合"持有 GL 上下文时
+每帧固定 ~20 ms 同步停顿"的宿主（见 header 里 `amiki_canvas_render_rgba8` 一节）：
+
+```c
+amiki_canvas_begin_render_rgba8(cv);          /* 本帧：只提交，立即返回 */
+/* ... 去做别的事 / 等下一帧 ... */
+
+int32_t ready = 0;
+amiki_canvas_poll_render_rgba8(cv, &ready);   /* 非阻塞；0 = 还没好，不是错误 */
+if (ready) {
+    /* 取走并释放这一帧；未就绪会返回 AMIKI_ERROR_BUSY 且不写任何字节 */
+    amiki_canvas_try_read_render_rgba8(cv, px, n);
+}
+```
+
+产物与同步入口 **逐字节相同**（同一套前置判断 + 同一份 CPU 实现）；
+CPU 后端与"超范围回落 CPU"的情形**首帧即就绪**。
+
 编译（Windows）：
 ```
 cl /utf-8 /W4 your_app.c /link amiki2d.dll.lib
@@ -154,6 +172,9 @@ cargo test -p amiki-capi
 - **位图与渐变可以在绘制后立刻销毁**（header 所有权第 4 条的实测）
 - 层没配平就渲染 → 显式拒绝（否则会静默丢掉那些绘制）
 - 端到端 CPU 渲染真的画出东西
+- **异步三入口**（0.10.9）：与同步入口**逐字节相同**；未就绪 ⇒ `AMIKI_ERROR_BUSY`
+  且**不写一个字节、也不消费那一帧**；`out_len` 不足不消费帧；没 `begin` 就
+  `poll` / `try_read` ⇒ 显式报错；`clear` 会把在飞帧一起丢掉
 
 `src/types.rs` 还有**布局断言**：每个 `#[repr(C)]` 结构体的 `size_of` / `offset_of`
 必须与 header 一致。C 侧的 `sizeof` 只要对不上，绑定就会静默踩内存。
@@ -182,7 +203,8 @@ crates\amiki-capi\verify.cmd
 > **这个脚本验证过有牙**：把 C 示例背景色的一个通道从 24 改成 25，
 > 第 5 项立刻失败并返回退出码 1（C 的哈希变了，C# / Node 没变）。
 
-它检查的符号数当前是 **header 声明 87 / 导出 87，无缺失**（0.10.0 新增图像编解码 3 个；0.9.0 新增
+它检查的符号数当前是 **header 声明 90 / 导出 90，无缺失**（0.10.9 新增异步三入口
+`amiki_canvas_begin/poll/try_read_render_rgba8` 与 `AMIKI_ERROR_BUSY`；0.10.0 新增图像编解码 3 个；0.9.0 新增
 `amiki_canvas_save` / `amiki_canvas_restore` 与两个状态栈错误码；
 0.8.0 新增填充规则枚举与 2 个符号；0.7.0 新增 6 个字体回退符号）。
 

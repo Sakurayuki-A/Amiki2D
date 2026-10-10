@@ -860,7 +860,8 @@ AMIKI_API amiki_result amiki_canvas_end_layer(amiki_canvas* canvas);
  *   反而是更稳的选择 —— 它不涉及任何跨 API 同步；
  * - **0.10.9 起另有异步接口**：`amiki_canvas_begin_render_rgba8` +
  *   `amiki_canvas_poll_render_rgba8` + `amiki_canvas_try_read_render_rgba8`，
- *   把"提交"与"读回"分到不同帧（见下面三节）。本函数**一行没变**。
+ *   把"提交"与"读回"分到不同帧（见下面三节）。本函数的**签名与语义没变** ——
+ *   只多了上一节那条"超范围回落 CPU"（它修掉的是静默算错，不是行为调整）。
  */
 AMIKI_API amiki_result amiki_canvas_render_rgba8(amiki_canvas* canvas, uint8_t* out,
                                                  size_t out_len);

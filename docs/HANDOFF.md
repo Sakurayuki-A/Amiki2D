@@ -91,6 +91,15 @@ open(P, "w", encoding="utf-8", newline="").write(s + extra)
    （全新分配 0.291 ms vs 复用 0.053 ms）一击定位真因是**每帧缺页**。
    反面教材：在这之前我已经改了两轮"减少 push"的代码 —— 方向全错。
 3. **小步验证**：改一处 → `cargo build` → `cargo test --workspace` → 再改下一处。
+   这一步现在**由 CI 兜底**（`.github/workflows/ci.yml`，两个 job）：
+   - `test`：`cargo test --workspace` · `clippy --all-targets -- -D warnings` ·
+     `cargo doc` 带 `RUSTDOCFLAGS=-D warnings` · capi 的**特性矩阵**（四种组合）·
+     wasm 纯 CPU 构建；
+   - `c-abi`：`crates/amiki-capi/verify.cmd` 五项（header 双语言编译 / 符号核对 /
+     版本一致 / 三绑定示例逐字节相同）。
+   本地手动跑与 CI 等价；仓库目前**没配 remote**，推上去才开始自动跑 ——
+   在那之前这份 workflow 同时就是"门禁清单"。runner 上没有 GPU 适配器，
+   需要 GPU 的测试会自行跳过（CPU 路径照常覆盖）。
 4. **绝不留"半通"的实现**：宁可显式报错，也不要静默画出错误结果。
    本会话有两次**主动停手**：判定剩余额度不足以安全完成跨侧改动时，
    写下实施方案而不是留下半坏的流水线（其中一次后来证明那方案根本不需要）。
@@ -149,9 +158,10 @@ open(P, "w", encoding="utf-8", newline="").write(s + extra)
 > ⚠️ 下面这组数字**每次发版都要重新量**（`docs/HANDOFF.md` 第 9 条纪律的另一半）。
 > 0.9.0 已把此前停在 0.2.0 时代的 **151** 更新为 **297**；0.9.2 起为 **298**。
 
-- **360 测试全绿**（并行）/ 三后端各 **26 / 0** / clippy 零警告 / cargo doc 零警告
+- **362 测试全绿**（并行）/ 三后端各 **26 / 0** / clippy 零警告 / cargo doc 零警告
 - 提交数见 `git rev-list --count HEAD`（不写死：任何一次提交都会让它过时）· 工作树 clean
-- Rust **27 300** 行；WGSL 1 570 行；9 个 crate（新增可选 `amiki-codec`）
+- Rust **24 660 行**（口径：非空且非整行注释；总行 33 598，125 个 `.rs`）·
+  WGSL **1 299 行**（总 1 699）· `amiki.h` 1 165 行 · 9 个 crate（新增可选 `amiki-codec`）
 - crate 分层与依赖边界：
   - `amiki-math` / `amiki-scene` / `amiki-raster` / `amiki-layout` —— **零第三方依赖**
   - `amiki-text` —— ttf-parser + rustybuzz（字体栈隔离在此）
@@ -262,7 +272,7 @@ loop {
 
 ```
 提交数见 `git rev-list --count HEAD`（不写死：任何一次提交都会让它过时）· 工作树 clean
-360 测试全绿（并行）· 三后端各 26/0 · clippy 与 cargo doc 零警告
+362 测试全绿（并行）· 三后端各 26/0 · clippy 与 cargo doc 零警告
 最新提交见 git log -1
 ```
 

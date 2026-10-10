@@ -25,7 +25,7 @@
 |---|---|---|---|
 | **Skia**（全仓） | 12 451 | 263 MB | 其中 `resources/` 46 MB、`site/` 24 MB、`tests/` 18 MB |
 | Skia 的代码面（`include/`+`src/`+`modules/`） | 3 624 | 64 MB | 这才是与我们可比的部分 |
-| **我们** | 8 个 crate | Rust 26.8k 行 + WGSL 1.6k 行 | 4 个核心 crate **零第三方依赖** |
+| **我们** | 9 个 crate | Rust 24.7k 行（代码行）+ WGSL 1.3k 行 | 4 个核心 crate **零第三方依赖**（`amiki-math` / `scene` / `raster` / `layout`） |
 
 Skia 的 `src/` 分区（文件数）本身就是一张能力图，值得贴在墙上：
 

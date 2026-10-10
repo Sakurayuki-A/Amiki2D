@@ -172,6 +172,24 @@ impl GpuRenderer {
         Ok(rgba8_from_f32(&self.readback_f32(tex)?))
     }
 
+    /// **非阻塞版收尾**：把在飞的 f16 回读收成 f32 像素（P3 第 ② 步用）。
+    #[allow(dead_code)]
+    pub(crate) fn finish_read_f32(&self, p: PendingRead) -> Result<Vec<[f32; 4]>, RenderError> {
+        let raw = self.finish_read(p)?;
+        let n = raw.len() / 8;
+        let mut out = Vec::with_capacity(n);
+        for i in 0..n {
+            let o = i * 8;
+            out.push([
+                f16_to_f32(u16::from_le_bytes([raw[o], raw[o + 1]])),
+                f16_to_f32(u16::from_le_bytes([raw[o + 2], raw[o + 3]])),
+                f16_to_f32(u16::from_le_bytes([raw[o + 4], raw[o + 5]])),
+                f16_to_f32(u16::from_le_bytes([raw[o + 6], raw[o + 7]])),
+            ]);
+        }
+        Ok(out)
+    }
+
     /// 读回纹理像素（直线 RGBA8）。仅用于 8 位纹理（用户位图、覆盖图等）。
     ///
     /// M3.6：暂存缓冲取自本模块的 `take_readback_buffer` 池（同一画布尺寸逐帧复用）。

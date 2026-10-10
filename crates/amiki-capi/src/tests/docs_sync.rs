@@ -232,6 +232,41 @@ fn symbol_count_matches_the_header_the_code_and_the_docs() {
 }
 
 #[test]
+fn license_declaration_matches_the_license_file() {
+    // 补这一条的原因：仓库里曾出现 "LICENSE 文本是 MIT，而 Cargo.toml 声明
+    // MIT OR Apache-2.0" 的不一致。两者不是等价的 —— 双许可要求**两份完整文本**
+    // 加标准声明，只有一份 MIT 文本时声明就必须是 MIT。改一处忘另一处就会红。
+    let cargo = read("../../Cargo.toml");
+    let declared = cargo
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("license = "))
+        .map(|v| v.trim().trim_matches('"').to_string())
+        .expect("Cargo.toml 的 [workspace.package] 里应有 license = \"...\"");
+    let first = read("../../LICENSE")
+        .lines()
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let spdx = if first.starts_with("MIT") {
+        "MIT"
+    } else if first.starts_with("Apache") {
+        "Apache-2.0"
+    } else {
+        ""
+    };
+    assert!(
+        !spdx.is_empty(),
+        "LICENSE 首行是 `{first}`：本测试只认识 MIT / Apache 两种 —— \
+         换成别的许可证时请同步这个映射"
+    );
+    assert_eq!(
+        declared, spdx,
+        "Cargo.toml 声明 `{declared}`，而 LICENSE 文件是 `{spdx}`：两者必须一致"
+    );
+}
+
+#[test]
 fn header_version_macros_match_cargo_toml() {
     let header = read("include/amiki.h");
     let mut got = [None, None, None];

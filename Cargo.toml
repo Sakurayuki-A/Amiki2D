@@ -15,7 +15,11 @@ members = [
 [workspace.package]
 version = "0.10.9-alpha"
 edition = "2021"
-license = "MIT OR Apache-2.0"
+# 与仓库根的 LICENSE 文件一致（就是 MIT 单许可）。
+# 曾经写成 "MIT OR Apache-2.0" 而仓库里只有 MIT 文本 —— 双许可需要两份完整文本
+# 加标准声明，只有一份就算不上双许可。这个一致性由
+# `crates/amiki-capi/src/tests/docs_sync.rs` 的 `license_declaration_matches_the_license_file` 钉住。
+license = "MIT"
 
 [workspace.dependencies]
 bytemuck = { version = "1", features = ["derive"] }

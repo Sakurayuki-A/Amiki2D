@@ -154,7 +154,7 @@ cargo bench -p amiki-gpu                              # 基准（含显存与逐
 | 跨平台后端 | 多后端并行维护 | Windows | CPU | **wgpu 一套 WGSL 通吃 + CPU 兜底**（已验证 Vulkan / DX12 / GL 三个后端） |
 | 绑定生态 | C++ 核心 + 各语言绑定 | COM | C/C++ | **Rust 核心 + C ABI → 全生态** |
 
-## 文档
+## 文档地图
 
 | 文件 | 内容 |
 |---|---|
@@ -187,3 +187,13 @@ cargo bench -p amiki-gpu                              # 基准（含显存与逐
 
 `amiki-raster`（CPU 引擎）零第三方依赖，是同一份数学的独立实现 ——
 GPU 与 CPU 的每个像素都对拍（纯几何容差 ≤2/255）。
+
+## 许可证
+
+**MIT**（见 [`LICENSE`](LICENSE)，Copyright (c) 2026 Sakuyuki）。
+`Cargo.toml` 的 `license` 字段与这个文件由测试钉在一起
+（`crates/amiki-capi/src/tests/docs_sync.rs`），改一处忘另一处会直接红。
+
+`assets/fonts/` 里的两份字体是第三方作品，按 **SIL OFL 1.1** 分发，
+其许可证文本与来源说明在该目录的 [`README.md`](assets/fonts/README.md) 内 ——
+OFL 与本项目的 MIT **不冲突**，但那些文本必须随字体一起保留。

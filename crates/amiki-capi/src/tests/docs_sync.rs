@@ -201,6 +201,15 @@ fn symbol_count_matches_the_header_the_code_and_the_docs() {
         exported.len()
     );
 
+    // 根 README（仓库主页）也是符号数的一个副本 —— 它最显眼，也最容易漂：
+    // 重写主页时实测发现它还写着 0.3.0 时代的 "72 个导出符号"。
+    let root = read("../../README.md");
+    let in_root = documented_number(&root, &["个符号", "C ABI"], "个符号", "根 README 的 C ABI 一句");
+    assert_eq!(
+        in_root, n,
+        "根 README 写 {in_root} 个符号，而 header 声明 {n} 个 —— 主页的这句话也要跟着改"
+    );
+
     // "符号数 N/M" 这种写法只在**描述 verify.cmd 本次输出**时出现（历史数字会写
     // "80 个导出符号（0.4.0）"这类带版本的措辞），所以它必须永远是当前值。
     for (file, text) in [("docs/OVERVIEW.md", &overview), ("crates/amiki-capi/README.md", &capi_readme)] {

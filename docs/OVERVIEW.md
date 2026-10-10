@@ -171,12 +171,12 @@
 
 | 项 | 证据 |
 |---|---|
-| **全工作区测试** | `cargo test --workspace` → **345 passed / 0 failed** |
+| **全工作区测试** | `cargo test --workspace` → **362 passed / 0 failed**（条数只会增长，以 CI 输出为准） |
 | **静态检查** | `cargo clippy --workspace --all-targets` 与 `cargo doc --workspace --no-deps` **零警告** |
 | **三后端** | Vulkan / DX12 / GL 在同一块 RTX 3050 上各跑通（`AMIKI_BACKENDS` 可指定；GL 遇位图**显式报错**而非静默画错） |
 | **GPU ↔ CPU 逐像素** | 图形、渐变、位图、滤镜、**HDR 层**、**CJK 字形**全部对拍；CJK 实测最大通道差 **1** |
 | **wasm ↔ 原生 CPU** | 逐**字节**相同（含中英混排），浏览器验证页自校验 SHA-256 一致 |
-| **三绑定示例** | C / C# / Node 产物逐**字节**相同（`crates/amiki-capi/verify.cmd`，含符号数 80/80 核对） |
+| **三绑定示例** | C / C# / Node 产物逐**字节**相同（`crates/amiki-capi/verify.cmd`，含符号数 90/90 核对） |
 | **真实应用（dogfooding）** | `window_demo` 可滚动、可交互、中英混排正常，长时间运行不崩 |
 | **浏览器** | Chrome 与 **Firefox 157.0** 均**页面自校验 PASS**：wasm 渲染结果与期望哈希 `fc9482ba…` 一致（含中英混排），方法见 [VERIFY.md](VERIFY.md) 第七节 |
 | **增量渲染正确性** | 200 轮**随机改动**序列下"增量结果 = 全量渲染"逐字节一致（不是样例测试） |

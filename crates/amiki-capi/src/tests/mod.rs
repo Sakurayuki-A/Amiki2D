@@ -22,6 +22,7 @@ use crate::types::*;
 use helpers::*;
 
 mod helpers;
+mod docs_sync;
 mod abi;
 mod null_and_out;
 mod gradient;

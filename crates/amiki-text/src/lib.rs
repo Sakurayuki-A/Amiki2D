@@ -622,3 +622,6 @@ fn shape_run_into(
     }
     Ok(glyphs)
 }
+
+mod style;
+pub use style::FontStyle;

@@ -140,7 +140,7 @@ pub extern "C" fn amiki_version() -> u32 {
     // `CARGO_PKG_VERSION` 逐段比对 —— 不同步就红。
     const MAJOR: u32 = 0;
     const MINOR: u32 = 10;
-    const PATCH: u32 = 6;
+    const PATCH: u32 = 8;
     (MAJOR << 16) | (MINOR << 8) | PATCH
 }
 

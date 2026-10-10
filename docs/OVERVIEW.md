@@ -69,6 +69,8 @@
 | **描边** | join（miter / round / bevel，含 miter limit）、cap（butt / round / square）、开放折线与闭合环、**虚线**（0.10.2） |
 | **渐变** | 线性 / 径向 / 扫描；双端逐像素一致 |
 | **位图** | 旋转 / 缩放 / 平铺（Repeat 采样器）+ **mipmap**（见 2.2 的 B4） |
+| **字体样式属性**（0.10.7） | `Font::style()` 读字重/斜体（`OS/2` 表，缺表兜底）；`FontStyle::distance` 定义「按样式取最近」的取舍（斜体不匹配 1000 > 字重差上限 800）；**不做合成加粗/倾斜** |
+| **GPU 路径边界**（0.10.8） | 已验证支持 **≤ 2048 边长**；超出时**明确回落 CPU 并打印原因**（已知 `y ≥ 2048` 会算错 ✗）；渲染器进程级复用（每次调用 ≈100 ms → ≈1.7 ms） |
 | **颜色矩阵滤镜**（0.10.4 类型层 / **0.10.5 接画布**） | `Canvas::set_color_filter`：**提交时**变换纯色 / 渐变停靠点 / 图像像素 ⇒ CPU/GPU 都不必知道滤镜存在（未动光栅器与 WGSL）。图像是逐像素（有代价）；**不在状态栈里**（有意，文档写明） |
 | **九宫格贴图**（0.10.3） | `Canvas::image_nine`：四角**保持源尺寸不缩放**、边单向、中间双向（对齐 Skia `drawImageNine` / Android 9-patch）；实现是「取子图 + 普通矩形放置」⇒ CPU/GPU/AMK1 都不需要知道它存在 |
 | **图像编解码**（0.10.0） | **自己读图**：PNG（含**索引色** / 1–16 位）解码 + PNG 编码 + JPEG 解码；在**可选 crate** `amiki-codec` 里 —— 核心四 crate 仍零第三方依赖 |
@@ -108,7 +110,7 @@
 | **C ABI** | **87 个符号**；`verify.cmd` 一条命令核对"header 声明 = 实际导出"、C/C++ 两种包含方式、三示例产物一致、版本一致性 |
 | **WASM** | 原生 WebAssembly API（不依赖 wasm-bindgen）；浏览器验证页**页内自校验 SHA-256** |
 | **dogfooding** | `window_demo` 真实窗口应用：列表视图（200 行滚动、点击选中）+ 展示页（渐变/位图/滤镜/动画真字），**中英混排正常** |
-| **工程质量** | `cargo test --workspace` **340 passed / 0 failed**；clippy 与 `cargo doc` **零警告** |
+| **工程质量** | `cargo test --workspace` **345 passed / 0 failed**；clippy 与 `cargo doc` **零警告** |
 | **代码规模** | Rust **24 618** 行 / 48 文件；WGSL **1 570** 行 / 13 文件；**8 个 crate** |
 
 ---
@@ -169,7 +171,7 @@
 
 | 项 | 证据 |
 |---|---|
-| **全工作区测试** | `cargo test --workspace` → **340 passed / 0 failed** |
+| **全工作区测试** | `cargo test --workspace` → **345 passed / 0 failed** |
 | **静态检查** | `cargo clippy --workspace --all-targets` 与 `cargo doc --workspace --no-deps` **零警告** |
 | **三后端** | Vulkan / DX12 / GL 在同一块 RTX 3050 上各跑通（`AMIKI_BACKENDS` 可指定；GL 遇位图**显式报错**而非静默画错） |
 | **GPU ↔ CPU 逐像素** | 图形、渐变、位图、滤镜、**HDR 层**、**CJK 字形**全部对拍；CJK 实测最大通道差 **1** |
@@ -258,6 +260,8 @@
 | `0.8.0` | **even-odd 填充规则** | 状态式 `set_fill_rule` + AMK1 v2 的 bit 12 + C ABI 82 个符号；实现靠**几何预处理**（覆盖率数学与 WGSL 一行未改）；顺带查明既有精度限制 B16（关闭 B5） |
 | `0.9.2` | **层只渲染自己的区域** | 层子场景按 `inflated_bounds` 渲染（2.7×），输出逐字节不变 |
 | `0.10.0` | **图像编解码** | 可选 crate `amiki-codec`：PNG（含索引色）解码/编码 + JPEG 解码；C ABI 87 符号；定调"核心零依赖 + 生态放可选 crate"（B18 部分关闭） |
+| `0.10.8` | **GPU 修复 + 止血** | 渲染器复用（60×）；超 2048 明确回落 CPU（不再静默画错） |
+| `0.10.7` | **字体样式属性** | 读字重/斜体 + `distance` 取舍（样式匹配前置） |
 | `0.10.6` | **C ABI 文本缓存** | 缓存挂在字体对象上（键含字体身份 ⇒ 不串字体）；**零新增 API**；D8 关闭 |
 | `0.10.5` | **颜色滤镜接画布** | `Canvas::set_color_filter`：提交时作用于纯色/渐变/图像；未动光栅器与 WGSL；不在状态栈（B20 的颜色滤镜一项收窄） |
 | `0.10.4` | **颜色矩阵（类型层）** | `ColorMatrix` 落地 + 6 条测试；接画布留到独立一轮（要动 CPU+GPU） |

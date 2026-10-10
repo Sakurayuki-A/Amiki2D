@@ -117,6 +117,17 @@ void amiki_header_selfcheck(void) {
     }
     (void)amiki_canvas_set_flatten_tolerance(cv, 0.05f);
     (void)amiki_canvas_render_rgba8(cv, out, sizeof(out) / sizeof(out[0]));
+    /* 异步三入口（0.10.9）与 AMIKI_ERROR_BUSY 也在自检里摸一遍：
+     * 这个文件按 C 与 C++ 各编译一次，且都是 /W4 /WX。 */
+    {
+        int32_t ready = 0;
+        (void)amiki_canvas_begin_render_rgba8(cv);
+        (void)amiki_canvas_poll_render_rgba8(cv, &ready);
+        if (ready) {
+            (void)amiki_canvas_try_read_render_rgba8(cv, out, sizeof(out) / sizeof(out[0]));
+        }
+        (void)amiki_result_string(AMIKI_ERROR_BUSY);
+    }
     amiki_canvas_destroy(cv);
     amiki_canvas_destroy(NULL);
 

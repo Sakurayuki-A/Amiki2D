@@ -110,7 +110,7 @@
 | **C ABI** | **90 个符号**（0.10.9 起含异步三入口 `amiki_canvas_begin/poll/try_read_render_rgba8`）；`verify.cmd` 一条命令核对"header 声明 = 实际导出"、C/C++ 两种包含方式、三示例产物一致、版本一致性 |
 | **WASM** | 原生 WebAssembly API（不依赖 wasm-bindgen）；浏览器验证页**页内自校验 SHA-256** |
 | **dogfooding** | `window_demo` 真实窗口应用：列表视图（200 行滚动、点击选中）+ 展示页（渐变/位图/滤镜/动画真字），**中英混排正常** |
-| **工程质量** | `cargo test --workspace` **358 passed / 0 failed**；clippy 与 `cargo doc` **零警告** |
+| **工程质量** | `cargo test --workspace` **359 passed / 0 failed**；clippy 与 `cargo doc` **零警告** |
 | **代码规模** | Rust **24 618** 行 / 48 文件；WGSL **1 570** 行 / 13 文件；**8 个 crate** |
 
 ---

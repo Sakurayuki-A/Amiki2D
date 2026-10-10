@@ -82,10 +82,52 @@ fn result_string_covers_every_value_and_rejects_out_of_range() {
     assert_eq!(s.to_str().unwrap(), "unknown");
 }
 
+/// **错误码取值必须在 header 与 Rust 两侧一致**。
+///
+/// 这是个"镜像"：`AMIKI_ERROR_*` 在 `include/amiki.h`（C 侧的契约）与
+/// `src/types.rs`（实现）各写一份。任何一侧改了数字，调用方就会按**错的含义**
+/// 处理错误 —— 与 0.9.0 抓到的 `clip_depth` / `fill_rule` 镜像漂移是同一类问题。
+///
+/// 只扫 `amiki_result` 枚举体那一段（交接文档第 10 条：范围要窄，
+/// 不能让相邻段落命中）。
+#[test]
+fn error_codes_match_the_header() {
+    let header = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/include/amiki.h"))
+        .expect("读 amiki.h");
+    let start = header.find("typedef enum amiki_result {").expect("header 里有 amiki_result");
+    let end = header[start..].find("} amiki_result;").expect("枚举体有结束") + start;
+    let body = &header[start..end];
+
+    for (name, value) in [
+        ("AMIKI_OK", AMIKI_OK),
+        ("AMIKI_ERROR_INVALID_ARGUMENT", AMIKI_ERROR_INVALID_ARGUMENT),
+        ("AMIKI_ERROR_OUT_OF_MEMORY", AMIKI_ERROR_OUT_OF_MEMORY),
+        ("AMIKI_ERROR_BACKEND_UNAVAILABLE", AMIKI_ERROR_BACKEND_UNAVAILABLE),
+        ("AMIKI_ERROR_NOT_SUPPORTED", AMIKI_ERROR_NOT_SUPPORTED),
+        ("AMIKI_ERROR_PANIC", AMIKI_ERROR_PANIC),
+        ("AMIKI_ERROR_UNKNOWN", AMIKI_ERROR_UNKNOWN),
+        ("AMIKI_ERROR_NOT_FOUND", AMIKI_ERROR_NOT_FOUND),
+        ("AMIKI_ERROR_STACK_OVERFLOW", AMIKI_ERROR_STACK_OVERFLOW),
+        ("AMIKI_ERROR_STACK_UNDERFLOW", AMIKI_ERROR_STACK_UNDERFLOW),
+        ("AMIKI_ERROR_BUSY", AMIKI_ERROR_BUSY),
+    ] {
+        let needle = format!("{name} = {value}");
+        let at = body
+            .find(&needle)
+            .unwrap_or_else(|| panic!("header 的 amiki_result 里没有 `{needle}`"))
+            + needle.len();
+        // 防"值前几位相同"造成的假通过（例如 header 写 100，needle 是 10）
+        assert_ne!(
+            body[at..].chars().next(),
+            Some('0'),
+            "header 里 {name} 的取值看起来不是 {value}"
+        );
+    }
+}
+
 // ============================================================================
 // 空指针：**必须被拒绝，且不能崩**
 // ============================================================================
-
 #[test]
 fn every_pointer_entry_point_rejects_null() {
     // 这个测试的价值在于"跑完不崩" —— 空指针解引用会直接段错误。

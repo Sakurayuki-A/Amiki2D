@@ -467,3 +467,146 @@ impl TimestampRecorder {
         self.labels.len() as u32 * 2
     }
 }
+
+
+// ============================================================================
+// 从 `lib.rs` 搬来的时间戳与 profile（0.10.9 模块化）
+// ============================================================================
+
+use crate::*;
+
+pub(crate) fn ts_writes(
+    rec: Option<&TimestampRecorder>,
+    slot: Option<(u32, u32)>,
+) -> Option<wgpu::ComputePassTimestampWrites<'_>> {
+    match (rec, slot) {
+        (Some(rec), Some((b, e))) => Some(wgpu::ComputePassTimestampWrites {
+            query_set: &rec.query_set,
+            beginning_of_pass_write_index: Some(b),
+            end_of_pass_write_index: Some(e),
+        }),
+        _ => None,
+    }
+}
+
+/// 从**预分配**的槽位表里取第 `i` 个槽位的时间戳写入描述。
+///
+/// 刻意写成自由函数并接收 `slots` 的**副本**（`[(u32,u32); N]` 是 `Copy`）：
+/// 闭包会捕获并保持对 `ts`/`ts_slots` 的借用，与 `run_scan(.., ts.as_deref_mut())`
+/// 的可变借用冲突；自由函数每次只做一次瞬时再借用，故无冲突。
+pub(crate) fn ts_slot<'a, const N: usize>(
+    ts: Option<&'a TimestampRecorder>,
+    slots: Option<[(u32, u32); N]>,
+    i: usize,
+) -> Option<wgpu::ComputePassTimestampWrites<'a>> {
+    match (ts, slots) {
+        (Some(r), Some(s)) => ts_writes(Some(r), Some(s[i])),
+        _ => None,
+    }
+}
+
+impl GpuRenderer {
+    /// **完整分析**：渲染一帧并同时返回 ①主机侧分阶段耗时（[`FrameProfile`]）
+    /// 与 ②逐 compute pass 的 GPU 时长（[`FrameProfile::timestamps`]）。
+    ///
+    /// 适配器不支持 `TIMESTAMP_QUERY` 时 `timestamps.supported = false`，
+    /// 但**主机侧计时仍然有效**——这正是必须两者都给的原因：GPU 计时不可用时，
+    /// 至少还能回答"CPU 花在哪"。
+    ///
+    /// 注意：本方法会为时间戳额外提交一次 resolve + 读回，故其结果**略高于**
+    /// 常规渲染路径的真实耗时；做墙钟基准请用 `render_into` + `poll`。
+    pub fn profile(&self, scene: &Scene, eps: f32) -> Result<FrameProfile, RenderError> {
+        // 每次新建 `Frame` —— 于是 `extract_ms` 里含**每帧全新分配**的代价。
+        // 逐帧复用场景的真实提取成本请用 [`Self::profile_into`]。
+        let mut frame = Frame::default();
+        self.profile_into(scene, eps, &mut frame)
+    }
+
+    /// 同 [`Self::profile`]，但**复用调用方持有的 `Frame`**。
+    ///
+    /// 两者的 `extract_ms` 会明显不同：全新分配约 1.0 ms，复用约 0.56 ms
+    /// （实测，见 `GpuScene::reset_for_reuse`）。逐帧路径用的是复用那一档，
+    /// 所以**评估提取成本应当看这个方法**。
+    pub fn profile_into(
+        &self,
+        scene: &Scene,
+        eps: f32,
+        frame: &mut Frame,
+    ) -> Result<FrameProfile, RenderError> {
+        let mut prof = FrameProfile {
+            timestamps: PassTimings {
+                supported: false,
+                timestamp_period_ns: self.timestamp_period_ns,
+                passes: Vec::new(),
+            },
+            ..Default::default()
+        };
+        let t_extract = Instant::now();
+        self.prepare_into(scene, eps, frame)?;
+        prof.extract_ms = t_extract.elapsed().as_secs_f64() * 1000.0;
+        let tex = self.create_output_texture(&frame.scene);
+        if !self.has_timestamps {
+            // GPU 计时不可用：仍跑一次管线，让主机侧数字有意义
+            match self.path {
+                RenderPath::Dense => {
+                    self.run_pipeline_impl(
+                        &frame.scene, &tex, false, &frame.clip_views, None, None, None, &mut prof,
+                    )?;
+                }
+                RenderPath::Sparse => {
+                    self.run_pipeline_sparse(
+                        &frame.scene, &tex, false, &frame.clip_views, None, None, None, &mut prof,
+                    )?;
+                }
+            }
+            return Ok(prof);
+        }
+        let mut rec = TimestampRecorder::new(&self.device);
+        match self.path {
+            RenderPath::Dense => {
+                self.run_pipeline_impl(
+                    &frame.scene,
+                    &tex,
+                    false,
+                    &frame.clip_views,
+                    None,
+                    None,
+                    Some(&mut rec),
+                    &mut prof,
+                )?;
+            }
+            RenderPath::Sparse => {
+                self.run_pipeline_sparse(
+                    &frame.scene,
+                    &tex,
+                    false,
+                    &frame.clip_views,
+                    None,
+                    None,
+                    Some(&mut rec),
+                    &mut prof,
+                )?;
+            }
+        }
+
+        // resolve 全部时间戳 → 回读 → tick 换算为 ns
+        let t_ts = Instant::now();
+        let mut enc = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("amiki_ts_resolve") });
+        enc.resolve_query_set(&rec.query_set, 0..rec.query_count(), &rec.resolve_buf, 0);
+        self.queue.submit(Some(enc.finish()));
+        let bytes = self.read_buffer(&rec.resolve_buf, rec.query_count() as usize * 8)?;
+        let raw: &[u64] = bytemuck::cast_slice(&bytes);
+        let period = self.timestamp_period_ns as f64;
+        for (i, label) in rec.labels.iter().enumerate() {
+            let (b, e) = (raw[2 * i], raw[2 * i + 1]);
+            let ns = e.saturating_sub(b) as f64 * period;
+            prof.timestamps.passes.push((label, ns));
+        }
+        prof.timestamps.supported = true;
+        prof.resolve_ts_ms = Some(t_ts.elapsed().as_secs_f64() * 1000.0);
+        Ok(prof)
+    }
+
+}

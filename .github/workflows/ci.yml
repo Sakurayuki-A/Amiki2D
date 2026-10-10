@@ -7,9 +7,14 @@
 #                  （90 声明 / 90 导出）、版本一致性、三个绑定示例**逐字节一致**。
 #                  这条是最强的封送检查，此前同样只能靠人手动跑。
 #
+# 两个 job 的**步骤本体不写在这里**，而是调用 `tools/ci-*.cmd` —— 这样 CI 与本地
+# 跑的是同一份清单，不会各自漂移（本地等价命令：`tools\ci-test.cmd`、
+# `tools\ci-cabi.cmd`）。本文件只负责"runner 上装什么工具链"。
+#
 # 两条都跑在 **windows-latest**：这是本项目的主平台（MSVC + Vulkan/DX12）、
 # 也是 `verify.cmd` 唯一被验证过的环境。runner 上没有 GPU 适配器，
 # 需要 GPU 的测试会自行跳过（`gpu()` 返回 None 即 return），CPU 路径照常覆盖。
+# 想在本地复现"没有 GPU"这一条：`set AMIKI_BACKENDS=bogus` 再跑 ci-test.cmd。
 #
 # ⚠️ 两个已知前提，若在 runner 上不成立会**直接红**（有意如此，不做静默跳过）：
 #   - C# 示例的 TargetFramework 是 **net10.0**（当前仍是 preview）⇒ 用
@@ -18,7 +23,13 @@
 #   - `verify.cmd` 需要 MSVC（`vcvars64.bat`）；windows-latest 自带 VS Build Tools。
 #
 # ⚠️ 本仓库当前**没有配置 remote**，所以这份 workflow 要等推送到 GitHub 才真正开始跑；
-# 在那之前它的作用是**把门禁写成可执行清单**（本地照着跑等价）。
+# 在那之前它的作用是**把门禁写成可执行清单**（`tools/ci-*.cmd` 本地跑等价）。
+#
+# 本地与 runner 仍有两点差异，且都是**工具链版本**层面的：
+#   - runner 用 `stable`，本机也大概率是 stable，但两者日期可能不同 —— 仓库没有
+#     `rust-toolchain.toml`，所以这一点没有被固定（要不要固定是个决策，见 HANDOFF）。
+#   - runner 是冷缓存（`target/` 为空、cargo 依赖全量下载）：本地复现用
+#     `cargo clean` + 全新克隆即可。
 #
 # Linux / macOS 的编译检查是下一步的自然扩展，但本机无法验证其依赖是否齐备，
 # 所以没有写进来 —— 与其加一条"可能因为环境而红"的 gate，不如等有人能验证时再加。
@@ -49,31 +60,9 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: cargo test --workspace
-        run: cargo test --workspace
-
-      - name: cargo clippy（零告警）
-        run: cargo clippy --workspace --all-targets -- -D warnings
-
-      - name: cargo doc（零告警）
-        run: cargo doc --workspace --no-deps
-        env:
-          RUSTDOCFLAGS: -D warnings
-
-      # 特性矩阵：这一条是加 CI 时**立刻抓到问题**的地方 —— `amiki-capi` 的
-      # `--no-default-features` 下测试目标此前编不过（codec 测试没有 cfg 门控），
-      # 而在此之前大家只构建过 lib，所以没人发现。
-      - name: 特性矩阵（capi 的四种组合，含测试目标）
-        run: |
-          cargo clippy -p amiki-capi --no-default-features --all-targets -- -D warnings
-          cargo clippy -p amiki-capi --no-default-features --features codec --all-targets -- -D warnings
-          cargo clippy -p amiki-capi --no-default-features --features gpu --all-targets -- -D warnings
-          cargo test -p amiki-capi --no-default-features
-          cargo test -p amiki-capi --no-default-features --features codec
-
-      # 纯 CPU 的 wasm 构建：这是 WASM 交付物的形状（关掉 gpu + codec）
-      - name: wasm 纯 CPU 构建
-        run: cargo build -p amiki-capi --profile wasm-release --target wasm32-unknown-unknown --no-default-features
+      - name: tools\ci-test.cmd（本地同一条命令）
+        shell: cmd
+        run: tools\ci-test.cmd
 
   c-abi:
     name: C ABI（verify.cmd 五项）
@@ -95,6 +84,7 @@ jobs:
         with:
           node-version: '22'
 
-      - name: crates\amiki-capi\verify.cmd
+      - name: tools\ci-cabi.cmd（本地同一条命令）
         shell: cmd
-        run: crates\amiki-capi\verify.cmd
+        run: tools\ci-cabi.cmd
+

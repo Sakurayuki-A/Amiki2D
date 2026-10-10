@@ -15,7 +15,7 @@
 > - Skia：官方 `main` 快照（zip 解包，**无 `.git` ⇒ 报不出 commit**）；
 >   版本据 `RELEASE_NOTES.md` 顶部 = **Milestone 156**。
 >   （对比时 pip 上可装的 `skia-python` 是 **M144** —— 源码比可装入的轮子更新。）
-> - 我们：**`0.9.2-alpha`**（`git describe --tags`）。
+> - 我们：快照拍摄于 **`0.9.2-alpha`**（`git describe --tags`）—— Skia 侧是那一刻的固定快照，我们的行会随版本更新，当前版本见 README。
 
 ---
 
@@ -105,8 +105,8 @@ svg 4 · xps 4 · lazy 3 · android 4
 | **跨语言 C ABI** | 手写 `amiki.h`（**90 符号**，所有权/线程模型/错误模型写清；0.10.9 起含 `begin`/`poll`/`try_read` 异步渲染），C/C#/Node 三示例产物**逐字节一致** | **`include/c/` 已从 main 移除**（`sk_canvas.h` 不存在）⇒ 跨语言只能走 C++ 或各语言自建绑定 | 在快照里搜 `sk_canvas.h` = 无 |
 | **CPU↔GPU 逐像素一致承诺** | ≤2/255（实测多为 0–1）；稀疏↔稠密**逐字节一致** | **不承诺** CPU 与 GPU 输出一致（后端不同即结果不同） | 我们的对拍设施 + `VERIFY.md` |
 | **二进制流格式有兼容承诺** | AMK1 v1/v2：v1 只解不编、未知版本**显式报错**、`docs/AMK1.md` 写明每个 bit | `.skp`（SkPicture）**明确不保证跨版本兼容** | 我们 `docs/AMK1.md` |
-| **WASM 体量** | **987.9 KB**（纯 CPU，与原生字节一致） | CanvasKit（`modules/canvaskit` 149 文件）是 **MB 级**，且需要 WebGL/WebGPU 才有意义 | 两边构建选项对照 |
-| **核心零第三方依赖** | `amiki-math` / `scene` / `raster` / `layout` 四个 crate 零依赖，总量可审计（26.8k 行） | 单体 + `third_party`（51 头 / 82 文件）+ `skcms` 等 | 两边 `DEPS`/`Cargo.toml` |
+| **WASM 体量** | **1 037.3 KB**（纯 CPU，与原生字节一致；本快照拍摄时是 987.9 KB，此后 even-odd / 状态栈 / 模块化拆分各让它长了一点） | CanvasKit（`modules/canvaskit` 149 文件）是 **MB 级**，且需要 WebGL/WebGPU 才有意义 | 两边构建选项对照 |
+| **核心零第三方依赖** | `amiki-math` / `scene` / `raster` / `layout` 四个 crate 零依赖，总量可审计（Rust 24.7k + WGSL 1.3k 行） | 单体 + `third_party`（51 头 / 82 文件）+ `skcms` 等 | 两边 `DEPS`/`Cargo.toml` |
 | **状态栈作为一等 API** | `save`/`restore` 四项状态、深度 32、溢出/下溢**显式报错**（0.9.0） | `save/restore` 是 SkCanvas 的**计数式**栈（无溢出错误码） | `SkCanvas.h` vs 我们 `amiki.h` |
 
 ---

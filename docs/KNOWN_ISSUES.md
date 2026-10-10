@@ -3,7 +3,7 @@
 **用途**：所有已知的"没做 / 做不到 / 有意不做 / 有条件"的事，集中在这里，
 每条有稳定编号，供发布计划与变更记录引用。
 
-**最后核对**：0.7.0-alpha（未打标签；工作树 = 字体回退 + 0.6.1 的脏区派发修复）
+**最后核对**：0.10.9-alpha（tag `v0.10.9-alpha`；此后是模块化拆分 / CI / 文档整理，未发版）
 **核对方式**：扫过全部 `return err(...)` / "不支持" / "未实现" 点，
 以及能力关键词（`even_odd` / `bidi` / `HDR` / `WASM` / `mipmap` / `FontStack`）在源码中的出现次数。
 
@@ -67,7 +67,8 @@ GL 的 `textureSize` 类型不匹配），所以未验证意味着**可能还存
 
 ### A2 WASM 的 WebGPU 构建未验证（**已知限制，非待办**）
 
-**当前 WASM 构建是纯 CPU 的**（关掉了 `gpu` feature），模块 **~966 KB**，
+**当前 WASM 构建是纯 CPU 的**（关掉了 `gpu` feature），模块 **1 037.3 KB**
+（`~966 KB` 是 0.6.0 的数字，见本节末尾的补充说明），
 与原生 CPU 后端输出**字节一致** —— 0.6.0 起这半边有了**三浏览器实测**：
 同一场景（含文本、渐变、位图、模糊层）在 **Chrome / Edge / Firefox**（均无头）
 渲染并哈希对比，三者与原生 CPU 输出**逐字节一致**
@@ -102,7 +103,7 @@ GL 的 `textureSize` 类型不匹配），所以未验证意味着**可能还存
 
 GL 读不出 `texture_2d_array`（实测采样恒为不透明黑）。引擎**显式报错**
 并提示改用 Vulkan/DX12 或 CPU 引擎 —— **不会静默画错**。
-代码：`crates/amiki-gpu/src/lib.rs:229`。
+代码：`crates/amiki-gpu/src/device.rs:137`。
 
 ### B2 字体格式有限
 
@@ -112,7 +113,7 @@ GL 读不出 `texture_2d_array`（实测采样恒为不透明黑）。引擎**�
 ### B3 AMK1 编码流不内嵌位图
 
 编码流无法表达"内嵌位图"的绘制，解码时**显式报错**。
-代码：`crates/amiki-scene/src/lib.rs:1220`。
+代码：`crates/amiki-scene/src/amk1.rs:283`。
 
 ### B4 位图缩小没有多级过滤（无 mipmap）—— **已修复（0.6.0）**
 
@@ -473,7 +474,7 @@ Skia 侧对照：`include/codec/SkEncodedImageFormat.h` 列了 **14 种**
 
 **C4 C ABI / WASM** —— **两者都已完成**：
 
-- **C ABI** 于 **0.4.0** 落地：手写 `amiki.h` 契约、**72 个导出符号**、
+- **C ABI** 于 **0.4.0** 落地：手写 `amiki.h` 契约、**68 个导出符号**、
   C / C# / Node 三个绑定示例输出**字节一致**（`crates/amiki-capi/`）
 - **WASM** 于 **0.5.0** 落地：模块 **950.7 KB**（纯 CPU 构建），
   与原生 CPU 后端输出**字节一致**（`crates/amiki-capi/examples/wasm/`）

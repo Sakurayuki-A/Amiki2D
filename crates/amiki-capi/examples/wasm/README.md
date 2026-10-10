@@ -36,18 +36,20 @@ cargo build -p amiki-capi --profile wasm-release \
 node minimal.js target/wasm32-unknown-unknown/wasm-release/amiki2d.wasm
 ```
 
-## 体积：**987.9 KB**
+## 体积：**1 037.3 KB**
 
 这是这一版最需要注意的数字。同一个模块：
 
 | 构建 | 体积 |
 |---|---|
 | `--profile release`（`debug = true`） | **11.7 MB** |
-| `--profile wasm-release`（`debug = false`） | **987.9 KB** |
+| `--profile wasm-release`（`debug = false`） | **1 037.3 KB** |
 
 > **历史**：0.5.0 首次落地时是 **950.7 KB**；0.6.0 把 mipmap 的链生成与
 > sRGB 查表加进 `amiki-scene`（wasm 构建包含它），模块 **+15 KB**；
-> 0.7.0 加字体回退（`FontStack` 与配套解析/缓存），模块 **+22 KB**。
+> 0.7.0 加字体回退（`FontStack` 与配套解析/缓存），模块 **+22 KB**；
+> 0.10.9 之后把 2 000 行级的 `lib.rs` 拆成多文件，模块 **+4.1 KB**
+> （模块边界改变了内联与死代码删除的判定 —— 那是结构整理的实测代价）。
 > 几个数字都对，只是属于不同版本 —— 引用时请带上版本号。
 
 **主导因素是 `debug = false`**，差 12 倍。仓库根 `Cargo.toml` 里的

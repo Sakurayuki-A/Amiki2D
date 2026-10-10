@@ -79,8 +79,10 @@ open(P, "w", encoding="utf-8", newline="").write(s + extra)
 
 ```
 项目：D:\program\Amiki2D —— 通用 2D 渲染引擎（Rust + wgpu）
-当前版本：0.3.0-alpha（tag: v0.1.0-alpha, v0.2.0-alpha, v0.3.0-alpha）
-发布判据 6 条**全部满足**，见 docs/RELEASE_0.3.0-alpha.md
+当前版本：0.10.9-alpha（共 22 个标签，最新 v0.10.9-alpha）
+HEAD 比 v0.10.9-alpha 多若干提交（模块化拆分 / CI / 文档整理），**尚未发版**
+0.3.0-alpha 的发布判据 6 条**全部满足**，见 docs/RELEASE_0.3.0-alpha.md
+门禁：cargo test --workspace · clippy · rustdoc · verify.cmd —— 两条 CI（.github/workflows/ci.yml）自动跑
 
 ## 工作纪律（务必遵守）
 
@@ -156,11 +158,11 @@ open(P, "w", encoding="utf-8", newline="").write(s + extra)
 ## 当前状态（全部实测，非记忆）
 
 > ⚠️ 下面这组数字**每次发版都要重新量**（`docs/HANDOFF.md` 第 9 条纪律的另一半）。
-> 0.9.0 已把此前停在 0.2.0 时代的 **151** 更新为 **297**；0.9.2 起为 **298**。
+> 0.9.0 把此前停在 0.2.0 时代的 **151** 更新为 **297**，0.9.2 起为 **298**；此后随每次发版增长，**0.10.9 实测 363**。
 
-- **362 测试全绿**（并行）/ 三后端各 **26 / 0** / clippy 零警告 / cargo doc 零警告
+- **363 测试全绿**（并行）/ 三后端各 **26 / 0** / clippy 零警告 / cargo doc 零警告
 - 提交数见 `git rev-list --count HEAD`（不写死：任何一次提交都会让它过时）· 工作树 clean
-- Rust **24 660 行**（口径：非空且非整行注释；总行 33 598，125 个 `.rs`）·
+- Rust **24 736 行**（口径：非空且非整行注释；总行 33 717，125 个 `.rs`）·
   WGSL **1 299 行**（总 1 699）· `amiki.h` 1 165 行 · 9 个 crate（新增可选 `amiki-codec`）
 - crate 分层与依赖边界：
   - `amiki-math` / `amiki-scene` / `amiki-raster` / `amiki-layout` —— **零第三方依赖**
@@ -175,7 +177,7 @@ open(P, "w", encoding="utf-8", newline="").write(s + extra)
 | 1 | P0-1/2/3、P1-1、P2-1/2 达标 | ✅ |
 | 2 | P3 六项达成 | ✅（多后端验证范围经决策收缩） |
 | 3 | 没有已知的静默错误路径 | ✅ |
-| 4 | 全部测试通过 + 有对拍 | ✅ 360 |
+| 4 | 全部测试通过 + 有对拍 | ✅ 363 |
 | 5 | 文档与代码一致 | ✅ |
 | 6 | 真实应用可持续运行 | ✅ |
 
@@ -272,7 +274,7 @@ loop {
 
 ```
 提交数见 `git rev-list --count HEAD`（不写死：任何一次提交都会让它过时）· 工作树 clean
-362 测试全绿（并行）· 三后端各 26/0 · clippy 与 cargo doc 零警告
+363 测试全绿（并行）· 三后端各 26/0 · clippy 与 cargo doc 零警告
 最新提交见 git log -1
 ```
 

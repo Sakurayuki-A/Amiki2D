@@ -1,6 +1,7 @@
 # Amiki2D 现状总览
 
-**版本 `0.9.0-alpha`** ｜ 149 个提交 ｜ 最新标签 `v0.5.0-alpha`（**0.6.0 / 0.6.1 / 0.7.0 / 0.8.0 / 0.9.0 尚未打标签**）
+**版本 `0.10.9-alpha`** ｜ 提交数见 `git rev-list --count HEAD`（不写死）｜ **22 个标签**，最新 `v0.10.9-alpha`；
+此后是模块化拆分 / CI / 文档整理，**尚未发版**
 
 > 这份文档的读者是**开发者本人**，不是外部用户。它回答四件事：
 > **这是什么、现在能做什么、不能做什么、接下来做什么。**
@@ -88,7 +89,7 @@
 | **B13**（0.6.x 关闭） | 色调映射没接进主机侧渲染路径与 C ABI | 已接通（`ToneMap` + `amiki_canvas_set_tone_map`） |
 | **B15**（0.7.0 关闭） | **无字体回退**：一段文本只能用一种字体 | `FontStack`（**有序**，第一个含该字形的字体胜出）+ `shape_with_stack` / `layout_with_stack` / `Canvas::text_with_stack`；缺字策略显式可选（默认**报错**，可切 `.notdef` / 跳过）；**老 API 零破坏** |
 | **B5**（0.8.0 关闭） | **even-odd 未实现**：`FillRule` 只有 `NonZero` | `FillRule::EvenOdd` + 状态式 `set_fill_rule`（门面与 C ABI）+ AMK1 v2 的 bit 12；实现方式是**几何预处理**（扫描线跨度分解成互不重叠的梯形）—— 覆盖率数学与 **WGSL 一行未改**；与独立裁判的偏差 ≤ 0.021 |
-| **C4**（移出"明确不做"） | C ABI / WASM"不做" | **C ABI 0.4.0**：手写 `amiki.h` 契约、**80 个导出符号**、C / C# / Node 三个绑定示例产物**逐字节相同**；**WASM 0.5.0**：纯 CPU 构建（**987.9 KB**），与原生 CPU 后端输出**逐字节相同** |
+| **C4**（移出"明确不做"） | C ABI / WASM"不做" | **C ABI 0.4.0**：手写 `amiki.h` 契约、**68 个导出符号**、C / C# / Node 三个绑定示例产物**逐字节相同**；**WASM 0.5.0**：纯 CPU 构建（**950.7 KB**），与原生 CPU 后端输出**逐字节相同** |
 | **C3 的一半** | 宽色域 / HDR"不做" | **HDR 已做（0.5.0）**；**宽色域仍未做**（C3 保留为"宽色域"，见 5.3） |
 
 **同一批工作里交付、但不来自 registry 的三件文本能力**（它们此前从未被登记为限制，
@@ -110,8 +111,8 @@
 | **C ABI** | **90 个符号**（0.10.9 起含异步三入口 `amiki_canvas_begin/poll/try_read_render_rgba8`）；`verify.cmd` 一条命令核对"header 声明 = 实际导出"、C/C++ 两种包含方式、三示例产物一致、版本一致性 |
 | **WASM** | 原生 WebAssembly API（不依赖 wasm-bindgen）；浏览器验证页**页内自校验 SHA-256** |
 | **dogfooding** | `window_demo` 真实窗口应用：列表视图（200 行滚动、点击选中）+ 展示页（渐变/位图/滤镜/动画真字），**中英混排正常** |
-| **工程质量** | `cargo test --workspace` **360 passed / 0 failed**；clippy 与 `cargo doc` **零警告** |
-| **代码规模** | Rust **24 618** 行 / 48 文件；WGSL **1 570** 行 / 13 文件；**8 个 crate** |
+| **工程质量** | `cargo test --workspace` **363 passed / 0 failed**；clippy 与 `cargo doc` **零警告**；两条 CI 在 GitHub Actions 上每次推送都跑 |
+| **代码规模** | Rust **24 736** 行（代码行，125 个文件）；WGSL **1 299** 行 / 13 文件；**9 个 crate** |
 
 ---
 
@@ -171,7 +172,8 @@
 
 | 项 | 证据 |
 |---|---|
-| **全工作区测试** | `cargo test --workspace` → **362 passed / 0 failed**（条数只会增长，以 CI 输出为准） |
+| **全工作区测试** | `cargo test --workspace` → **363 passed / 0 failed**（条数只会增长，以 CI 输出为准） |
+| **CI（自动化）** | `.github/workflows/ci.yml` 两个 job：测试矩阵 + C ABI 五项，每次推送在 GitHub Actions 上跑；本地等价命令是 `tools\ci-test.cmd` / `tools\ci-cabi.cmd` |
 | **静态检查** | `cargo clippy --workspace --all-targets` 与 `cargo doc --workspace --no-deps` **零警告** |
 | **三后端** | Vulkan / DX12 / GL 在同一块 RTX 3050 上各跑通（`AMIKI_BACKENDS` 可指定；GL 遇位图**显式报错**而非静默画错） |
 | **GPU ↔ CPU 逐像素** | 图形、渐变、位图、滤镜、**HDR 层**、**CJK 字形**全部对拍；CJK 实测最大通道差 **1** |
@@ -295,7 +297,7 @@ cargo clippy --workspace --all-targets                 # 零警告
 cargo run --release -p amiki --example headless_png    # 出四张图（图形/文本/综合/排版）
 cargo run --release -p amiki --example window_demo     # 打开窗口应用（中英混排）
 cargo bench -p amiki-gpu                               # 性能数据（含逐 pass 时间戳）
-crates/amiki-capi/verify.cmd                           # 三绑定示例 + 80/80 符号核对
+crates/amiki-capi/verify.cmd                           # 三绑定示例 + 90/90 符号核对
 crates/amiki-capi/examples/wasm/build.cmd              # wasm ↔ 原生 CPU 字节对比
 ```
 

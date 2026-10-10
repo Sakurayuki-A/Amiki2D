@@ -21,6 +21,43 @@
 
 ---
 
+## [未发布]
+
+> 0.10.9 之后的整理，**不含行为变更**（可以安全跳过）；发下一版时并进对应小节。
+
+### 结构：把 2 000 行级的文件拆开（5 个）
+
+- `amiki-gpu/src/tests.rs` 2893 行 → `src/tests/` 10 个文件；`amiki-scene/src/lib.rs` 2493 行 →
+  8 个类型簇模块 + `tests/`；`amiki-capi/src/api_obj.rs` 1691 行 → `api_obj/` 11 个文件；
+  `amiki-capi/src/tests.rs` 2038 行 → `src/tests/` 18 个文件；
+  `amiki-gpu/src/lib.rs` 2101 行 → 124 行 + 7 个模块（**1109 行的单个 `impl GpuRenderer` 消失**）
+- 交付面零变化：`verify.cmd` 仍 **90 声明 / 90 导出**，三示例产物 SHA256 未变
+- 实测代价：wasm 模块 **1 033.2 → 1 037.3 KB**（模块边界改变了内联与死代码删除的判定）
+
+### CI：门禁从"人记得跑"变成"机器必跑"
+
+- `.github/workflows/ci.yml` 两个 job：`test`（workspace 测试 + clippy/rustdoc `-D warnings` +
+  capi 特性矩阵 + wasm 构建）与 `c-abi`（`verify.cmd` 五项）；步骤本体在 `tools/ci-*.cmd`，
+  **本地跑的就是 CI 跑的那一份**，不会各自漂移
+- 首次真跑抓到并修掉四件事：`vcvars64.bat` 的硬编码路径（改用 `vswhere.exe`）、
+  runner 上只有软件适配器 WARP（性能类断言跳过、正确性断言按 1 LSB 容忍）、
+  包装脚本"退出码 0 但其实没跑"的**假绿**、符号计数依赖仓库路径
+
+### 文档：把计数与版本钉在测试上
+
+- 新增 `docs_sync` 三条测试：符号集合（header ↔ 实现 ↔ 文档三处对齐）、
+  header 版本宏 ↔ `Cargo.toml`、许可证声明 ↔ `LICENSE` 文件
+- 顺手修掉一批积压漂移（80/72 → **68** 个符号（0.4.0 的真实值）、151 → **363** 测试、
+  1 025.7 → **1 037.3** KB、crate 5 → 9，以及两个"当前状态"抬头还停在 0.3.0 / 0.7.0）
+- 主页 `README.md` 从 199 行压到 40 行，里面每个数字都重新实测过
+
+### 许可证
+
+- 统一为 **MIT**。此前 `Cargo.toml` 写 `MIT OR Apache-2.0` 而仓库里只有 MIT 文本 ——
+  双许可需要两份完整文本加标准声明，只有一份就该声明 MIT。
+
+---
+
 ## [0.10.9-alpha] —— 异步渲染接进 C ABI + 4K 静默错误**真修**
 
 ### ① 异步三入口进 C ABI（P3 第 ③b 步）：符号 87 → 90
@@ -396,7 +433,7 @@ UI 每帧重画同一批文字时，不必再逐字形重新查轮廓 + 缩放 +
 `font_id` 填成 `FontId::UNKNOWN` ⇒ **字体 A 的字形 5** 与 **字体 B 的字形 5** 在
 同字号下会命中**同一条** ⇒ **静默画错**。
 
-所以缓存交给**调用方**持有：**谁知道字体身份，谁持有缓存**（[`KNOWN_ISSUES`](KNOWN_ISSUES.md) 的 D8）。
+所以缓存交给**调用方**持有：**谁知道字体身份，谁持有缓存**（[`KNOWN_ISSUES`](docs/KNOWN_ISSUES.md) 的 D8）。
 
 ### 实测（`crates/amiki/tests/text_cache.rs`，3 条测试）
 
@@ -410,7 +447,7 @@ UI 每帧重画同一批文字时，不必再逐字形重新查轮廓 + 缩放 +
 1. `TextCache` 返回的是**已按字号缩放**的轮廓 + 单位变换，而 `text()` 用
    **em 轮廓 + 缩放变换** ⇒ 设备空间几何相同，但 `Draw` 的 `path` / `transform`
    两个字段合法地不同 ⇒ **判据必须比像素，不能比 `Draw` 字段**。
-   演示图：[`out/text_cache_demo.png`](../out/text_cache_demo.png)（真字体 Inter，走缓存路径）。
+   演示图在本地 `out/text_cache_demo.png`（真字体 Inter，走缓存路径）—— `out/` 不入库，所以这里不放链接。
 2. 缓存键把字号量化到 **1/16 px**（`GlyphKey.size_q`）⇒ 字号不是 1/16 整数倍时，
    缓存路径的缩放最多差 1/32 的相对量（视觉不可见，但**不是逐位相同**）。
 

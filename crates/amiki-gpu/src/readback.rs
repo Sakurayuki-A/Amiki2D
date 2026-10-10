@@ -41,7 +41,80 @@ impl GpuRenderer {
         }
     }
 
+    /// 在飞的一次回读：**只发起了 `map_async`，还没等**。
+    ///
+    /// `strip`：`None` = 取前 `byte_size` 字节（通用缓冲读回）；
+    /// `Some((padded_row, row_bytes, h))` = 按行去掉 padding（纹理读回）。
+    ///
+    /// P3 第 ① 步把"映射 / 推进 / 取值"拆开，于是同步与异步**共用一份实现**。
+    fn begin_map(
+        &self,
+        out: wgpu::Buffer,
+        byte_size: usize,
+        strip: Option<(usize, usize, u32)>,
+    ) -> PendingRead {
+        let (tx, rx) = std::sync::mpsc::channel();
+        out.slice(..).map_async(wgpu::MapMode::Read, move |r| {
+            let _ = tx.send(r);
+        });
+        PendingRead { buf: out, rx, got: None, byte_size, strip }
+    }
+
+    /// 推进一次。`true` = 可以 `finish_read` 了。
+    ///
+    /// - `WaitMode::Blocking`：`poll(Wait)` 一次到位（**不忙等**，同步路径用）；
+    /// - `WaitMode::Polling`：`poll(Poll)` 立即返回（实测单次 0.071 ms，P3 用）。
+    fn advance_read(&self, p: &mut PendingRead, mode: WaitMode) -> Result<bool, RenderError> {
+        let polled = match mode {
+            WaitMode::Blocking => self.device.poll(wgpu::PollType::Wait),
+            WaitMode::Polling => self.device.poll(wgpu::PollType::Poll),
+        };
+        polled.map_err(|e| RenderError(format!("poll 失败: {e}")))?;
+        if p.got.is_none() {
+            match p.rx.try_recv() {
+                Ok(r) => p.got = Some(r),
+                Err(std::sync::mpsc::TryRecvError::Empty) => return Ok(false),
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    return Err(RenderError("map 回调通道关闭".into()));
+                }
+            }
+        }
+        match &p.got {
+            Some(Ok(())) => Ok(true),
+            Some(Err(e)) => Err(RenderError(format!("map 失败: {e}"))),
+            None => Ok(false),
+        }
+    }
+
+    /// 取值：拷出去、`unmap`、**归还回读池**。
+    ///
+    /// 顺序很重要：**只有走到这里才归还** —— 在飞期间归还的话，同一个缓冲会被
+    /// 下一帧拿走而它还在被映射（P3 判据 4）。
+    fn finish_read(&self, p: PendingRead) -> Result<Vec<u8>, RenderError> {
+        let PendingRead { buf, byte_size, strip, .. } = p;
+        let mut out = Vec::new();
+        {
+            let data = buf.slice(..).get_mapped_range();
+            match strip {
+                None => out.extend_from_slice(&data[..byte_size.min(data.len())]),
+                Some((padded_row, row_bytes, h)) => {
+                    out.reserve(row_bytes * h as usize);
+                    for row in 0..h as usize {
+                        let start = row * padded_row;
+                        out.extend_from_slice(&data[start..start + row_bytes]);
+                    }
+                }
+            }
+        }
+        buf.unmap();
+        self.give_readback_buffer(buf);
+        Ok(out)
+    }
+
     /// 映射 + 等待 + 拷贝出 `byte_size` 字节，然后 unmap 并归还缓冲。
+    ///
+    /// P3 第 ① 步之后只负责"等待策略"，映射与取值在
+    /// `begin_map` / `advance_read` / `finish_read`（一份实现）。
     ///
     /// 失败路径**不归还**缓冲：若 `map_async` 失败则缓冲会保持已映射状态，
     /// 再次映射会报错，故直接丢弃（池会按需补建）。
@@ -50,28 +123,9 @@ impl GpuRenderer {
         out: wgpu::Buffer,
         byte_size: usize,
     ) -> Result<Vec<u8>, RenderError> {
-        let (tx, rx) = std::sync::mpsc::channel();
-        let slice = out.slice(..);
-        slice.map_async(wgpu::MapMode::Read, move |r| {
-            let _ = tx.send(r);
-        });
-        let polled = self.device.poll(wgpu::PollType::Wait);
-        let mapped = rx
-            .recv()
-            .map_err(|_| RenderError("map 回调通道关闭".into()))
-            .and_then(|r| r.map_err(|e| RenderError(format!("map 失败: {e}"))));
-        // 先把 poll 的错误报出去（保持与原实现一致的错误优先级）
-        polled.map_err(|e| RenderError(format!("poll 失败: {e}")))?;
-        mapped?;
-        let v = {
-            let data = slice.get_mapped_range();
-            let v = data[..byte_size.min(data.len())].to_vec();
-            drop(data);
-            v
-        };
-        out.unmap();
-        self.give_readback_buffer(out);
-        Ok(v)
+        let mut p = self.begin_map(out, byte_size, None);
+        while !self.advance_read(&mut p, WaitMode::Blocking)? {}
+        self.finish_read(p)
     }
 
     /// 读回 storage buffer 内容（通用小数据读回）。
@@ -126,7 +180,21 @@ impl GpuRenderer {
     }
 
     /// 把纹理读成裸字节（每像素 `bpp` 字节），按行去掉 padding。
+    ///
+    /// P3 第 ① 步之后同样建在 `begin_map` / `advance_read` / `finish_read` 之上。
     fn read_raw(&self, tex: &wgpu::Texture, bpp: usize) -> Result<Vec<u8>, RenderError> {
+        let (mut p, _) = self.begin_read_raw(tex, bpp)?;
+        while !self.advance_read(&mut p, WaitMode::Blocking)? {}
+        self.finish_read(p)
+    }
+
+    /// **非阻塞版**：发起拷贝 + 映射后立刻返回在飞句柄（P3 第 ② 步用）。
+    #[allow(dead_code)]
+    pub(crate) fn begin_read_raw(
+        &self,
+        tex: &wgpu::Texture,
+        bpp: usize,
+    ) -> Result<(PendingRead, usize), RenderError> {
         let w = tex.width();
         let h = tex.height();
         let bytes_per_row = (w as usize * bpp).div_ceil(256) * 256;
@@ -148,33 +216,40 @@ impl GpuRenderer {
             wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
         );
         self.queue.submit(Some(encoder.finish()));
-
-        let (tx, rx) = std::sync::mpsc::channel();
-        let slice = buf.slice(..);
-        slice.map_async(wgpu::MapMode::Read, move |r| {
-            let _ = tx.send(r);
-        });
-        let polled = self.device.poll(wgpu::PollType::Wait);
-        let mapped = rx
-            .recv()
-            .map_err(|_| RenderError("map 回调通道关闭".into()))
-            .and_then(|r| r.map_err(|e| RenderError(format!("map 失败: {e}"))));
-        // 失败路径不归还缓冲（可能仍处于已映射状态）
-        polled.map_err(|e| RenderError(format!("poll 失败: {e}")))?;
-        mapped?;
-
-        let mut out = Vec::with_capacity(w as usize * h as usize * bpp);
-        {
-            let data = slice.get_mapped_range();
-            for row in 0..h as usize {
-                let start = row * bytes_per_row;
-                out.extend_from_slice(&data[start..start + w as usize * bpp]);
-            }
-        }
-        buf.unmap();
-        self.give_readback_buffer(buf);
-        Ok(out)
+        let row_bytes = w as usize * bpp;
+        let p = self.begin_map(buf, buf_size, Some((bytes_per_row, row_bytes, h)));
+        Ok((p, row_bytes * h as usize))
     }
+
+    /// 推进非阻塞回读（P3 第 ② 步用）。
+    #[allow(dead_code)]
+    pub(crate) fn poll_read_raw(&self, p: &mut PendingRead) -> Result<bool, RenderError> {
+        self.advance_read(p, WaitMode::Polling)
+    }
+
+    /// 取值（P3 第 ② 步用）；与同步路径**同一个** `finish_read`。
+    #[allow(dead_code)]
+    pub(crate) fn finish_read_raw(&self, p: PendingRead) -> Result<Vec<u8>, RenderError> {
+        self.finish_read(p)
+    }
+}
+
+/// 在飞的一次回读（P3 第 ① 步）：**只发起了 `map_async`**。
+pub(crate) struct PendingRead {
+    buf: wgpu::Buffer,
+    rx: std::sync::mpsc::Receiver<Result<(), wgpu::BufferAsyncError>>,
+    got: Option<Result<(), wgpu::BufferAsyncError>>,
+    byte_size: usize,
+    strip: Option<(usize, usize, u32)>,
+}
+
+/// 等待策略：同步用 `Blocking`（一次 `Wait`，不忙等），异步用 `Polling`（立即返回）。
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WaitMode {
+    Blocking,
+    /// P3 第 ② 步（`PendingFrame::poll`）会用；当前仅同步路径在用 `Blocking`。
+    #[allow(dead_code)]
+    Polling,
 }
 
 /// IEEE 754 binary16 → f32。

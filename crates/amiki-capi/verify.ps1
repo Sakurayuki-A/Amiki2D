@@ -76,8 +76,32 @@ if (-not $vcvars) {
     Bad 'vcvars64.bat not found -- cannot run dumpbin'
 } else {
     $dump = cmd /c "`"$vcvars`" >nul 2>&1 && dumpbin /exports `"$dll`" 2>&1" | Out-String
-    $exported = [regex]::Matches($dump, '\b(amiki_[a-z0-9_]+)\b') |
-                ForEach-Object { $_.Groups[1].Value } | Sort-Object -Unique
+    # Read the exported names from the export table only. dumpbin prints:
+    #     ordinal hint RVA      name
+    #           1    0 00013FF0 amiki_affine_concat = amiki_affine_concat
+    # so the 4th column is the symbol, optionally followed by "= alias".
+    #
+    # Do NOT scan the whole dump with \b(amiki_[a-z0-9_]+)\b: the first line is
+    # "Dump of file <path>", so a checkout path containing "amiki_" was counted as
+    # an extra exported symbol (measured: cloning to D:\amiki_ci_checkout made the
+    # count 91). Worse, if the path happened to contain a declared symbol's name,
+    # a genuinely missing export would have been masked as "passing".
+    #
+    # No regex capture here on purpose: `[regex]::Matches(...) | ForEach-Object
+    # { $_.Groups[1] }` failed under Windows PowerShell 5.1 with "Cannot index into
+    # a null array". Locating the table and splitting columns has no such version
+    # dependency.
+    $exported = @()
+    $inTable = $false
+    foreach ($line in ($dump -split "`n")) {
+        if ($line -match 'ordinal\s+hint\s+RVA') { $inTable = $true; continue }
+        if ($line -match '^\s*Summary') { $inTable = $false }
+        if (-not $inTable) { continue }
+        foreach ($tok in ($line.Trim() -split '\s+')) {
+            if ($tok -like 'amiki_*') { $exported += $tok; break }
+        }
+    }
+    $exported = $exported | Sort-Object -Unique
     $declared = (Get-Content (Join-Path $inc 'amiki.h')) |
                 ForEach-Object { [regex]::Match($_, '^AMIKI_API\s+[\w\s\*]+?\b(amiki_[a-z0-9_]+)\s*\(') } |
                 Where-Object { $_.Success } |
@@ -87,6 +111,8 @@ if (-not $vcvars) {
         Bad ("declared but not exported: " + ($missing -join ', '))
     } elseif ($declared.Count -eq 0) {
         Bad 'parsed 0 declarations from amiki.h -- the regex is wrong, not the ABI'
+    } elseif ($exported.Count -eq 0) {
+        Bad 'parsed 0 exports from dumpbin -- the regex is wrong, not the ABI'
     } else {
         Ok "$($declared.Count) declared / $($exported.Count) exported, none missing"
     }

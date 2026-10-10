@@ -2775,3 +2775,118 @@ fn sparse_and_dense_agree_on_even_odd() {
     eprintln!("even-odd：稀疏 ⇄ 稠密逐字节一致（{} 字节）", sparse.len());
 }
 
+// ───────────────────── 1D 派发契约与 4K 尾部回归（0.10.9）─────────────────────
+
+/// **纯算术**：单维派发的分批必须让每个元素**恰好被处理一次**。
+///
+/// 这是那个 4K 静默错误的钉子：宿主按"每行 65535 个**工作组**"推进，而内核的
+/// `lin()` 按"每行 65535 个**元素**"解码 —— 行与行重叠 95%，尾部 62 385 个元素
+/// 从未被处理。本测试不需要 GPU，所以它对任何环境都有效。
+#[test]
+fn dispatch_dims_1d_covers_every_element_exactly_once() {
+    /// 与内核 `lin()` 的行距一致（见 `dispatch_dims_1d` 的文档）。
+    const ROW: u64 = 65_536;
+    const WG: u64 = 64;
+
+    // 取值覆盖：小尺寸、行边界两侧、旧的 65535 工作组边界、以及旧 bug 的确切触发点。
+    for n in [
+        1u32,
+        63,
+        64,
+        65,
+        1_024 * 64,
+        1_024 * 64 + 1,
+        65_535,
+        65_536,
+        65_537,
+        4_194_240,
+        4_194_241,
+        4_259_775,
+        4_322_160,
+        10_000_000,
+        65_535 * 65_536,
+    ] {
+        let (x, y) = dispatch_dims_1d(n);
+        assert!(x >= 1 && y >= 1, "n={n}：派发维度不能为 0");
+        assert!(x <= 1_024, "n={n}：x={x} 超过一行");
+        assert!(x <= 65_535 && y <= 65_535, "n={n}：超出单维上限");
+
+        let per_row = x as u64 * WG;
+        if y == 1 {
+            assert!(per_row >= n as u64, "n={n}：单行没盖住");
+        } else {
+            assert_eq!(per_row, ROW, "n={n}：多行时每行必须正好一行，否则会重叠或留空隙");
+            assert!(
+                (y as u64 - 1) * ROW + per_row >= n as u64,
+                "n={n}：最后一行没盖到尾部（尾部元素会永远不被处理）"
+            );
+        }
+        // 不做无谓的放大：总量最多是需要的两倍（只在行边界附近发生）
+        let wg = (n as u64).div_ceil(WG);
+        assert!((x as u64) * (y as u64) <= 2 * wg, "n={n}：派发的总量浪费过多");
+    }
+
+    // 旧 bug 的确切形状：3840×2160 / 2000 矩形 ⇒ carry 需要 4 322 160 个元素
+    assert_eq!(dispatch_dims_1d(4_322_160), (1_024, 66));
+    assert_eq!(dispatch_dims_1d(0), (0, 0), "0 元素 ⇒ 调用方跳过派发");
+}
+
+/// **回归钉子（0.10.9）**：`draws × tile 行` 够大时，稀疏路径的 1D 派发会拆成二维；
+/// 只要宿主与内核的行距不一致，**尾部 strip 就永远不会被处理** —— 表现是画面最下面
+/// 若干行瓦片整片空白（0.10.8 把它记成了"GPU 在 `y ≥ 2048` 会算错"）。
+///
+/// 这里用最小的复现形状：256×2160（135 个 tile 行）× 2000 个矩形 ⇒
+/// `draws × tile 行 = 270 135 > 262 140`（= `65535×64/16`），carry 需要
+/// 4 322 160 个元素 = 67 534 个工作组 ⇒ **必然触发二维分批**。
+#[test]
+fn tall_canvas_with_many_draws_matches_cpu_in_the_bottom_rows() {
+    use amiki_math::Affine;
+    use amiki_scene::{Color, Paint, PathBuilder, Scene};
+
+    let Some((renderer, _gpu_guard)) = gpu() else { return };
+
+    let (w, h, n) = (256u32, 2160u32, 2000u32);
+    let mut scene = Scene::new(w, h);
+    let mut pb = PathBuilder::new();
+    pb.rect(0.0, 0.0, w as f32, h as f32);
+    scene.push(Affine::IDENTITY, pb.build(), Paint::Solid(Color::rgb8(250, 250, 252)));
+    let side = (n as f32).sqrt().ceil() as u32;
+    for i in 0..n {
+        let col = i % side;
+        let row = i / side;
+        let cw = w as f32 / side as f32;
+        let ch = h as f32 / side as f32;
+        let (x0, y0) = (col as f32 * cw + cw * 0.15, row as f32 * ch + ch * 0.15);
+        let mut pb = PathBuilder::new();
+        pb.rect(x0, y0, x0 + cw * 0.7, y0 + ch * 0.7);
+        let t = i as f32 / n as f32;
+        scene.push(
+            Affine::IDENTITY,
+            pb.build(),
+            Paint::Solid(Color { r: t, g: 1.0 - t, b: (t * 3.0) % 1.0, a: 1.0 }),
+        );
+    }
+
+    let gpu_px = renderer.render_blocking(&scene, 0.05).expect("GPU 渲染失败");
+    let cpu_px = amiki_raster::render(&amiki_raster::bin(&scene, 0.05));
+
+    let max_diff = gpu_px
+        .iter()
+        .zip(cpu_px.iter())
+        .map(|(a, b)| (*a as i32 - *b as i32).unsigned_abs())
+        .max()
+        .unwrap_or(0);
+    assert!(
+        max_diff <= 2,
+        "GPU 与 CPU 最大通道差 {max_diff} 超出容差 —— 尾部 tile 可能又被丢掉了"
+    );
+
+    // 最下面一行必须真的画了东西（旧 bug 时这里是全透明）
+    let bottom = ((h - 1) * w + w / 2) as usize * 4;
+    assert!(
+        gpu_px[bottom + 3] > 0,
+        "最下面一行是透明的：尾部 strip 又被丢掉了（1D 派发的行距与 lin() 不一致？）"
+    );
+    eprintln!("4K 尾部回归：{w}x{h}/{n} 矩形，最大通道差 {max_diff}");
+}
+

@@ -210,7 +210,7 @@ extern "C" {
 
 #define AMIKI_VERSION_MAJOR 0
 #define AMIKI_VERSION_MINOR 10
-#define AMIKI_VERSION_PATCH 8
+#define AMIKI_VERSION_PATCH 9
 /** 预发布标签（正式版为空串）。**不参与数值比较**，只用于展示。 */
 #define AMIKI_VERSION_PRERELEASE "alpha"
 
@@ -839,13 +839,13 @@ AMIKI_API amiki_result amiki_canvas_end_layer(amiki_canvas* canvas);
  *
  * 长度不足返回 `AMIKI_ERROR_INVALID_ARGUMENT` 且**不写入任何字节**。
  *
- * ## 超出 GPU 已验证范围的画布：回落 CPU
+ * ## 大画布：不再回落 CPU（0.10.9）
  *
- * GPU 路径在 **`y ≥ 2048`** 会**静默算错**（实测最差像素差 255，见
- * `docs/KNOWN_ISSUES.md` 与 `amiki::GPU_MAX_SUPPORTED_SIDE`）。所以宽或高超过
- * **2048** 的画布，**即使 context 选的是 GPU 后端**，也会明确**回落到 CPU 引擎**
- * 并在 stderr 打印原因 —— 输出永远正确，代价是慢一些。
- * 异步入口 `amiki_canvas_begin_render_rgba8` 做**同一个判断**。
+ * `0.10.8` 曾规定"宽或高超过 2048 的画布一律回落 CPU"，因为当时已知 GPU 会在 4K
+ * 画布的最下面若干行**静默画错**。那条的**真因已经查明并修掉**（与 `y` 无关：稀疏路径
+ * 把 1D 派发拆成二维时，宿主与内核的行距不一致，导致尾部 strip 从未被处理），
+ * 所以这条限制**已删除** —— 大画布照常走 GPU，与 CPU 的差异回到引擎一贯的承诺：
+ * **≤ 2/255**（实测 3840×2160 / 2000 矩形：最大通道差 0，GPU 313 ms vs CPU 371 ms）。
  *
  * ## 与 OpenGL 宿主共存时的性能特征（嵌入式集成反馈 P3）
  *
@@ -889,8 +889,8 @@ AMIKI_API amiki_result amiki_canvas_render_rgba8(amiki_canvas* canvas, uint8_t* 
  * ## 语义（写死在这里，实现与测试都照此）
  *
  * - 在飞帧是**提交那一刻场景的快照**：提交之后再改画布不影响它；
- * - **CPU 分支首帧即就绪**：CPU 后端、以及 GPU 超出已验证范围而回落 CPU 的情形，
- *   在 `begin` 里就已经算完 ⇒ 第一次 `poll` 就是 ready，`try_read` 立刻能取。
+ * - **CPU 分支首帧即就绪**：CPU 后端（以及 GPU 不可用时的回落）在 `begin` 里就已经
+ *   算完 ⇒ 第一次 `poll` 就是 ready，`try_read` 立刻能取。
  *   这**不是遗漏** —— CPU 本来就没有"在飞"可言，统一语义比"假装在飞"好；
  * - **重复 begin 是允许的**：上一个还没取走的帧被丢弃（它只是一次还没算完的计算）。
  *   这样"不想等了"不需要再来一个 cancel 接口；

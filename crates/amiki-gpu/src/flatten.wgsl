@@ -32,9 +32,20 @@ fn elem_base(i: u32) -> u32 {
     return (nq + fp.n_cubics) * 2u + (i - nq - fp.n_cubics);
 }
 
+// 线性 2D 索引：宿主按 `(1024, ⌈n/65536⌉)` 派发（见 `sparse.rs` 的 `dispatch_1d`）。
+//
+// **凡是经 `dispatch_1d` 派发的内核都必须这样解码**：行距 = 65536 元素
+// = 1024 工作组 × 64 线程。只读 `gid.x` 的内核在 `gid.y > 0` 时会丢掉
+// 除第一行以外的**全部**元素（0.10.9 修 4K 静默错误时踩到过：
+// `strip_clear` 只清了前 65 536 个 strip，其余的 `strip_meta` 保持 0，
+// 于是 measure 把 20 万个空 strip 当成"活跃"，画面虽然对、结构全错）。
+fn lin(gid: vec3<u32>) -> u32 {
+    return gid.x + gid.y * 65536u;
+}
+
 @compute @workgroup_size(64)
 fn flatten(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let i = gid.x;
+    let i = lin(gid);
     if (i < fp.n_quads) {
         let n = counts[i];
         let base = seg_base[i];

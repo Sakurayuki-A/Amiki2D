@@ -30,9 +30,10 @@ struct SparseParams {
 
 const TILE: f32 = 16.0;
 
-// 线性 2D 索引：宿主以 (≤65535, ⌈n/65535⌉) 派发
+// 线性 2D 索引：宿主按 `(1024, ⌈n/65536⌉)` 派发（见 `sparse.rs` 的 `dispatch_1d`）。
+// 行距 = 65536 元素 = 1024 工作组 × 64 线程，**必须与宿主一致**（理由见该函数）。
 fn lin(gid: vec3<u32>) -> u32 {
-    return gid.x + gid.y * 65535u;
+    return gid.x + gid.y * 65536u;
 }
 
 @compute @workgroup_size(64)

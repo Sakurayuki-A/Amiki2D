@@ -125,7 +125,7 @@ pub struct AmikiCanvas {
 /// 与 **mip bias**，与同步入口 `amiki_canvas_render_rgba8` 用的是同一份实现 ——
 /// "两条入口逐字节相同"这条承诺的根据就在这里。
 pub(crate) enum PendingCanvasRender {
-    /// **已经算好**（CPU 后端；或 GPU 超出已验证范围而回落 CPU）⇒ 首帧即就绪。
+    /// **已经算好**（CPU 后端，或 GPU 不可用时的回落）⇒ 首帧即就绪。
     Ready(Vec<u8>),
     /// GPU 上真在飞。`PendingFrame` 自己持 `Arc<GpuRenderer>`，所以无生命周期参数。
     #[cfg(feature = "gpu")]

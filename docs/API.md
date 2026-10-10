@@ -44,7 +44,9 @@
 | `amiki::CanvasError` / `amiki::MAX_STACK_DEPTH` | 状态栈错误（`StackOverflow` / `StackUnderflow`）与深度上限（32） |
 | `Canvas::scene` | 产出场景（字段） |
 | `amiki::color` | 调色板常量 |
-| `render_to_rgba(&Canvas, f32) -> Result<Vec<u8>, gpu::RenderError>` | CPU 渲染为 RGBA8 |
+| `render_to_rgba(&Canvas, f32) -> Result<Vec<u8>, gpu::RenderError>` | 渲染为 RGBA8：**GPU 优先**，GPU 不可用时回落 CPU 并打印原因 |
+| `begin_render_to_rgba(&Canvas, f32) -> Result<PendingRender, _>`（0.10.9） | **异步入口**：提交后立即返回，由调用方 `poll` / `take_ready` / `try_read` 决定何时等 |
+| `PendingRender::{poll, take_ready, try_read}`（0.10.9） | `take_ready`：未就绪返回 `None` 且**不消费**那一帧；`try_read` 是消费版（未就绪即丢弃） |
 
 ### 再导出的模块
 

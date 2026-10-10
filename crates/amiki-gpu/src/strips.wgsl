@@ -39,9 +39,16 @@ struct StripParams {
 
 const TILE: f32 = 16.0;
 
+// 线性 2D 索引：宿主按 `(1024, ⌈n/65536⌉)` 派发（见 `sparse.rs` 的 `dispatch_1d`）。
+// 行距 = 65536 元素 = 1024 工作组 × 64 线程；**只读 `gid.x` 会在 `gid.y > 0` 时
+// 丢掉除第一行以外的全部元素**（理由与事故记录见 `dispatch_1d` 的文档）。
+fn lin(gid: vec3<u32>) -> u32 {
+    return gid.x + gid.y * 65536u;
+}
+
 @compute @workgroup_size(64)
 fn strip_clear(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let si = gid.x;
+    let si = lin(gid);
     if (si >= sp.tiles_y * sp.n_draws) {
         return;
     }
@@ -53,7 +60,7 @@ fn strip_clear(@builtin(global_invocation_id) gid: vec3<u32>) {
 
 @compute @workgroup_size(64)
 fn strip_extract(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let i = gid.x;
+    let i = lin(gid);
     if (i >= sp.total_segments) {
         return;
     }

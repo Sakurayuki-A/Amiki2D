@@ -1873,14 +1873,15 @@ fn async_matches_sync_on_the_gpu_backend() {
     amiki_context_destroy(ctx);
 }
 
-/// 0.10.8 的"止血"必须**接进 C ABI**：GPU 在 `y ≥ 2048` 会静默算错，
-/// 所以超范围的画布只能走 CPU。
+/// **0.10.9 的回归钉子（C ABI 侧）**：`draws × tile 行` 够大时，稀疏路径的 1D 派发
+/// 会拆成二维 —— 宿主与内核的行距不一致会让**尾部 strip 永远不被处理**，
+/// 于是画面最下面若干行整片透明（`0.10.8` 记为"GPU 在 `y ≥ 2048` 会算错"，
+/// 当时的处置是"超范围回落 CPU"；真因查明后那条限制已删除）。
 ///
-/// 判据：GPU 上下文与纯 CPU 上下文渲染**同一场景**得到**逐字节相同**的像素，
-/// 且异步入口在这一尺寸上**首帧即就绪**（回落 CPU 分支的性质）。
-/// 若哪天这条回落被去掉，下面这组断言就会失去意义 —— 所以它同时是回归钉子。
+/// 判据：GPU 上下文与纯 CPU 上下文渲染**同一场景**，最大通道差 ≤ 2，
+/// 且**最下面一行不是透明的**（旧 bug 时那里什么都没有）。
 #[test]
-fn oversized_canvas_falls_back_to_cpu_even_on_the_gpu_backend() {
+fn tall_canvas_with_many_draws_is_correct_on_the_gpu_backend() {
     let mut ctx: *mut AmikiContext = ptr::null_mut();
     assert_eq!(amiki_context_create(AMIKI_BACKEND_AUTO, &mut ctx), AMIKI_OK);
     if amiki_context_backend(ctx) != AMIKI_BACKEND_GPU {
@@ -1889,36 +1890,68 @@ fn oversized_canvas_falls_back_to_cpu_even_on_the_gpu_backend() {
         return;
     }
 
-    // 2049 > GPU_MAX_SUPPORTED_SIDE(2048)
-    let (w, h) = (8u32, 2049u32);
+    // 256×2160（135 个 tile 行）× 2000 个矩形 ⇒ draws × tile 行 = 270 135 > 262 140
+    // ⇒ carry 需要 4 322 160 个元素（> 65535 个工作组）⇒ 必然触发二维分批。
+    let (w, h, n) = (256u32, 2160u32, 2000u32);
+    let side = (n as f32).sqrt().ceil() as u32;
+
     let mut cv_gpu: *mut AmikiCanvas = ptr::null_mut();
     assert_eq!(amiki_canvas_create(ctx, w, h, &mut cv_gpu), AMIKI_OK);
-    assert_eq!(
-        amiki_canvas_draw_rect(cv_gpu, 0.0, 0.0, w as f32, h as f32, amiki_paint_solid(amiki_color_rgb8(0, 255, 0))),
-        AMIKI_OK
-    );
-    let gpu_bytes = render(cv_gpu, w, h);
-
     let (cctx, _) = cpu_context();
     let mut cv_cpu: *mut AmikiCanvas = ptr::null_mut();
     assert_eq!(amiki_canvas_create(cctx, w, h, &mut cv_cpu), AMIKI_OK);
-    assert_eq!(
-        amiki_canvas_draw_rect(cv_cpu, 0.0, 0.0, w as f32, h as f32, amiki_paint_solid(amiki_color_rgb8(0, 255, 0))),
-        AMIKI_OK
+
+    // 同一个场景画到两块画布上（背景 + 45×45 的彩色矩形网格）
+    for cv in [cv_gpu, cv_cpu] {
+        assert_eq!(
+            amiki_canvas_draw_rect(
+                cv,
+                0.0,
+                0.0,
+                w as f32,
+                h as f32,
+                amiki_paint_solid(amiki_color_rgb8(250, 250, 252))
+            ),
+            AMIKI_OK
+        );
+        for i in 0..n {
+            let col = i % side;
+            let row = i / side;
+            let cw = w as f32 / side as f32;
+            let ch = h as f32 / side as f32;
+            let (x0, y0) = (col as f32 * cw + cw * 0.15, row as f32 * ch + ch * 0.15);
+            let t = i as f32 / n as f32;
+            assert_eq!(
+                amiki_canvas_draw_rect(
+                    cv,
+                    x0,
+                    y0,
+                    x0 + cw * 0.7,
+                    y0 + ch * 0.7,
+                    amiki_paint_solid(amiki_color_rgba(t, 1.0 - t, (t * 3.0) % 1.0, 1.0))
+                ),
+                AMIKI_OK
+            );
+        }
+    }
+
+    let gpu_px = render(cv_gpu, w, h);
+    let cpu_px = render(cv_cpu, w, h);
+    let max_diff = gpu_px
+        .iter()
+        .zip(cpu_px.iter())
+        .map(|(a, b)| (*a as i32 - *b as i32).unsigned_abs())
+        .max()
+        .unwrap_or(0);
+    assert!(
+        max_diff <= 2,
+        "GPU 与 CPU 最大通道差 {max_diff} 超出容差 —— 尾部 tile 可能又被丢掉了"
     );
-    let cpu_bytes = render(cv_cpu, w, h);
 
-    assert!(cpu_bytes.iter().any(|&b| b != 0), "有牙的前提：画面不是空的");
-    assert_eq!(gpu_bytes, cpu_bytes, "超范围画布必须回落到 CPU（GPU 会画错最下面一带）");
-
-    // 异步入口做同一个判断 ⇒ 首帧即就绪
-    assert_eq!(amiki_canvas_begin_render_rgba8(cv_gpu), AMIKI_OK);
-    let mut ready = 0i32;
-    assert_eq!(amiki_canvas_poll_render_rgba8(cv_gpu, &mut ready), AMIKI_OK);
-    assert_eq!(ready, 1, "回落 CPU 的分支应首帧即就绪");
-    let mut out = vec![0u8; cpu_bytes.len()];
-    assert_eq!(amiki_canvas_try_read_render_rgba8(cv_gpu, out.as_mut_ptr(), out.len()), AMIKI_OK);
-    assert_eq!(out, cpu_bytes);
+    // 最下面一行必须真的画了东西（旧 bug 时这里是全透明）
+    let bottom = (((h - 1) * w + w / 2) as usize) * 4;
+    assert!(gpu_px[bottom + 3] > 0, "最下面一行是透明的：尾部 strip 又被丢掉了");
+    eprintln!("C ABI 4K 尾部回归：{w}x{h}/{n} 矩形，最大通道差 {max_diff}");
 
     amiki_canvas_destroy(cv_gpu);
     amiki_canvas_destroy(cv_cpu);

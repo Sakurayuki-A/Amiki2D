@@ -43,10 +43,19 @@ fn async_matches_sync_and_reaches_ready() {
     eprintln!("async == sync（{} 字节），轮询 {polls} 次", got.len());
 }
 
-/// 判据 2：**超出 GPU 已验证范围**时走 CPU 分支，第一次 poll 就必须是 Ready。
+/// 判据 2：**没有 GPU** 时走 CPU 分支，第一次 poll 就必须是 Ready。
+///
+/// 注意（0.10.9）：这里原本用 `8×2049` 的画布触发"超出 GPU 已验证范围 ⇒ 回落 CPU"
+/// 那条止血；**真因修掉之后那条限制已删除**（见 `amiki_gpu::dispatch_dims_1d`），
+/// 所以现在只有"机器上没有 GPU"才会走 CPU 分支 —— 有 GPU 的环境跳过本测试，
+/// CPU 分支本身由 `amiki-capi` 的 `async_trio_matches_sync_on_the_cpu_backend`
+/// （显式 `AMIKI_BACKEND_CPU`）覆盖。
 #[test]
 fn cpu_branch_is_ready_on_first_poll() {
-    // 2049 > GPU_MAX_SUPPORTED_SIDE ⇒ 明确回落 CPU（与同步路径同一判断）
+    if amiki::gpu::GpuRenderer::new_blocking().is_ok() {
+        eprintln!("本机有 GPU，CPU 分支不可达（回落路径已随 0.10.9 的修复删除），跳过");
+        return;
+    }
     let c = Canvas::new(8, 2049);
     let mut pending = amiki::begin_render_to_rgba(&c, 0.05).expect("begin");
     assert_eq!(

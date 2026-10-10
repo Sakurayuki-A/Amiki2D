@@ -28,9 +28,14 @@ struct SparseParams {
 @group(0) @binding(5) var<storage, read_write> cell_csr_off: array<u32>;
 @group(0) @binding(6) var<storage, read_write> cell_meta: array<vec4<u32>>;
 
-// 线性 2D 索引：宿主以 (≤65535, ⌈n/65535⌉) 派发（n = draws × tile 行 × 16 可达千万级）
+// 线性 2D 索引：宿主按 `(1024, ⌈n/65536⌉)` 派发（见 `sparse.rs` 的 `dispatch_1d`）。
+//
+// **行距 = 65536 个元素 = 1024 个工作组 × 64 线程**，与宿主的分批一一对应。
+// 两侧步长必须一致：早先这里是 `65535`（元素），而宿主按 65535 **工作组**推进，
+// 于是行与行重叠 95%，**尾部的元素永远没人处理** —— 4K/2000 矩形时正是最下面
+// 两行瓦片整片空白（0.10.9 修掉的那个静默错误）。
 fn lin(gid: vec3<u32>) -> u32 {
-    return gid.x + gid.y * 65535u;
+    return gid.x + gid.y * 65536u;
 }
 
 @compute @workgroup_size(64)

@@ -169,14 +169,13 @@ impl GpuRenderer {
                 entries: &all,
             })
         };
-        /// 单维派发（入参为**元素数**；自动按 65535 拆分到 2D，规避工作组维度上限）
+        /// 单维派发：维度由 [`dispatch_dims_1d`] 给出（**与内核 `lin()` 的行距一一对应**，
+        /// 事故记录见那个函数的文档）。
         fn dispatch_1d(pass: &mut wgpu::ComputePass<'_>, n_elements: u32) {
-            if n_elements == 0 {
+            let (x, y) = dispatch_dims_1d(n_elements);
+            if x == 0 {
                 return;
             }
-            let wg = n_elements.div_ceil(64);
-            let x = wg.min(65_535);
-            let y = wg.div_ceil(65_535);
             pass.dispatch_workgroups(x, y, 1);
         }
 

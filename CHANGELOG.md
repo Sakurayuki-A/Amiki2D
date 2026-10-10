@@ -21,6 +21,99 @@
 
 ---
 
+## [0.10.9-alpha] —— 异步渲染接进 C ABI + 4K 静默错误**真修**
+
+### ① 异步三入口进 C ABI（P3 第 ③b 步）：符号 87 → 90
+
+`amiki_canvas_begin_render_rgba8` / `amiki_canvas_poll_render_rgba8` /
+`amiki_canvas_try_read_render_rgba8`（+ `AMIKI_ERROR_BUSY = 10`）。
+
+把"提交"与"读回"分到不同帧 —— 嵌入式反馈里那条"持有 GL 上下文时每帧固定 ~20 ms
+同步停顿"（B11）终于有了对外的错帧手段。
+
+- 在飞帧挂在**画布**上，不是新句柄 ⇒ **不需要第 4 个 `_destroy`**，也就没有"忘了销毁"
+  这种泄漏路径（取走即释放；`amiki_canvas_clear` 会把它一起丢掉）；
+- `try_read` 未就绪 ⇒ `AMIKI_ERROR_BUSY`：**一个字节都不写**，且那一帧**留在原地**
+  （可以继续 `poll`）；`out_len` 不足 ⇒ 拒绝且**不消费**帧；没 `begin` 就
+  `poll` / `try_read` ⇒ 显式报错（**不假装已就绪**）；
+- **重复 `begin` 允许**：旧的未读帧被丢弃 ⇒ "不想等了"不需要再来一个 cancel 接口；
+- 与同步入口**逐字节相同**（共用前置判断与同一份 CPU 实现），CPU 分支首帧即就绪。
+
+门面侧同步补齐两块：`PendingFrame::take_ready(&mut self)`（与门面的
+`PendingRender::take_ready`）—— "取不到不算数"，C ABI 的三入口正是建在它上面；
+以及 `PendingRender::Cpu(Option<Vec<u8>>)`：取走后再取得 `None`，
+而不是一张**零字节的"合法空图"**。
+
+### ② 修：`PendingFrame::try_read` 会在**未映射**的缓冲上取像素
+
+`finish_read_f32` 直接 `get_mapped_range()`，而 map 回调还没跑过时，那正是 wgpu
+明确会 **panic** 的用法。现在就绪判据是 `PendingRead::map_outcome`，并且回调结果
+**只读不取**：
+
+> 回调跑完之后 `tx` 会被析构 ⇒ 同一个通道**再** `try_recv` 得到的是 `Disconnected`。
+> 第一版把结果 `take` 走了，于是 `poll` 报 Ready 之后 `try_read` 反而报"通道关闭" ——
+> 是 C ABI 的测试把它抓出来的。
+
+### ③ 真修 4K 静默错误：真因是 1D 派发拆二维时**宿主与内核的行距不一致**
+
+`0.10.8` 把现象记成"GPU 在 `y ≥ 2048` 会算错"并加了止血。这一版**查明真因并修掉**：
+
+```text
+宿主 dispatch_1d：x = min(wg, 65535)，y = ⌈wg/65535⌉     ← 按 65535 个【工作组】推进
+内核 lin(gid)   ：gid.x + gid.y * 65535u                 ← 按 65535 个【元素】推进
+```
+
+两者差 64 倍（一个工作组 64 线程）⇒ 行与行**重叠 95%**（同一个元素被反复处理：
+对 `atomicAdd` 的内核就是**重复计数**），而真正超出的尾部**永远不会被处理**。
+
+复现形状（**与 `y` 无关**）：256×2160 × 2000 个矩形 ⇒ `draws × tile 行 = 270 135
+> 262 140`，carry 需要 `135×2001×16 = 4 322 160` 个元素 = 67 534 个工作组 ⇒
+拆成 `(65535, 2)`：最大元素下标只到 4 259 774，**尾部 62 385 个元素 = 3899 个 strip
+从未执行**。strip 按 **tile 行主序**编号 ⇒ 最下面两行瓦片的 `cell_meta` 一直是 0 ⇒
+fine 阶段在那两行**什么都不画**（实测最差像素差 255、`gpu=0`，即整行透明）。
+`0.10.8` 的"`y ≥ 2048`"只是 256px 探针分块把这条带子框在了那一块。
+
+**修法**：行距统一为 `1024 个工作组 × 64 线程 = 65536 个元素`（`dispatch_dims_1d`），
+并把 `strips.wgsl` / `flatten.wgsl` 里**只读 `gid.x`** 的索引也改成同一个 `lin()`。
+
+> 后半句是修的时候**踩出来**的：只改宿主的话，`strip_clear` 只清了前 65 536 个 strip，
+> 其余 `strip_meta` 保持 0 ⇒ `measure` 把 20 万个空 strip 当成"活跃"，
+> 画面是对的、结构全错。**凡经 `dispatch_1d` 派发的内核都必须按同一个行距解码**。
+
+**顺带的收益**（同一测量，3840×2160 / 2000 矩形，release，各含提取与读回）：
+
+| | CPU | GPU（修前） | GPU（修后） |
+|---|---|---|---|
+| 耗时 | 371 ms | 435 ms | **313 ms** |
+| 最大通道差 | — | **255**（最下两行空白） | **0** |
+
+### ④ 删除止血：`GPU_MAX_SUPPORTED_SIDE` 与"超 2048 回落 CPU"
+
+真因既已修掉，那条限制就没有存在理由了 —— **删掉**（`0.10.8` 引入的公开常量一并移除，
+0.x 允许破坏）。大画布照常走 GPU，与 CPU 的差异回到引擎一贯的承诺 **≤ 2/255**；
+C ABI 侧"即使 context 是 GPU 后端也回落 CPU"的行为随之消失。
+
+### ⑤ 回归钉子（两条，都**验过有牙**）
+
+- `dispatch_dims_1d_covers_every_element_exactly_once`（**纯算术，不需要 GPU**）：
+  任何元素都必须**恰好被处理一次**，且允许的浪费最多 2× —— 把公式换回旧的立刻红。
+- `tall_canvas_with_many_draws_matches_cpu_in_the_bottom_rows`（`amiki-gpu`）与
+  `tall_canvas_with_many_draws_is_correct_on_the_gpu_backend`（C ABI）：
+  上面那个复现形状，判据是 **≤ 2/255 且最下面一行不是透明的**（旧 bug 时那里全透明）。
+
+### 验证
+
+```text
+测试       361 passed / 0 failed（+2 回归钉子）
+静态检查   clippy 0 告警 · cargo doc 0 告警 · header 按 C 与 C++ /W4 /WX
+C ABI      header 声明 90 / 导出 90，无缺失（verify.cmd 五项全过）
+零破坏     三示例字节相同，SHA256 90A8B3B8… 未变
+WASM       1 033.2 KB（纯 CPU）；原生 CPU 与 wasm 产物逐字节相同
+版本       Cargo.toml / header 宏 / amiki_version() 三处一致 = 0.10.9-alpha
+```
+
+---
+
 ## [0.10.8-alpha] —— GPU 路径：一个 60× 性能修复 + 一个正确性止血
 
 ### ① 修：每次渲染都在重建 GPU 设备（60×）

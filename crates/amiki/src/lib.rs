@@ -676,29 +676,22 @@ fn shared_gpu_renderer() -> Result<std::sync::Arc<gpu::GpuRenderer>, String> {
     }
 }
 
-/// GPU 路径**已验证支持的最大边长**（0.10.8）。
-///
-/// 超过它的画布会**明确回落到 CPU**，而不是静默画错。理由（实测，见
-/// `crates/amiki/tests/consistency_probe.rs`）：3840×2160 的画布，GPU 会在
-/// **`y ≥ 2048` 的横带**上给出错误像素（最差像素差 255、`>16` 的通道 19.4 万个、
-/// 错误聚集在第 128 行瓦片起 —— `2048 / TILE(16) = 128`）。
-/// 在查清并修掉那个上限之前，**宁可少用 GPU，也不输出错的像素**。
-#[cfg(feature = "gpu")]
-pub const GPU_MAX_SUPPORTED_SIDE: u32 = 2048;
-
-/// 便捷入口：GPU 渲染为 RGBA8；GPU 不可用、或画布超出**已验证范围**时回落 CPU 引擎。
+/// 便捷入口：GPU 渲染为 RGBA8；**GPU 不可用时**回落 CPU 引擎。
 ///
 /// 渲染器是**进程级共享**的（见私有函数 `shared_gpu_renderer`）；锁只在一帧渲染期间持有。
+///
+/// # 不再有"画布太大 ⇒ 回落 CPU"这条（0.10.9）
+///
+/// `0.10.8` 曾在这里加了 `GPU_MAX_SUPPORTED_SIDE = 2048` 的止血：当时已知 GPU 会在
+/// 4K 画布的最下面若干行**静默画错**。那条的**真因已经查明并修掉**（与 `y` 无关，
+/// 是 1D 派发拆成二维时宿主与内核的行距不一致 —— 见 `amiki_gpu::dispatch_dims_1d`
+/// 的文档），所以这个常量连同回落分支一起删掉了：大画布照常走 GPU，
+/// 与 CPU 的差异回到引擎一贯的承诺 —— **≤ 2/255**。
+///
+/// 实测（RTX 3050 / Vulkan，release，各含提取与读回）：3840×2160 / 2000 矩形
+/// CPU 371 ms vs **GPU 313 ms**（修前 GPU 435 ms —— 旧的分批让 95% 的元素被重复处理）。
 #[cfg(feature = "gpu")]
 pub fn render_to_rgba(canvas: &Canvas, flatten_eps: f32) -> Result<Vec<u8>, gpu::RenderError> {
-    let (w, h) = (canvas.scene.width, canvas.scene.height);
-    if w > GPU_MAX_SUPPORTED_SIDE || h > GPU_MAX_SUPPORTED_SIDE {
-        eprintln!(
-            "画布 {w}×{h} 超出 GPU 路径已验证范围（≤ {GPU_MAX_SUPPORTED_SIDE}），\
-             已知 y≥2048 会算错；使用 CPU 引擎"
-        );
-        return Ok(render_cpu(canvas, flatten_eps));
-    }
     match shared_gpu_renderer() {
         Ok(r) => r.render_blocking(&canvas.scene, flatten_eps),
         Err(msg) => {
@@ -710,9 +703,8 @@ pub fn render_to_rgba(canvas: &Canvas, flatten_eps: f32) -> Result<Vec<u8>, gpu:
 
 /// 异步渲染的在飞结果（P3 第 ③ 步）。
 ///
-/// 两种形态：`Gpu` 是真正在飞的帧；`Cpu` 是**已经算好**的结果 —— 当画布超出
-/// GPU 已验证范围、或 GPU 不可用时，异步入口与同步入口做出**同样的选择**（回落 CPU），
-/// 于是 `Cpu` 恒为"首帧即就绪"。
+/// 两种形态：`Gpu` 是真正在飞的帧；`Cpu` 是**已经算好**的结果 —— GPU 不可用时，
+/// 异步入口与同步入口做出**同样的选择**（回落 CPU），于是 `Cpu` 恒为"首帧即就绪"。
 ///
 /// `Cpu` 里是 `Option`：**结果被取走之后就是 `None`** —— 这样"再取一次"得到
 /// `None`（还没好 / 已经取走），而不是一张**零字节的图**（后者会被当成一张合法的空图）。
@@ -753,20 +745,13 @@ impl PendingRender {
 
 /// **异步入口**：提交后立即返回，由调用方 `poll` / `try_read`（P3 第 ③ 步）。
 ///
-/// 与 [`render_to_rgba`] 走**同一套前置判断**（超范围 / GPU 不可用 ⇒ 回落 CPU），
+/// 与 [`render_to_rgba`] 走**同一套前置判断**（GPU 不可用 ⇒ 回落 CPU），
 /// 所以两条路径的结果必然一致（有测试按逐字节比对）。
 #[cfg(feature = "gpu")]
 pub fn begin_render_to_rgba(
     canvas: &Canvas,
     flatten_eps: f32,
 ) -> Result<PendingRender, gpu::RenderError> {
-    let (w, h) = (canvas.scene.width, canvas.scene.height);
-    if w > GPU_MAX_SUPPORTED_SIDE || h > GPU_MAX_SUPPORTED_SIDE {
-        eprintln!(
-            "画布 {w}×{h} 超出 GPU 路径已验证范围（≤ {GPU_MAX_SUPPORTED_SIDE}）；使用 CPU 引擎"
-        );
-        return Ok(PendingRender::Cpu(Some(render_cpu(canvas, flatten_eps))));
-    }
     match shared_gpu_renderer() {
         Ok(r) => Ok(PendingRender::Gpu(r.begin(&canvas.scene, flatten_eps)?)),
         Err(msg) => {

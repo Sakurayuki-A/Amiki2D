@@ -695,28 +695,6 @@ pub extern "C" fn amiki_canvas_end_layer(canvas: *mut AmikiCanvas) -> i32 {
 
 // ---- 输出 ----
 
-/// 画布是否落在 GPU 路径**已验证的范围内**。
-///
-/// 超出范围时 GPU 会在 `y ≥ 2048` 的横带上**静默算错**（实测最差像素差 255，
-/// 见 `amiki::GPU_MAX_SUPPORTED_SIDE` 的记录），所以两条渲染入口都要**明确回落
-/// CPU 并打印原因** —— 与门面 `amiki::render_to_rgba` 用的是同一条判断。
-///
-/// 为什么不是报 `AMIKI_ERROR_NOT_SUPPORTED`：那样调用方在超范围画布上就**完全画不出**
-/// 东西；回落 CPU 给出的是**正确**像素。这条与本项目"宁可少用 GPU，也不输出错的像素"
-/// 的取舍一致。
-#[cfg(feature = "gpu")]
-fn gpu_range_ok(width: u32, height: u32) -> bool {
-    width <= amiki::GPU_MAX_SUPPORTED_SIDE && height <= amiki::GPU_MAX_SUPPORTED_SIDE
-}
-
-#[cfg(feature = "gpu")]
-fn warn_gpu_out_of_range(width: u32, height: u32) {
-    eprintln!(
-        "画布 {width}×{height} 超出 GPU 路径已验证范围（≤ {}），已知 y≥2048 会算错；使用 CPU 引擎",
-        amiki::GPU_MAX_SUPPORTED_SIDE
-    );
-}
-
 /// CPU 后端渲染（带画布自己的色调映射与 mip bias）。
 ///
 /// 同步入口与异步入口**共用这一份实现** —— 否则"两条入口逐字节相同"没有根据。
@@ -780,12 +758,7 @@ pub extern "C" fn amiki_canvas_render_rgba8(
         let rendered: Result<Vec<u8>, String> = match &ctx.backend {
             #[cfg(feature = "gpu")]
             Backend::Gpu(r) => {
-                if gpu_range_ok(c.width, c.height) {
-                    r.render_blocking_with(scene, eps, tone, bias).map_err(|e| e.to_string())
-                } else {
-                    warn_gpu_out_of_range(c.width, c.height);
-                    Ok(render_cpu_with_tone(scene, eps, tone, bias))
-                }
+                r.render_blocking_with(scene, eps, tone, bias).map_err(|e| e.to_string())
             }
             // CPU 路径与 GPU 无关 —— 这也是 WASM 构建下唯一的路径
             Backend::Cpu => Ok(render_cpu_with_tone(scene, eps, tone, bias)),
@@ -837,17 +810,12 @@ pub extern "C" fn amiki_canvas_begin_render_rgba8(canvas: *mut AmikiCanvas) -> i
         let scene = &c.root.scene;
         let pending = match &ctx.backend {
             #[cfg(feature = "gpu")]
-            Backend::Gpu(r) => {
-                if gpu_range_ok(c.width, c.height) {
-                    match r.begin_with(scene, eps, tone, bias) {
-                        Ok(p) => PendingCanvasRender::InFlight(p),
-                        Err(e) => return render_error_to_i32(&e.to_string()),
-                    }
-                } else {
-                    warn_gpu_out_of_range(c.width, c.height);
-                    PendingCanvasRender::Ready(render_cpu_with_tone(scene, eps, tone, bias))
-                }
-            }
+            Backend::Gpu(r) => match r.begin_with(scene, eps, tone, bias) {
+                Ok(p) => PendingCanvasRender::InFlight(p),
+                // 提交阶段的失败（准备 / 派发）是同步可见的 —— 立刻报出去，
+                // 不让它装作"在飞"然后再由 try_read 报
+                Err(e) => return render_error_to_i32(&e.to_string()),
+            },
             Backend::Cpu => PendingCanvasRender::Ready(render_cpu_with_tone(scene, eps, tone, bias)),
         };
         c.pending = Some(pending);

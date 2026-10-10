@@ -731,6 +731,53 @@ pub(crate) fn fine_dispatch_dims(n_tiles: u32) -> (u32, u32) {
     (x, z)
 }
 
+/// 稀疏路径单维派发（64 线程/工作组）的维度：`(x_workgroups, y_workgroups)`。
+///
+/// `n_elements == 0` 返回 `(0, 0)`（调用方跳过派发，`dispatch_workgroups(0, ..)` 非法）。
+///
+/// # 与内核 `lin()` 的契约（**改一处必须改另一处**）
+///
+/// ```text
+/// 行距 = 1024 个工作组 × 64 线程 = 65536 个元素
+/// x    = min(⌈n/64⌉, 1024)
+/// y    = ⌈⌈n/64⌉ / 1024⌉
+/// ```
+///
+/// 即每个内核的 `lin(gid) = gid.x + gid.y * 65536u` 必须与这里的 `1024` 行宽一致。
+/// 一致性用 `dispatch_dims_1d_covers_every_element_exactly_once`（纯算术，不需要 GPU）
+/// 钉住：任何元素都必须**恰好被处理一次**。
+///
+/// # 为什么不是"每行 65535 个工作组"（0.10.8～0.10.9 之间的那个静默错误）
+///
+/// 旧写法 `x = min(wg, 65535)`、`y = ⌈wg/65535⌉` 是按 **65535 个工作组**推进的，
+/// 而内核的 `lin()` 是按 **65535 个元素**（线程）推进 —— 两者差 64 倍。于是：
+///
+/// - 行与行**重叠 95%**：同一个元素被处理多次（对 `atomicAdd` 的内核就是重复计数）；
+/// - 真正超出的尾部**永远不会被处理**。实测 3840×2160 / 2000 矩形时，
+///   carry 需要 4 322 160 个元素（67 534 个工作组），尾部 **62 385 个元素 =
+///   3899 个 strip** 从未执行；strip 按 tile 行主序编号 ⇒ 最下面两行瓦片的
+///   `cell_meta` 一直是 0 ⇒ fine 阶段在那两行**什么都不画**。
+///
+/// 这就是 `0.10.8` 记为"GPU 在 `y ≥ 2048` 会算错"的那条：真因与 `y` 无关，
+/// 是 `draws × tile 行` 够大（本例 > 262 140）就会踩到。
+pub(crate) fn dispatch_dims_1d(n_elements: u32) -> (u32, u32) {
+    /// 与所有稀疏内核的 `@workgroup_size(64)` 一致。
+    const WG: u32 = 64;
+    /// 一行的工作组数（= 内核 `lin()` 的行距 65536 个元素）。
+    const ROW_WG: u32 = 1024;
+    if n_elements == 0 {
+        return (0, 0);
+    }
+    let wg = n_elements.div_ceil(WG);
+    let x = wg.min(ROW_WG);
+    let y = wg.div_ceil(ROW_WG);
+    // 元素上限 = `65535 行 × 65536 元素 ≈ 4.29e9`，而 `n_elements` 是 u32
+    // （最大 4.29e9）：只有理论极值会超出 y 维上限，那时 wgpu 报派发维度非法
+    // （**响亮地失败**，不是静默少算）。
+    debug_assert!(y <= 65_535, "1D 派发的行数超出 WebGPU 的 y 维上限");
+    (x, y)
+}
+
 fn ts_writes(
     rec: Option<&TimestampRecorder>,
     slot: Option<(u32, u32)>,

@@ -8,6 +8,9 @@ use crate::types::*;
 
 use amiki_scene::ImagePlacement;
 use std::ffi::CString;
+// `Arc` 只被 `make_backend` 的 GPU 分支用到：拆文件后它不再与"总是存在的"用法同处一室，
+// 所以 `--no-default-features` 下必须连导入一起门控（否则 unused_imports）。
+#[cfg(feature = "gpu")]
 use std::sync::Arc;
 
 // ============================================================================
@@ -50,7 +53,11 @@ pub use canvas_output::{amiki_canvas_begin_render_rgba8, amiki_canvas_poll_rende
 pub mod path;
 pub use path::{amiki_path_circle, amiki_path_clear, amiki_path_close, amiki_path_create, amiki_path_cubic_to, amiki_path_destroy, amiki_path_line_to, amiki_path_move_to, amiki_path_quad_to, amiki_path_rect};
 pub mod image;
-pub use image::{amiki_image_create_from_bytes, amiki_image_create_from_file, amiki_image_create_rgba8, amiki_image_destroy, amiki_image_encode_png, amiki_image_set_mipmap_mode, amiki_image_size};
+pub use image::{amiki_image_create_rgba8, amiki_image_destroy, amiki_image_set_mipmap_mode, amiki_image_size};
+// 编解码三个入口只在 `codec` feature 下存在（`image.rs` 里它们整体带 cfg），
+// 所以这里也必须带上 —— 少了它 `--no-default-features` 会 E0432。
+#[cfg(feature = "codec")]
+pub use image::{amiki_image_create_from_bytes, amiki_image_create_from_file, amiki_image_encode_png};
 pub mod font;
 pub use font::{amiki_font_create_from_file, amiki_font_create_from_memory, amiki_font_destroy, amiki_font_metrics, amiki_font_stack_create, amiki_font_stack_destroy, amiki_font_stack_push, amiki_font_stack_resolve, amiki_text_options_default};
 pub mod gradient;

@@ -6,6 +6,9 @@ use crate::api::{ffi, ffi_free, write_out};
 use crate::objects::*;
 use crate::types::*;
 
+// `CStr` 只被下面那三个 `codec` 门控的入口用到（拆文件后不再有"总是存在"的用法兜底），
+// 所以连导入一起门控。
+#[cfg(feature = "codec")]
 use std::ffi::CStr;
 use std::sync::Arc;
 

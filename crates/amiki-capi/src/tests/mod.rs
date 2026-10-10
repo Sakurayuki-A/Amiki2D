@@ -34,6 +34,9 @@ mod tone_map;
 mod mipmap;
 mod fill_rule;
 mod text_cache;
+// 编解码三个入口只在 `codec` feature 下存在。这条门控是 CI 加"特性矩阵"时补的：
+// 在此之前 `--no-default-features` 只构建过 lib（能过），**测试目标其实一直编不过**。
+#[cfg(feature = "codec")]
 mod codec;
 mod state_stack;
 mod font;

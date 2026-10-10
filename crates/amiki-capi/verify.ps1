@@ -38,12 +38,36 @@ function Ok($msg) { Write-Host "    OK  $msg" -ForegroundColor Green }
 function Bad($msg) { Write-Host "    FAIL  $msg" -ForegroundColor Red; $script:fail++ }
 
 # --- locate MSVC -------------------------------------------------------------
+# Ask vswhere.exe first. Hardcoding the edition folders is what broke the first
+# real CI run: the runner's Visual Studio is not under any of them, so checks 2,
+# 3, 4 and 5 all failed with "vcvars64.bat not found". vswhere ships with every
+# VS 2017+ installer at a fixed path, so it is the layout-independent answer;
+# VCINSTALLDIR (set inside a developer prompt) and the hardcoded list remain as
+# fallbacks for machines that lack it.
 $vcvars = $null
-foreach ($p in @(
-    'C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat',
-    'C:\Program Files\Microsoft Visual Studio\2022\Professional\VC\Auxiliary\Build\vcvars64.bat',
-    'C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat'
-)) { if (Test-Path $p) { $vcvars = $p; break } }
+if ($env:VCINSTALLDIR) {
+    $cand = Join-Path $env:VCINSTALLDIR 'Auxiliary\Build\vcvars64.bat'
+    if (Test-Path $cand) { $vcvars = $cand }
+}
+if (-not $vcvars) {
+    $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+    if (Test-Path $vswhere) {
+        $found = & $vswhere -latest -products * `
+            -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
+            -find 'VC\Auxiliary\Build\vcvars64.bat' 2>$null
+        if ($found) {
+            $cand = ($found | Select-Object -First 1).Trim()
+            if (Test-Path $cand) { $vcvars = $cand }
+        }
+    }
+}
+if (-not $vcvars) {
+    foreach ($p in @(
+        'C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat',
+        'C:\Program Files\Microsoft Visual Studio\2022\Professional\VC\Auxiliary\Build\vcvars64.bat',
+        'C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat'
+    )) { if (Test-Path $p) { $vcvars = $p; break } }
+}
 
 # --- 1. build -----------------------------------------------------------------
 Step 1 'cargo build -p amiki-capi --release'

@@ -43,7 +43,21 @@ fn gpu_lock() -> std::sync::MutexGuard<'static, ()> {
 fn gpu() -> Option<(GpuRenderer, std::sync::MutexGuard<'static, ()>)> {
     let guard = gpu_lock();
     match pollster::block_on(GpuRenderer::new()) {
-        Ok(r) => Some((r, guard)),
+        Ok(r) => {
+            // 打一行适配器：CI runner 上只有软件适配器（WARP，类型 Cpu），
+            // 而性能类断言在那里没有意义 —— 日志里能一眼看出是哪条路。
+            eprintln!(
+                "[gpu] 适配器 = {}，类型 = {:?}{}",
+                r.adapter_name,
+                r.adapter_device_type,
+                if r.adapter_device_type == wgpu::DeviceType::Cpu {
+                    "（软件实现：性能类断言会跳过，正确性断言按 1 LSB 容忍）"
+                } else {
+                    ""
+                }
+            );
+            Some((r, guard))
+        }
         Err(_) => {
             eprintln!("跳过：无 GPU 适配器");
             None

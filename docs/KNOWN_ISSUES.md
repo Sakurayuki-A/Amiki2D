@@ -21,6 +21,15 @@
 
 ### A1 跨厂商硬件未验证（**已知限制，非待办**）
 
+> **2026-10 补充：CI runner 上出现的是"软件适配器"，不是"第二家厂商"。**
+> GitHub 的 windows runner 没有真卡，只有 `Microsoft Basic Render Driver`
+> （WARP，wgpu 报 `DeviceType::Cpu`）。GPU 测试在那里**真的会跑**，首次 CI
+> 实测：单帧 GPU pass 795 ms（真卡 <5 ms）、冷启动 1502 ms（真卡 340–500 ms）、
+> 稀疏↔稠密出现 1 LSB 差（blend16：3/16384 字节）。因此测试现在区分适配器类型：
+> **性能预算类断言在软件适配器上显式跳过**（数字无意义），
+> **正确性断言保留但容忍 1 LSB**（落在本文档承诺的 GPU↔CPU ≤2/255 之内）。
+> 真卡上两者仍按原样严格执行。WARP 通过**不代表**跨厂商通过 —— A1 不变。
+
 本版本仅在 **NVIDIA RTX 3050 / Windows** 上完成三后端验证。
 **AMD、Intel、Apple Silicon、移动 GPU 未测试。**
 **不承诺跨厂商像素一致。**

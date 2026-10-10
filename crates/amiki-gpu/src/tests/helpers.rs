@@ -4,6 +4,26 @@
 
 use super::*;
 
+/// 适配器是不是**软件实现**（WARP / `Microsoft Basic Render Driver`，wgpu 报 `Cpu`）。
+///
+/// # 为什么测试必须区分它（首次 CI 实测）
+///
+/// GitHub 的 windows runner **没有真卡**，只有软件适配器 WARP；GPU 测试因此真的
+/// 跑起来了，而三条判据在那条路上不成立：
+///
+/// | 判据 | 真卡 | WARP（runner 实测） |
+/// |---|---|---|
+/// | 单帧 GPU pass | <5 ms | **795 ms** |
+/// | 冷启动 | 340–500 ms | **1502 ms** |
+/// | 稀疏 ↔ 稠密 | 逐字节相等 | **1 LSB 差**（blend16: 3/16384 字节） |
+///
+/// 结论：**性能预算类**断言在软件适配器上显式跳过（数字没有意义）；
+/// **正确性**断言保留，但容忍 1 LSB —— 那是软件光栅器的舍入，且在项目文档承诺的
+/// GPU↔CPU ≤2/255 之内。真卡上两者都仍按原样严格执行。
+pub(super) fn is_software_adapter(r: &GpuRenderer) -> bool {
+    r.adapter_device_type == wgpu::DeviceType::Cpu
+}
+
 // ===================== M3a：活跃 tile 表（sparse strips 底座） =====================
 
 /// 运行一次管线并转储中间数据（M3a 验证用：固定走稠密参照路径）。

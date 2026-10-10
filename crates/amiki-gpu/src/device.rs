@@ -451,6 +451,7 @@ impl GpuRenderer {
             .map_err(|e| RenderError(format!("设备创建失败: {e}")))?;
         let mut renderer = GpuRenderer::from_device(device, queue)?;
         renderer.adapter_name = format!("{} ({:?})", info.name, info.backend);
+        renderer.adapter_device_type = info.device_type;
         renderer.backend = Some(info.backend);
         Ok(renderer)
     }
@@ -796,6 +797,9 @@ impl GpuRenderer {
         Ok(GpuRenderer {
             path: RenderPath::default(),
             adapter_name: "unknown".to_string(),
+            // `from_device` 拿不到适配器信息 ⇒ 未知。测试里的 `is_software_adapter`
+            // 因此在 `from_device` 造的渲染器上恒为 false（即按真卡对待）。
+            adapter_device_type: wgpu::DeviceType::Other,
             backend: None,
             has_timestamps: device.features().contains(wgpu::Features::TIMESTAMP_QUERY)
                 && timestamp_period_ns > 0.0,

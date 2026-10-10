@@ -201,6 +201,16 @@ fn profile_frame_path_phases() {
     use std::hint::black_box;
     use std::time::Instant;
     let Some((renderer, _gpu_guard)) = gpu() else { return };
+    if is_software_adapter(&renderer) {
+        // 软件适配器（CI 的 WARP）单帧 GPU pass 实测 795 ms，真卡 <5 ms ——
+        // 本测试的三个阈值是**性能回归守卫**，在软件实现上没有意义
+        // （主机侧/读回的耗时同样不可比）。
+        eprintln!(
+            "跳过：软件适配器（{}）—— 帧路径的耗时守卫只对真实 GPU 有意义",
+            renderer.adapter_name
+        );
+        return;
+    }
     // 与基准同规模、同形状的场景（圆：每条 4 条三次曲线）
     let scene = {
         use amiki_math::{Affine, Vec2};

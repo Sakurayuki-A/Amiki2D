@@ -18,7 +18,17 @@ REM Deliberately written as top-level statements (no nested blocks): inside a
 REM parenthesised block, %VCVARS% would be expanded at parse time and be empty.
 if defined VCINSTALLDIR goto :msvc_ready
 
+REM Ask vswhere.exe first. Hardcoding the VS edition folders is what broke the
+REM first real CI run -- the runner's Visual Studio is under none of them, so
+REM "vcvars64.bat not found" failed the C example, the header compile check and
+REM the symbol check all at once. vswhere ships with every VS 2017+ installer at
+REM a fixed path, so it is the layout-independent answer. The hardcoded list
+REM below stays as a fallback for machines without it.
 set "VCVARS="
+set "VSWHERE=%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe"
+if exist "%VSWHERE%" for /f "usebackq tokens=*" %%I in (`"%VSWHERE%" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -find "VC\Auxiliary\Build\vcvars64.bat"`) do if not defined VCVARS set "VCVARS=%%I"
+if defined VCVARS if not exist "%VCVARS%" set "VCVARS="
+
 if not defined VCVARS if exist "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat" set "VCVARS=C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat"
 if not defined VCVARS if exist "C:\Program Files\Microsoft Visual Studio\2022\Professional\VC\Auxiliary\Build\vcvars64.bat" set "VCVARS=C:\Program Files\Microsoft Visual Studio\2022\Professional\VC\Auxiliary\Build\vcvars64.bat"
 if not defined VCVARS if exist "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat" set "VCVARS=C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
@@ -27,6 +37,7 @@ if not defined VCVARS if exist "C:\Program Files (x86)\Microsoft Visual Studio\2
 
 if not defined VCVARS (
     echo [ERROR] vcvars64.bat not found.
+    echo         Tried vswhere.exe, VCINSTALLDIR and the usual 2019/2022 folders.
     echo         Run this from an "x64 Native Tools Command Prompt", or set VCINSTALLDIR.
     exit /b 1
 )

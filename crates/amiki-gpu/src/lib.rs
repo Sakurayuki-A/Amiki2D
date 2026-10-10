@@ -129,6 +129,14 @@ pub struct GpuRenderer {
     pub path: RenderPath,
     /// 适配器名称/后端（基准报告用；`new` 填充，`from_device` 为 "unknown"）
     pub adapter_name: String,
+    /// 适配器类型（`new` 填充；`from_device` 为 `Other` = 未知）。
+    ///
+    /// 存在的理由：CI runner **没有真卡**，只有软件适配器
+    /// （`Microsoft Basic Render Driver` / WARP，wgpu 报 `DeviceType::Cpu`）。
+    /// 在那条路上性能预算与"逐字节相等"的判据都不成立 —— 首次 CI 实测：
+    /// 单帧 GPU pass 795 ms（真卡 <5 ms）、冷启动 1502 ms（真卡 340–500 ms）、
+    /// 稀疏↔稠密出现 1 LSB 差。测试据此分别处理，而不是把判据整体放松。
+    pub adapter_device_type: wgpu::DeviceType,
     /// 实际使用的 wgpu 后端。`new` 填充；`from_device` 为 `None`（未知 ⇒ 不做后端相关判定）。
     pub backend: Option<wgpu::Backend>,
     /// 适配器是否支持 GPU 时间戳（`profile` 的前提）

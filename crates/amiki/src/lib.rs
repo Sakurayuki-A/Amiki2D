@@ -663,15 +663,15 @@ impl Canvas {
 /// 现在初始化只做一次；失败也**缓存**（`Err(String)`），避免在没有 GPU 的机器上
 /// 每次调用都重试一次昂贵的初始化。
 #[cfg(feature = "gpu")]
-fn shared_gpu_renderer() -> Result<&'static std::sync::Mutex<gpu::GpuRenderer>, String> {
-    static CELL: std::sync::OnceLock<Result<std::sync::Mutex<gpu::GpuRenderer>, String>> =
+fn shared_gpu_renderer() -> Result<std::sync::Arc<gpu::GpuRenderer>, String> {
+    static CELL: std::sync::OnceLock<Result<std::sync::Arc<gpu::GpuRenderer>, String>> =
         std::sync::OnceLock::new();
     match CELL.get_or_init(|| {
         gpu::GpuRenderer::new_blocking()
-            .map(std::sync::Mutex::new)
+            .map(std::sync::Arc::new)
             .map_err(|e| format!("{e:?}"))
     }) {
-        Ok(m) => Ok(m),
+        Ok(r) => Ok(std::sync::Arc::clone(r)),
         Err(msg) => Err(msg.clone()),
     }
 }
@@ -700,14 +700,65 @@ pub fn render_to_rgba(canvas: &Canvas, flatten_eps: f32) -> Result<Vec<u8>, gpu:
         return Ok(render_cpu(canvas, flatten_eps));
     }
     match shared_gpu_renderer() {
-        Ok(cell) => {
-            // 锁中毒时取回内部值继续，不 panic（与 C ABI 的 Poison 机制同一态度）
-            let r = cell.lock().unwrap_or_else(|p| p.into_inner());
-            r.render_blocking(&canvas.scene, flatten_eps)
-        }
+        Ok(r) => r.render_blocking(&canvas.scene, flatten_eps),
         Err(msg) => {
             eprintln!("GPU 不可用（{msg}），使用 CPU 引擎");
             Ok(render_cpu(canvas, flatten_eps))
+        }
+    }
+}
+
+/// 异步渲染的在飞结果（P3 第 ③ 步）。
+///
+/// 两种形态：`Gpu` 是真正在飞的帧；`Cpu` 是**已经算好**的结果 —— 当画布超出
+/// GPU 已验证范围、或 GPU 不可用时，异步入口与同步入口做出**同样的选择**（回落 CPU），
+/// 于是 `Cpu` 恒为"首帧即就绪"。
+#[cfg(feature = "gpu")]
+pub enum PendingRender {
+    Gpu(gpu::PendingFrame),
+    Cpu(Vec<u8>),
+}
+
+#[cfg(feature = "gpu")]
+impl PendingRender {
+    /// 非阻塞推进；`Cpu` 恒为 `Ready`。
+    pub fn poll(&mut self) -> gpu::PollStatus {
+        match self {
+            PendingRender::Gpu(f) => f.poll(),
+            PendingRender::Cpu(_) => gpu::PollStatus::Ready,
+        }
+    }
+
+    /// 就绪则取值；未就绪返回 `None`（**不返回半成品**）。
+    pub fn try_read(self) -> Option<Result<Vec<u8>, gpu::RenderError>> {
+        match self {
+            PendingRender::Gpu(f) => f.try_read(),
+            PendingRender::Cpu(v) => Some(Ok(v)),
+        }
+    }
+}
+
+/// **异步入口**：提交后立即返回，由调用方 `poll` / `try_read`（P3 第 ③ 步）。
+///
+/// 与 [`render_to_rgba`] 走**同一套前置判断**（超范围 / GPU 不可用 ⇒ 回落 CPU），
+/// 所以两条路径的结果必然一致（有测试按逐字节比对）。
+#[cfg(feature = "gpu")]
+pub fn begin_render_to_rgba(
+    canvas: &Canvas,
+    flatten_eps: f32,
+) -> Result<PendingRender, gpu::RenderError> {
+    let (w, h) = (canvas.scene.width, canvas.scene.height);
+    if w > GPU_MAX_SUPPORTED_SIDE || h > GPU_MAX_SUPPORTED_SIDE {
+        eprintln!(
+            "画布 {w}×{h} 超出 GPU 路径已验证范围（≤ {GPU_MAX_SUPPORTED_SIDE}）；使用 CPU 引擎"
+        );
+        return Ok(PendingRender::Cpu(render_cpu(canvas, flatten_eps)));
+    }
+    match shared_gpu_renderer() {
+        Ok(r) => Ok(PendingRender::Gpu(r.begin(&canvas.scene, flatten_eps)?)),
+        Err(msg) => {
+            eprintln!("GPU 不可用（{msg}），使用 CPU 引擎");
+            Ok(PendingRender::Cpu(render_cpu(canvas, flatten_eps)))
         }
     }
 }

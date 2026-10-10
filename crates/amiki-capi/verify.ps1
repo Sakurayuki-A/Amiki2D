@@ -172,6 +172,11 @@ if (-not $core -or -not $hdrVer) {
 }
 
 # --- 4. the three examples build and run -------------------------------------
+# Hand the MSVC path we already located to the example scripts. The C example
+# needs cl.exe, and doing the discovery once here (rather than in every .cmd)
+# keeps a single place to fix -- the first CI run failed precisely because that
+# discovery was hardcoded per script.
+if ($vcvars) { $env:AMIKI_VCVARS = $vcvars }
 Step 4 'three binding examples (C / C# / Node) build and run'
 $bmp = @{
     'C'    = Join-Path $ex 'c\amiki_c_demo.bmp'

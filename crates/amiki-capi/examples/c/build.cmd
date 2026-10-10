@@ -18,15 +18,20 @@ REM Deliberately written as top-level statements (no nested blocks): inside a
 REM parenthesised block, %VCVARS% would be expanded at parse time and be empty.
 if defined VCINSTALLDIR goto :msvc_ready
 
-REM Ask vswhere.exe first. Hardcoding the VS edition folders is what broke the
-REM first real CI run -- the runner's Visual Studio is under none of them, so
-REM "vcvars64.bat not found" failed the C example, the header compile check and
-REM the symbol check all at once. vswhere ships with every VS 2017+ installer at
-REM a fixed path, so it is the layout-independent answer. The hardcoded list
-REM below stays as a fallback for machines without it.
-set "VCVARS="
-set "VSWHERE=%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe"
-if exist "%VSWHERE%" for /f "usebackq tokens=*" %%I in (`"%VSWHERE%" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -find "VC\Auxiliary\Build\vcvars64.bat"`) do if not defined VCVARS set "VCVARS=%%I"
+REM verify.ps1 locates MSVC for its own checks anyway and exports the path as
+REM AMIKI_VCVARS, so reuse it when present: one discovery, one place to fix.
+set "VCVARS=%AMIKI_VCVARS%"
+if defined VCVARS if not exist "%VCVARS%" set "VCVARS="
+
+REM Standalone fallback: ask vswhere.exe (it ships with every VS 2017+ installer at
+REM a fixed path, so it is the layout-independent answer; hardcoding the edition
+REM folders is what failed the first real CI run).
+REM
+REM The output goes through a temp file + set /p on purpose: with `for /f` the
+REM quotes around the vswhere path get eaten by the parser, cmd then tries to run
+REM "C:\Program", and the CI log showed exactly that error.
+if not defined VCVARS if exist "%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" "%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -find "VC\Auxiliary\Build\vcvars64.bat" > "%TEMP%\amiki_vcvars.txt" 2>nul
+if not defined VCVARS if exist "%TEMP%\amiki_vcvars.txt" set /p VCVARS=<"%TEMP%\amiki_vcvars.txt"
 if defined VCVARS if not exist "%VCVARS%" set "VCVARS="
 
 if not defined VCVARS if exist "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat" set "VCVARS=C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat"

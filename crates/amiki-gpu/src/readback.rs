@@ -431,3 +431,75 @@ mod tests {
         }
     }
 }
+
+
+// ============================================================================
+// P3 机制探针：非阻塞轮询能不能把 map_async 的回调等出来？
+// ============================================================================
+//
+// P3（异步渲染）的全部设计都压在一个假设上：把 `poll(PollType::Wait)` 换成
+// `poll(PollType::Poll)` 之后，**反复轮询**最终会让 `map_async` 的回调触发，
+// 而且单次 `Poll` 不会阻塞。这条没有验证过就不能动手（交接文档第 11 条）。
+//
+// 注意：本探针必须放在 crate 内 —— `GpuRenderer::device` 是 `pub(crate)`，
+// 放在 `tests/` 下的外部集成测试里拿不到它。
+#[cfg(test)]
+mod p3_probe {
+    use crate::GpuRenderer;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    #[test]
+    fn nonblocking_poll_delivers_the_map_callback() {
+        let Ok(r) = pollster::block_on(GpuRenderer::new()) else {
+            eprintln!("p3_probe: 无可用 GPU，跳过");
+            return;
+        };
+
+        // 一个可映射的小缓冲
+        let buf = r.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("p3_probe"),
+            size: 256,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        r.queue.write_buffer(&buf, 0, &[7u8; 256]);
+
+        let done = Arc::new(AtomicBool::new(false));
+        let flag = done.clone();
+        buf.slice(..).map_async(wgpu::MapMode::Read, move |res| {
+            let _ = res;
+            flag.store(true, Ordering::SeqCst);
+        });
+
+        // 单次 Poll 的耗时（测量，不做计时断言 —— 只打印）
+        let t = std::time::Instant::now();
+        let _ = r.device.poll(wgpu::PollType::Poll);
+        let single_ms = t.elapsed().as_secs_f64() * 1000.0;
+
+        let mut polls = 1u32;
+        while !done.load(Ordering::SeqCst) && polls < 200_000 {
+            let _ = r.device.poll(wgpu::PollType::Poll);
+            polls += 1;
+        }
+        let fired = done.load(Ordering::SeqCst);
+        println!(
+            "p3_probe: single Poll = {single_ms:.3} ms; polls until map callback fired = {polls}; fired = {fired}"
+        );
+
+        if fired {
+            // 映射成功即可读；读完必须 unmap，否则缓冲不能复用
+            {
+                // 只断言"可读"：`queue.write_buffer` 要等下一次 submit 才落地，
+                // 所以这里读到 0 是对的（我第一版断言了 7，被实测打回）。
+                let view = buf.slice(..).get_mapped_range();
+                assert_eq!(view.len(), 256, "映射范围长度应与缓冲一致");
+            }
+            buf.unmap();
+        }
+        assert!(
+            fired,
+            "map 回调在 20 万次 Poll 内仍未触发 ⇒ P3 的轮询方案不成立（应改为后台线程 + Wait）"
+        );
+    }
+}

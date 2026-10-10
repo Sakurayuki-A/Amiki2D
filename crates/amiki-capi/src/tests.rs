@@ -88,8 +88,7 @@ fn result_string_covers_every_value_and_rejects_out_of_range() {
 /// `src/types.rs`（实现）各写一份。任何一侧改了数字，调用方就会按**错的含义**
 /// 处理错误 —— 与 0.9.0 抓到的 `clip_depth` / `fill_rule` 镜像漂移是同一类问题。
 ///
-/// 只扫 `amiki_result` 枚举体那一段（交接文档第 10 条：范围要窄，
-/// 不能让相邻段落命中）。
+/// 只扫 `amiki_result` 枚举体那一段（范围要窄，不能让相邻段落命中）。
 #[test]
 fn error_codes_match_the_header() {
     let header = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/include/amiki.h"))
@@ -812,7 +811,7 @@ fn tone_map_changes_the_output_of_an_hdr_pixel() {
     assert!(d_ra > 0, "Reinhard 与 ACES 给出相同的输出 —— 那等于只有一个映射");
 
     // 方块**内部**的像素：alpha 不透明，且不该被色调映射改动
-    // （(0,0) 在方块外，alpha 自然是 0 —— 我第一版就是这么写错的）
+    // （(0,0) 在方块外、alpha 自然是 0，不能用它断言"不透明"）
     let inside = (32 * 64 + 32) * 4;
     assert_eq!(raw[inside + 3], 255, "方块内应当不透明");
     assert_eq!(aces[inside + 3], 255, "色调映射不该改动 alpha");
@@ -1082,8 +1081,7 @@ fn text_outline_cache_is_reused_across_draws() {
     assert!(m1 > 0, "第一轮应有缺失（首次取轮廓）");
     assert!(h2 > h1, "第二轮应命中：h2={h2} h1={h1}");
     // 缺失可能仍 +N（实测 +2）：**没有轮廓的字形**（空格/无轮廓标记）本来就存不进
-    // 缓存 —— 每次都得再问一次。所以判据是"命中在涨 + 缺失增量很小"，不是"零缺失"
-    // （我第一版写了零缺失，被实测 +2 打回）。
+    // 缓存 —— 每次都得再问一次。所以判据是"命中在涨 + 缺失增量很小"，不是"零缺失"。
     assert!(m2 - m1 <= 2, "第二轮缺失增量应极小（仅无轮廓字形），实测 {} ", m2 - m1);
     eprintln!("重复绘制：第一轮 hits={h1} misses={m1}；第二轮 hits={h2} misses={m2}");
 

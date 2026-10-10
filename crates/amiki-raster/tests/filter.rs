@@ -70,7 +70,7 @@ fn layer_without_filter_matches_direct_draw() {
 #[test]
 fn blur_actually_spreads_energy_outward() {
     // 用**细条**而不是方块：方块若比模糊半径宽得多，其中心在模糊后仍会饱和
-    // （邻域全是同色），"中心变暗"就不成立 —— 我第一版正是这么写错的。
+    // （邻域全是同色），"中心变暗"就不成立 —— 这条断言必须换输入才有牙。
     // 细条的横向能量必然外流，效果无歧义。
     let (cx, cy) = (120.0f32, 90.0f32);
     let (hw, hh) = (4.0f32, 40.0f32);
@@ -343,7 +343,7 @@ fn persistent_renderer_keeps_layers_on_incremental_frames() {
 
     // 含一个模糊层的场景。`inner_dx` 用来**改动层内容本身** ——
     // 这一点是必须的：若只改层外的图元，层的陈旧像素恰好仍是正确的，
-    // 测试会因为"侥幸"而通过（第一版就是这样，没能暴露问题）。
+    // 测试会因为"侥幸"而通过（那样就暴露不了问题）。
     let build = |inner_dx: f32| -> Scene {
         let mut s = Scene::new(200, 160);
         s.push_layer(

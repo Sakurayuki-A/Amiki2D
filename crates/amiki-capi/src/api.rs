@@ -153,9 +153,8 @@ pub extern "C" fn amiki_version_string() -> *const std::ffi::c_char {
     // **编译期**从 `Cargo.toml` 取，`concat!` 补上结尾的 NUL ——
     // 于是它不可能与包版本漂移。
     //
-    // 这一条是踩出来的：我先前把版本串**硬编码**成 "0.4.0-alpha"，
-    // 后来把 workspace 版本升到 0.5.0-alpha 时就漏改了，于是 Node 示例
-    // 打印出旧版本。两处各写一份必然漂移，干脆只留一处。
+    // 这里曾经把版本串**硬编码**过：workspace 版本一升就漏改，Node 示例
+    // 打印出旧版本。两处各写一份必然漂移，所以只留 `Cargo.toml` 一处。
     concat!(env!("CARGO_PKG_VERSION"), "\0").as_ptr().cast()
 }
 

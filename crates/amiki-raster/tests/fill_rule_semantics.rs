@@ -1,11 +1,16 @@
 //! **阶段 1 spike**：even-odd 的两件事，先用最小实验钉死，再动生产代码。
 //!
-//! 1. **边界约定**（计划 §2.2）：段与 tile / 像素的归属统一成左闭右开 `[lo, hi)`。
+//! 1. **边界约定**（计划 §2.2 曾设想"统一成左闭右开 `[lo, hi)`"）：**没有采用**。
+//!    实际落地的是现有的 **floor 偏包含 + carry 严格排除**（`x_max < T_l`），
+//!    理由与断言见 `fill_rule_boundary.rs` —— 两者是一对互补约定，
+//!    按"统一起见"改成左闭右开会把边界段算两次。本文件原有一条按计划写的
+//!    `boundary_convention`，它断言的是**与实现相反**的约定，已删除。
 //! 2. **累加语义**（计划 §2.1 的前提）：even-odd 能不能"复用 `seg_area`、
 //!    只把最终结果取奇偶"就算对？—— 用**独立超采样裁判**（逐点绕数取模 2）
 //!    对拍，看它到底对不对。
 //!
-//! 本文件是**实验**，不改任何生产代码；结论写进报告与 `docs/`。
+//! 本文件是**实验**（只用到 `amiki_raster::seg_area` 这一个生产函数），
+//! 目标不是覆盖引擎，而是留下一份**可复现的否证记录**；结论写进报告与 `docs/`。
 
 use amiki_math::Vec2;
 use amiki_raster::seg_area;
@@ -112,49 +117,12 @@ fn rect(x0: f32, y0: f32, x1: f32, y1: f32, ccw: bool) -> Vec<Vec2> {
     v
 }
 
-// ================================================================ 1) 边界约定
-
-/// 段是否属于 tile `[t_l, t_r)`（左闭右开）。
-///
-/// 规则（计划 §2.2）：`x_min < T_r && x_max > T_l`；桶前缀排除用 `x_max <= T_l`。
-fn segment_belongs_to_tile(x_min: f32, x_max: f32, t_l: f32, t_r: f32) -> bool {
-    x_min < t_r && x_max > t_l
-}
-
-/// 桶前缀是否应排除该段（即"整段都在 tile 左边"）。
-fn excluded_by_prefix(x_max: f32, t_l: f32) -> bool {
-    x_max <= t_l
-}
-
-#[test]
-fn boundary_convention() {
-    let t_l = 8.0;
-    let t_r = 16.0;
-
-    // 段正好在 tile 左边界结束 → 不归属
-    assert!(!segment_belongs_to_tile(0.0, t_l, t_l, t_r));
-    // 段越过左边界 → 归属
-    assert!(segment_belongs_to_tile(0.0, t_l + 0.001, t_l, t_r));
-    // 段正好在 tile 右边界开始 → 不归属
-    assert!(!segment_belongs_to_tile(t_r, t_r + 8.0, t_l, t_r));
-    // 段越过右边界 → 归属
-    assert!(segment_belongs_to_tile(t_r - 0.001, t_r + 8.0, t_l, t_r));
-    // 段跨整个 tile → 归属
-    assert!(segment_belongs_to_tile(0.0, 32.0, t_l, t_r));
-    // 退化段 → 不归属
-    assert!(!segment_belongs_to_tile(t_l, t_l, t_l, t_r));
-
-    // 前缀排除与归属必须**互补**：正好在左边界结束的段，既不归属也不参与前缀
-    assert!(excluded_by_prefix(t_l, t_l));
-    assert!(!segment_belongs_to_tile(0.0, t_l, t_l, t_r));
-}
-
 // ================================================================ 2) 累加语义
 
 /// 先确认实验装置本身可信：**生产的累加式**能复现 NonZero 的参考覆盖率。
 ///
 /// 形状**故意非整数对齐** —— 否则边缘落在像素边界上，参考里一个部分覆盖像素都没有，
-/// 后面两条断言会"因为没牙而通过"（本 spike 第一次就是这么假通过的）。
+/// 后面两条断言会"因为没牙而通过"（本 spike 最初就是这样假通过的）。
 #[test]
 fn harness_reproduces_nonzero_reference() {
     let contours = vec![rect(2.3, 2.1, 6.4, 5.7, true)];

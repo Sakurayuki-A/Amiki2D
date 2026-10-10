@@ -44,7 +44,7 @@ fn distance_ordering_matches_the_documented_tradeoff() {
 
 /// 极端值：同等斜体性下的最大字重差（800）仍小于斜体惩罚（1000）。
 ///
-/// 我第一版把候选自身的斜体惩罚漏算了（断言 500 < 1000）—— 实测打回，改成现在这条。
+/// 注意惩罚是加在**候选自身**的样式上的（断言 500 < 1000 会算错）。
 #[test]
 fn weight_gap_never_outweighs_italic_mismatch() {
     let heaviest = FontStyle { weight: 900, italic: true };

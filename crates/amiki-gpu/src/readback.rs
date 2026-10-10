@@ -271,7 +271,7 @@ impl PendingRead {
     ///
     /// 回调跑完之后 `tx` 会被析构 ⇒ 同一个通道**再** `try_recv` 得到的是
     /// `Disconnected`。若把结果 take 走，第二次问就会把"已经完成了"读成
-    /// "通道关闭"（我在 C ABI 上踩到过：`poll` 问过一次 Ready，`try_read`
+    /// "通道关闭"（C ABI 上踩到过：`poll` 报过一次 Ready，`try_read`
     /// 再问一次就报错）。所以这里只**看**，不拿走。
     pub(crate) fn map_outcome(&mut self) -> Option<Result<(), String>> {
         if self.got.is_none() {
@@ -520,7 +520,7 @@ mod tests {
         // 任何色调映射都会把它压到 255。
         //
         // 所以"高光源"在 sRGB 空间里是 1.2~2.0 这个量级，不是 4.0。
-        // 我第一版测试用了 4.0，三种映射里有两种给出 255，看起来像"没生效"，
+        // 用 4.0 当输入时，三种映射里有两种给出 255，看起来像"没生效"，
         // 其实是**输入选错了**，不是映射坏了。
         //
         // 这条测试要证明的是：**在真实的高光源量级上，不同的映射给出可分辨的
@@ -564,7 +564,7 @@ mod tests {
 //
 // P3（异步渲染）的全部设计都压在一个假设上：把 `poll(PollType::Wait)` 换成
 // `poll(PollType::Poll)` 之后，**反复轮询**最终会让 `map_async` 的回调触发，
-// 而且单次 `Poll` 不会阻塞。这条没有验证过就不能动手（交接文档第 11 条）。
+// 而且单次 `Poll` 不会阻塞。**这条没有验证过就不能动手** —— 所以下面是探针。
 //
 // 注意：本探针必须放在 crate 内 —— `GpuRenderer::device` 是 `pub(crate)`，
 // 放在 `tests/` 下的外部集成测试里拿不到它。
@@ -616,7 +616,7 @@ mod p3_probe {
             // 映射成功即可读；读完必须 unmap，否则缓冲不能复用
             {
                 // 只断言"可读"：`queue.write_buffer` 要等下一次 submit 才落地，
-                // 所以这里读到 0 是对的（我第一版断言了 7，被实测打回）。
+                // 所以这里读到 0 是对的（断言 7 会失败）。
                 let view = buf.slice(..).get_mapped_range();
                 assert_eq!(view.len(), 256, "映射范围长度应与缓冲一致");
             }

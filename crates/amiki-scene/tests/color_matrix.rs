@@ -1,6 +1,6 @@
 //! `ColorMatrix`（0.10.4）：纯函数层的完整验证。
 //!
-//! 判据原则（按交接文档第 11 条）：**给互不相同的输入**，别去猜输出 ——
+//! 判据原则：**给互不相同的输入**，别去猜输出 ——
 //! 这里用"已知颜色的已知结果"（Rec.709 权重、恒等、钳制）做断言。
 
 use amiki_scene::{Color, ColorMatrix};
@@ -83,7 +83,7 @@ fn clamps_and_never_produces_nan() {
 #[test]
 fn sepia_and_scale_behave() {
     // ⚠️ 用**中灰**而不是纯白：经典 sepia 系数会饱和（白色 r、g 都被钳到 1.0，
-    //    r>g 不成立）—— 我第一版就是拿白色当输入，把自己写红了。
+    //    r>g 不成立）—— 用白色当输入时这条断言无法成立。
     let s = ColorMatrix::sepia().apply(Color { r: 0.5, g: 0.5, b: 0.5, a: 1.0 });
     assert!(
         s.r > s.g && s.g > s.b,
